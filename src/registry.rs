@@ -45,42 +45,129 @@ fn acquire_lock(state: &StateDir) -> Result<RegistryLock> {
     Ok(RegistryLock(file))
 }
 
+/// Best-effort `fsync` of the directory holding `path`, so a rename/creat
+/// performed there survives a power loss. Errors (e.g. on filesystems that
+/// cannot sync a directory) are ignored — durability here is best-effort.
+fn sync_parent_dir(path: &std::path::Path) {
+    let Some(dir) = path.parent() else { return };
+    if let Ok(f) = std::fs::File::open(dir) {
+        let _ = f.sync_all();
+    }
+}
+
 impl Registry {
     /// Load the registry, returning an empty one if it does not yet exist.
+    ///
+    /// Cleans up any `registry.json.tmp` left by a crash between the temp write
+    /// and the rename, validates the parsed content (healing `next_id` and
+    /// rejecting clearly-broken entries), and falls back to `registry.json.bak`
+    /// if the live file is missing or unparseable — so a botched commit can no
+    /// longer brick the whole CLI.
     pub fn load(state: &StateDir) -> Result<Registry> {
         let path = state.registry_path();
-        if !path.exists() {
-            return Ok(Registry::default());
+        // A leftover .tmp means a prior save crashed before the rename; drop it
+        // so we never accidentally load a half-written file.
+        let _ = std::fs::remove_file(path.with_extension("json.tmp"));
+
+        if let Some(bytes) = std::fs::read(&path).ok()
+            && !bytes.iter().all(u8::is_ascii_whitespace)
+        {
+            return match Registry::parse(&bytes) {
+                Ok(reg) => Ok(reg),
+                Err(e) => match Self::load_backup(state) {
+                    Some(reg) => Ok(reg),
+                    None => Err(e)
+                        .with_context(|| format!("registry file {} is corrupted", path.display())),
+                },
+            };
         }
-        let data =
-            std::fs::read(&path).with_context(|| format!("reading registry {}", path.display()))?;
-        if data.iter().all(u8::is_ascii_whitespace) {
-            return Ok(Registry::default());
-        }
-        serde_json::from_slice::<Registry>(&data)
-            .with_context(|| format!("registry file {} is corrupted", path.display()))
+
+        // Missing or empty live file: prefer the backup, else a fresh default.
+        Ok(Self::load_backup(state).unwrap_or_default())
     }
 
-    /// Atomically persist the registry (write a mode-0600 temp file, then rename).
+    /// Decode + validate a registry blob.
+    fn parse(bytes: &[u8]) -> Result<Registry> {
+        let mut reg: Registry =
+            serde_json::from_slice(bytes).context("decoding registry")?;
+        reg.validate().context("validating registry")?;
+        Ok(reg)
+    }
+
+    /// Best-effort load of `registry.json.bak`, used when the live file is
+    /// missing or corrupt. Returns `None` if there is no usable backup.
+    fn load_backup(state: &StateDir) -> Option<Registry> {
+        let bak = state.registry_path().with_extension("json.bak");
+        let bytes = std::fs::read(&bak).ok()?;
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            return None;
+        }
+        Registry::parse(&bytes).ok()
+    }
+
+    /// Atomically and durably persist the registry:
     ///
-    /// The temp file is created with mode 0600 and the rename preserves it, so
-    /// `registry.json` is owner-only even on a shared host (it records every
-    /// service's absolute served-directory path).
+    /// 1. write a mode-0600 temp file and `fsync` it;
+    /// 2. best-effort copy the previous registry to `registry.json.bak`;
+    /// 3. atomically rename temp → `registry.json`;
+    /// 4. `fsync` the parent directory so the rename survives power loss.
     pub fn save(&self, state: &StateDir) -> Result<()> {
         let path = state.registry_path();
         let tmp = path.with_extension("json.tmp");
         let data = serde_json::to_vec_pretty(self).context("encoding registry")?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)
-            .with_context(|| format!("writing registry temp file {}", tmp.display()))?;
-        file.write_all(&data)
-            .with_context(|| format!("writing registry temp file {}", tmp.display()))?;
+        {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+                .with_context(|| format!("writing registry temp file {}", tmp.display()))?;
+            file.write_all(&data)
+                .with_context(|| format!("writing registry temp file {}", tmp.display()))?;
+            file.sync_all()
+                .with_context(|| format!("fsyncing registry temp file {}", tmp.display()))?;
+        }
+        // Recovery snapshot of the previous registry (copy, not rename, so the
+        // live file stays in place right up to the atomic replace below).
+        let _ = std::fs::copy(&path, path.with_extension("json.bak"));
         std::fs::rename(&tmp, &path)
             .with_context(|| format!("committing registry {}", path.display()))?;
+        // Make the rename durable too.
+        sync_parent_dir(&path);
+        Ok(())
+    }
+
+    /// Sanity-check a loaded registry, healing `next_id` so future allocations
+    /// stay monotonic. Rejects clearly-broken state (reserved id 0, duplicate
+    /// ids/names, empty names, reserved port 0) that would otherwise cause
+    /// confusing behavior downstream.
+    pub fn validate(&mut self) -> Result<()> {
+        let mut ids = std::collections::HashSet::new();
+        let mut names = std::collections::HashSet::new();
+        for s in &self.services {
+            if s.id == 0 {
+                anyhow::bail!("service {:?} has reserved id 0", s.name);
+            }
+            if !ids.insert(s.id) {
+                anyhow::bail!("duplicate service id {}", s.id);
+            }
+            if s.name.is_empty() {
+                anyhow::bail!("service id {} has an empty name", s.id);
+            }
+            if !names.insert(s.name.as_str()) {
+                anyhow::bail!("duplicate service name {:?}", s.name);
+            }
+            if s.port == 0 {
+                anyhow::bail!("service {:?} binds reserved port 0", s.name);
+            }
+        }
+        // Keep the id counter strictly ahead of every existing id so a hand-
+        // edited entry can never collide with a future allocation.
+        let max_id = self.services.iter().map(|s| s.id).max().unwrap_or(0);
+        if self.next_id <= max_id {
+            self.next_id = max_id.saturating_add(1);
+        }
         Ok(())
     }
 
