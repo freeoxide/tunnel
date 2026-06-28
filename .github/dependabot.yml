@@ -1,0 +1,16 @@
+version: 2
+updates:
+  # Keep Rust dependencies current.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # Keep GitHub Actions current (and, once actions are pinned to SHAs, this is
+  # how those pins stay up to date safely).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
