@@ -377,6 +377,7 @@ dependencies = [
  "libc",
  "nix",
  "open",
+ "percent-encoding",
  "proptest",
  "serde",
  "serde_json",
