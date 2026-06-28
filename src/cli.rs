@@ -85,6 +85,10 @@ pub enum Command {
         target: String,
     },
 
+    /// Remove stale services whose worker process is no longer running.
+    #[command(alias = "gc")]
+    Prune,
+
     /// Internal: detached worker process spawned by START.
     #[command(hide = true)]
     RunWorker {
