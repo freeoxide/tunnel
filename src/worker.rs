@@ -146,6 +146,7 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
         tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(&tunnel_log)
             .await
             .with_context(|| format!("opening tunnel log {}", tunnel_log.display()))?,
@@ -332,15 +333,18 @@ fn publish_url(ctx: &ReaderCtx, url: String) -> Result<()> {
 /// worker/ft traces go to `worker.log`. Fire-once; a no-op if a subscriber is
 /// already installed.
 fn init_tracing(worker_log: &Path, server_log: &Path) {
+    use std::os::unix::fs::OpenOptionsExt;
     use std::sync::Mutex;
     use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
     // tower_http request traces -> server.log; everything else -> worker.log.
     // Each layer is Option-wrapped so a failure to open one log file just drops
-    // that sink rather than aborting tracing setup.
+    // that sink rather than aborting tracing setup. Mode 0600: server.log can
+    // carry request URIs.
     let server_layer = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(server_log)
         .ok()
         .map(|f| {
@@ -353,6 +357,7 @@ fn init_tracing(worker_log: &Path, server_log: &Path) {
     let worker_layer = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(worker_log)
         .ok()
         .map(|f| {

@@ -14,6 +14,7 @@
 //! spawned.
 
 use std::fs::OpenOptions;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -36,14 +37,17 @@ pub fn spawn_worker(id: u64, name: &str, dir: &Path, port: u16) -> Result<u32> {
 
     // Open the log file twice so stdout and stderr each get an owned handle
     // that the child can dup. Append (and create) so restarts are additive.
+    // Mode 0600: the worker log can contain request/paths detail.
     let stdout_file = OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(&worker_log)
         .with_context(|| format!("opening worker log {}", worker_log.display()))?;
     let stderr_file = OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(&worker_log)
         .with_context(|| format!("opening worker log {}", worker_log.display()))?;
 

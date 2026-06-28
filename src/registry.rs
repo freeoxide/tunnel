@@ -10,6 +10,8 @@ use crate::model::{Registry, Service};
 use crate::state::StateDir;
 use anyhow::Context;
 use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 
 /// An advisory lock on the registry, released on drop.
@@ -30,6 +32,7 @@ fn acquire_lock(state: &StateDir) -> Result<RegistryLock> {
         .truncate(false)
         .read(true)
         .write(true)
+        .mode(0o600)
         .open(&path)
         .with_context(|| format!("opening registry lock {}", path.display()))?;
     // Block until we hold an exclusive advisory lock on the lock file.
@@ -58,12 +61,23 @@ impl Registry {
             .with_context(|| format!("registry file {} is corrupted", path.display()))
     }
 
-    /// Atomically persist the registry (write temp file, then rename).
+    /// Atomically persist the registry (write a mode-0600 temp file, then rename).
+    ///
+    /// The temp file is created with mode 0600 and the rename preserves it, so
+    /// `registry.json` is owner-only even on a shared host (it records every
+    /// service's absolute served-directory path).
     pub fn save(&self, state: &StateDir) -> Result<()> {
         let path = state.registry_path();
         let tmp = path.with_extension("json.tmp");
         let data = serde_json::to_vec_pretty(self).context("encoding registry")?;
-        std::fs::write(&tmp, &data)
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("writing registry temp file {}", tmp.display()))?;
+        file.write_all(&data)
             .with_context(|| format!("writing registry temp file {}", tmp.display()))?;
         std::fs::rename(&tmp, &path)
             .with_context(|| format!("committing registry {}", path.display()))?;

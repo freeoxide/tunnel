@@ -109,8 +109,7 @@ async fn run_background(dir: &Path, name: Option<String>, port: Option<u16>) -> 
             }
             None => name::unique_name(reg, &name::generate_name(dir)),
         };
-        std::fs::create_dir_all(state.service_dir(&name))
-            .with_context(|| format!("creating service directory for '{name}'"))?;
+        let service_dir = state.ensure_service_dir(&name)?;
         let id = reg.allocate_id();
         reg.services.push(Service {
             id,
@@ -123,7 +122,7 @@ async fn run_background(dir: &Path, name: Option<String>, port: Option<u16>) -> 
             worker_pid: 0,
             tunnel_pid: None,
             created_at: chrono::Utc::now(),
-            state_dir: state.service_dir(&name),
+            state_dir: service_dir,
         });
         Ok((id, name))
     })??;

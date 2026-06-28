@@ -61,10 +61,39 @@ impl StateDir {
     }
 
     /// Create the root and services directory tree if missing.
+    ///
+    /// Both are created owner-only (mode 0700): the registry lives at the root
+    /// and every service's logs (which may contain request URIs and local
+    /// filesystem paths) live under `services/`, so they must not be readable
+    /// by other users on a shared host. Pre-existing directories are
+    /// re-chmodded to 0700 so a state tree created by an older build is sealed.
     pub fn ensure(&self) -> Result<()> {
-        std::fs::create_dir_all(self.services_dir())
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(self.services_dir())
             .with_context(|| format!("creating state directory {}", self.root.display()))?;
+        let _ = std::fs::set_permissions(
+            self.root(),
+            std::fs::Permissions::from_mode(0o700),
+        );
         Ok(())
+    }
+
+    /// Create (or reuse) a single service's private directory with mode 0700
+    /// and return it. Holds that service's `worker.log`/`server.log`/`tunnel.log`.
+    pub fn ensure_service_dir(&self, name: &str) -> Result<PathBuf> {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let dir = self.service_dir(name);
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .with_context(|| format!("creating service directory for '{name}'"))?;
+        let _ =
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        Ok(dir)
     }
 }
 
