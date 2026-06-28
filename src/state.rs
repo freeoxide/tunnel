@@ -14,6 +14,7 @@ pub struct StateDir {
     root: PathBuf,
 }
 
+#[allow(dead_code)] // public surface of the frozen state API; callers may use any of these
 impl StateDir {
     /// Locate the OS-appropriate state directory for Freeoxide Tunnel.
     pub fn new() -> Result<Self> {
