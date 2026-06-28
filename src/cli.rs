@@ -40,6 +40,12 @@ pub struct Cli {
     /// Run in the foreground instead of spawning a detached worker.
     #[arg(long, short)]
     pub foreground: bool,
+
+    /// Answer "yes" to the sensitive-directory confirmation prompt
+    /// (e.g. when publishing `$HOME` or `/`). Non-interactive runs that target
+    /// a sensitive directory must pass this or they will refuse to start.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
 /// Explicit subcommands.

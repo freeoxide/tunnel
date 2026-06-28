@@ -37,7 +37,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         }) => crate::worker::run(id, name, dir, port).await,
         None => {
             let dir: PathBuf = cli.dir.unwrap_or_else(|| PathBuf::from("."));
-            start::run(Some(dir), cli.name, cli.port, cli.foreground).await
+            start::run(Some(dir), cli.name, cli.port, cli.foreground, cli.yes).await
         }
     }
 }

@@ -42,15 +42,67 @@ pub async fn run(
     name: Option<String>,
     port: Option<u16>,
     foreground: bool,
+    yes: bool,
 ) -> Result<()> {
     let dir = dir.unwrap_or_else(|| PathBuf::from("."));
     let dir = resolve_dir(&dir)?;
+    // Guard the most foot-gun cases: publishing the whole home directory or the
+    // filesystem root to the public internet. Dotfiles are already refused by
+    // the server (C1), but `$HOME` still exposes most of a user's life.
+    confirm_sensitive(&dir, yes)?;
 
     if foreground {
         run_foreground(&dir, name, port).await
     } else {
         run_background(&dir, name, port).await
     }
+}
+
+/// Refuse — or prompt for confirmation — when the served directory is a
+/// sensitive one (the home directory or `/`). Non-interactive runs must pass
+/// `yes`; a TTY gets a y/N prompt (default No).
+fn confirm_sensitive(dir: &Path, yes: bool) -> Result<()> {
+    if !is_sensitive_dir(dir) {
+        return Ok(());
+    }
+    use std::io::{IsTerminal, Write};
+    eprintln!(
+        "[!] Publishing '{}' to the PUBLIC internet via a Cloudflare Quick Tunnel.",
+        dir.display()
+    );
+    eprintln!("    Anyone with the URL can read its contents. Dotfiles are refused by default.");
+
+    if yes {
+        eprintln!("    (--yes given; proceeding)");
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "refusing to publish a sensitive directory ({}) non-interactively; \
+             re-run with --yes to confirm",
+            dir.display()
+        );
+    }
+    eprint!("    Proceed? [y/N] ");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+    if !line.trim().eq_ignore_ascii_case("y") {
+        bail!("aborted");
+    }
+    Ok(())
+}
+
+/// True for directories whose wholesale public exposure is almost certainly a
+/// mistake: the filesystem root and the user's home directory.
+fn is_sensitive_dir(dir: &Path) -> bool {
+    if dir == Path::new("/") {
+        return true;
+    }
+    if let Some(home) = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()) {
+        return dir == home;
+    }
+    false
 }
 
 /// Resolve a directory to an absolute, existing, readable path.
