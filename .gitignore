@@ -24,3 +24,6 @@ target
 # Added by cargo
 
 /target
+
+# Claude Code harness state (local worktrees, session data, etc.)
+.claude/
