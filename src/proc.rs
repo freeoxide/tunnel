@@ -33,6 +33,11 @@ pub fn pid_alive(pid: u32) -> bool {
 /// whole group (negative pid) and are best-effort — members that are already
 /// gone return `ESRCH`, which we ignore.
 pub fn shutdown_process_group(pgid: u32) {
+    // pgid == 0 means "no group recorded": kill(-0) is kill(0), which signals
+    // the CALLER's own process group (self-kill). Treat it as a no-op.
+    if pgid == 0 {
+        return;
+    }
     let raw = -(pgid as i32);
     let _ = kill(Pid::from_raw(raw), Signal::SIGTERM);
     std::thread::sleep(std::time::Duration::from_millis(1500));

@@ -50,25 +50,52 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
 
     // Recover our registry entry (parent race). The parent reserves the entry
     // before spawning us, but there is a window before the atomic save lands.
+    // Look up by id, not name: if a stale worker is still draining while the
+    // parent reuses this name for a new service, a name lookup would bind us to
+    // the wrong entry. The id is unique and stable.
     let deadline = std::time::Instant::now() + REGISTRY_LOOKUP_TIMEOUT;
     let mut found_entry = false;
     while std::time::Instant::now() < deadline {
-        if Registry::load(&state)?.find(&name).is_some() {
+        let located = Registry::update(&state, |reg| {
+            if let Some(svc) = reg.find_mut(&id.to_string()) {
+                // Self-register our pid if the parent never recorded it (e.g. it
+                // died between spawn and recording), so `ft kill` can still
+                // reach us.
+                if svc.worker_pid == 0 {
+                    svc.worker_pid = std::process::id();
+                }
+                true
+            } else {
+                false
+            }
+        })?;
+        if located {
             found_entry = true;
             break;
         }
         tokio::time::sleep(REGISTRY_LOOKUP_INTERVAL).await;
     }
     if !found_entry {
-        anyhow::bail!("registry entry for service {name:?} never appeared");
+        // Dying worker mustn't leave a permanent stale entry; clear ours by id.
+        let _ = Registry::update(&state, |reg| {
+            reg.remove(id);
+        });
+        anyhow::bail!("registry entry for service id={id} never appeared");
     }
 
     // Bind the listener now (fail-fast): if the port is taken, the worker exits
     // immediately and the parent's poll detects the dead worker instead of
     // waiting out the full timeout with a dead tunnel returning 502s.
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-        .await
-        .with_context(|| format!("failed to bind 127.0.0.1:{port}"))?;
+    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            // Dying worker mustn't leave a permanent stale entry.
+            let _ = Registry::update(&state, |reg| {
+                reg.remove(id);
+            });
+            return Err(e).with_context(|| format!("failed to bind 127.0.0.1:{port}"));
+        }
+    };
     tracing::info!("static server bound on 127.0.0.1:{port}");
 
     let router = static_server::router(dir.clone());
@@ -91,6 +118,10 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
         // gracefully (it may already have accepted connections).
         let _ = shutdown_tx.send(());
         let _ = tokio::time::timeout(SERVER_SHUTDOWN_TIMEOUT, &mut server_handle).await;
+        // Dying worker mustn't leave a permanent stale entry.
+        let _ = Registry::update(&state, |reg| {
+            reg.remove(id);
+        });
         return Err(e);
     }
     let mut child = match cloudflared::spawn(port, tunnel_log.clone()) {
@@ -99,6 +130,10 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
             tracing::error!(%e, "failed to spawn cloudflared");
             let _ = shutdown_tx.send(());
             let _ = tokio::time::timeout(SERVER_SHUTDOWN_TIMEOUT, &mut server_handle).await;
+            // Dying worker mustn't leave a permanent stale entry.
+            let _ = Registry::update(&state, |reg| {
+                reg.remove(id);
+            });
             return Err(e);
         }
     };
@@ -120,6 +155,7 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
     let stderr = child.stderr.take();
 
     let ctx = ReaderCtx {
+        id,
         name: name.clone(),
         state: state.clone(),
         tunnel_pid,
@@ -226,6 +262,10 @@ enum ReaderExit {
 /// Shared context handed to each output-reader task.
 #[derive(Clone)]
 struct ReaderCtx {
+    /// Numeric id — the lookup key for registry writes (unique & stable, unlike
+    /// `name`, which the parent may reuse for a fresh service after a kill).
+    id: u64,
+    /// Display only — used in log messages, never as a registry key.
     name: String,
     state: StateDir,
     tunnel_pid: Option<u32>,
@@ -270,18 +310,20 @@ where
 }
 
 /// Record the discovered `url` (and the tunnel pid, if known) on the registry
-/// entry for `ctx.name` under an exclusive lock.
+/// entry for `ctx.id` under an exclusive lock. Looks up by id so a stale worker
+/// draining alongside a name-reuse can't clobber the freshly-reused name's entry.
 fn publish_url(ctx: &ReaderCtx, url: String) -> Result<()> {
-    let name = ctx.name.clone();
+    let id = ctx.id;
+    let name = &ctx.name;
     let tunnel_pid = ctx.tunnel_pid;
     Registry::update(&ctx.state, |reg| {
-        if let Some(svc) = reg.find_mut(&name) {
+        if let Some(svc) = reg.find_mut(&id.to_string()) {
             svc.public_url = Some(url.clone());
             if svc.tunnel_pid.is_none() {
                 svc.tunnel_pid = tunnel_pid;
             }
         } else {
-            tracing::warn!("service {} vanished before URL could be recorded", name);
+            tracing::warn!("service id={id} ({name}) vanished before URL could be recorded");
         }
     })
 }

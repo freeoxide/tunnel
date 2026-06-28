@@ -31,26 +31,32 @@ pub fn ensure_installed() -> Result<PathBuf> {
 
 /// Extract the first Quick Tunnel URL from a line of `cloudflared` output.
 ///
-/// Looks for `https://` and takes the run of non-whitespace characters that
-/// follow. The result is accepted only if the host component ends with
-/// `.trycloudflare.com`; anything else (e.g. a documentation link) is
-/// ignored and `None` is returned.
+/// Scans every `https://` occurrence left-to-right. For each candidate the
+/// host is taken by stripping the `https://` prefix and reading up to the
+/// first `/` or `?`. The first candidate whose host ends with
+/// `.trycloudflare.com` is returned (with trailing punctuation stripped);
+/// any earlier non-tunnel `https://` (e.g. a documentation link) is skipped.
 pub fn extract_url(text: &str) -> Option<String> {
-    let start = text.find("https://")?;
-    let rest = &text[start..];
-    // The URL runs until the next whitespace character.
-    let url = rest.split_whitespace().next()?;
-    // Strip any trailing punctuation that cloudflared occasionally appends.
-    let url = url.trim_end_matches(['.', ')', ',', ';', '"', '\'']);
-    let host = url
-        .strip_prefix("https://")
-        .and_then(|s| s.split('/').next())
-        .unwrap_or("");
-    if host.ends_with(".trycloudflare.com") {
-        Some(url.to_string())
-    } else {
-        None
+    let mut search_from = 0;
+    while let Some(rel) = text[search_from..].find("https://") {
+        let start = search_from + rel;
+        let rest = &text[start..];
+        // The URL runs until the next whitespace character.
+        let url = rest.split_whitespace().next()?;
+        // Strip any trailing punctuation that cloudflared occasionally appends.
+        let url = url.trim_end_matches(['.', ')', ',', ';', '"', '\'']);
+        // Host = after `https://`, up to the first `/` or `?`.
+        let host = url
+            .strip_prefix("https://")
+            .map(|s| s.split(['/', '?']).next().unwrap_or(""))
+            .unwrap_or("");
+        if host.ends_with(".trycloudflare.com") {
+            return Some(url.to_string());
+        }
+        // Advance past this `https://` and keep scanning for a later tunnel URL.
+        search_from = start + "https://".len();
     }
+    None
 }
 
 /// Spawn a `cloudflared` Quick Tunnel pointing at the local server.
@@ -78,6 +84,18 @@ pub fn spawn(port: u16, _tunnel_log: PathBuf) -> Result<Child> {
     // directly (even if the worker has already died and can no longer relay a
     // signal), and in the foreground flow a terminal Ctrl+C reaches it along
     // with `ft`. We do NOT `setsid()` here — that would orphan it on kill.
+
+    // Best-effort: on Linux, ask the kernel to SIGKILL cloudflared if its
+    // parent (the worker) dies — even via SIGKILL or OOM — so we never leave
+    // an orphaned tunnel behind when the worker is killed abnormally while
+    // cloudflared is idle. prctl result is ignored (best-effort).
+    #[cfg(target_os = "linux")]
+    unsafe {
+        cmd.pre_exec(|| {
+            let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong);
+            Ok(())
+        });
+    }
 
     let child = cmd
         .spawn()
@@ -137,6 +155,17 @@ mod tests {
         assert_eq!(
             extract_url(line),
             Some("https://my-tunnel.trycloudflare.com".to_string())
+        );
+    }
+
+    #[test]
+    fn skips_non_tunnel_url_before_tunnel_url() {
+        // A non-tunnel https:// precedes the trycloudflare URL on the same
+        // line. extract_url must skip it and return the later tunnel URL.
+        let line = "docs: https://developers.cloudflare.com/  tunnel: https://real-tunnel.trycloudflare.com";
+        assert_eq!(
+            extract_url(line),
+            Some("https://real-tunnel.trycloudflare.com".to_string())
         );
     }
 }

@@ -41,10 +41,15 @@ pub async fn run(target: String, follow: bool) -> Result<()> {
     Ok(())
 }
 
+/// Maximum number of bytes read from a log into memory at once. Logs can grow
+/// large, so only the trailing window is held when computing the tail.
+const READ_CAP: u64 = 65_536;
+
 /// Print a header and the last ~`TAIL_LINES` lines of `path`.
 ///
-/// Reads the whole file (acceptable for MVP-sized logs) and prints its trailing
-/// lines. Friendly error if the file cannot be opened.
+/// For large files, only the trailing `READ_CAP` bytes are read so memory stays
+/// bounded (a partial first line may be dropped). Friendly error if the file
+/// cannot be opened.
 async fn print_tail(path: &PathBuf, label: &str) -> Result<()> {
     println!("--- {label} ---");
 
@@ -56,6 +61,16 @@ async fn print_tail(path: &PathBuf, label: &str) -> Result<()> {
         }
         Err(e) => bail!("opening log {}: {}", path.display(), e),
     };
+
+    // If the file is larger than the cap, seek to the last `READ_CAP` bytes
+    // before reading so we never hold the whole thing in memory.
+    if let Ok(meta) = file.metadata().await
+        && meta.len() > READ_CAP
+    {
+        file.seek(std::io::SeekFrom::Start(meta.len() - READ_CAP))
+            .await?;
+    }
+
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)
         .await
@@ -76,6 +91,8 @@ async fn print_tail(path: &PathBuf, label: &str) -> Result<()> {
 /// error logs a warning and continues so a transient failure does not abort the
 /// follow.
 async fn follow_logs(tunnel_path: &PathBuf, worker_path: &PathBuf) -> Result<()> {
+    // A log may not exist yet (e.g. a service that is still starting). Tolerate
+    // that by opening each file best-effort and skipping any that are absent.
     let mut tunnel = open_at_end(tunnel_path).await?;
     let mut worker = open_at_end(worker_path).await?;
 
@@ -86,28 +103,51 @@ async fn follow_logs(tunnel_path: &PathBuf, worker_path: &PathBuf) -> Result<()>
             _ = tokio::time::sleep(FOLLOW_INTERVAL) => {}
         }
 
-        drain_appended(&mut tunnel).await;
-        drain_appended(&mut worker).await;
+        if let Some(f) = tunnel.as_mut() {
+            drain_appended(f).await;
+        }
+        if let Some(f) = worker.as_mut() {
+            drain_appended(f).await;
+        }
     }
     Ok(())
 }
 
 /// Open `path` and seek to its end, ready for incremental reads.
-async fn open_at_end(path: &PathBuf) -> Result<tokio::fs::File> {
-    let mut file = tokio::fs::File::open(path)
-        .await
-        .with_context(|| format!("opening log {}", path.display()))?;
+///
+/// Returns `None` when the file does not exist yet (so a starting service does
+/// not crash `--follow`); any other I/O error is surfaced via `bail!`.
+async fn open_at_end(path: &PathBuf) -> Result<Option<tokio::fs::File>> {
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => bail!("opening log {}: {}", path.display(), e),
+    };
     file.seek(std::io::SeekFrom::End(0)).await?;
-    Ok(file)
+    Ok(Some(file))
 }
 
 /// Read any bytes appended since the last call and print each line.
+///
+/// Reads at most `READ_CAP` bytes per poll so a runaway writer cannot exhaust
+/// memory between polls; any backlog is picked up on subsequent iterations.
 async fn drain_appended(file: &mut tokio::fs::File) {
-    let mut buf = Vec::new();
-    if file.read_to_end(&mut buf).await.is_ok() && !buf.is_empty() {
-        let text = String::from_utf8_lossy(&buf);
-        for line in text.lines() {
-            println!("{line}");
+    let mut buf = vec![0u8; READ_CAP as usize];
+    loop {
+        match file.read(&mut buf).await {
+            Ok(0) => return,
+            Ok(n) => {
+                let text = String::from_utf8_lossy(&buf[..n]);
+                for line in text.lines() {
+                    println!("{line}");
+                }
+                if n < buf.len() {
+                    // Short read means we've caught up to EOF.
+                    return;
+                }
+                // Filled the buffer — more may be waiting; loop to drain it.
+            }
+            Err(_) => return,
         }
     }
 }

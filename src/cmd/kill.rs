@@ -19,15 +19,25 @@ use crate::state::StateDir;
 pub async fn run(target: String) -> Result<()> {
     let state = StateDir::new()?;
 
-    // Find and remove the entry atomically under the registry lock so a
-    // concurrent writer cannot resurrect or duplicate it.
-    let service = Registry::update(&state, |reg| {
+    // Resolve `target` with an UNLOCKED read first. This avoids creating
+    // `registry.lock` (which would fail with a raw 'No such file or directory'
+    // when the state dir does not yet exist) on a system with no services, and
+    // lets us emit the friendly 'no service matches' message without any dir.
+    let exists = Registry::load(&state)?.find(&target).is_some();
+    if !exists {
+        bail!("no service matches '{target}'");
+    }
+
+    // Remove the entry atomically under the registry lock so a concurrent
+    // writer cannot resurrect or duplicate it. `find` is re-checked under the
+    // lock in case it vanished between the unlocked read and here; `update`
+    // returns the removed service (cloned) or an error if the dir disappeared.
+    let Some(service) = Registry::update(&state, |reg| {
         reg.find(&target).cloned().inspect(|svc| {
             reg.remove(svc.id);
         })
-    })?;
-
-    let Some(service) = service else {
+    })?
+    else {
         bail!("no service matches '{target}'");
     };
 

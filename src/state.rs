@@ -86,9 +86,14 @@ fn state_base() -> Result<PathBuf> {
     Ok(home.join(".local").join("state"))
 }
 
-/// Reduce a name to a single safe path segment: only `[A-Za-z0-9_-]`, with
-/// surrounding dashes trimmed. Valid service names are unchanged; a hostile
-/// name like `../etc` collapses to `etc`.
+/// Reduce a name to a single safe path segment: any char outside
+/// `[A-Za-z0-9_-]` becomes `-` (so `.`, `/`, and other separators are all
+/// neutralized to dashes and can never form a self/parent-dir segment).
+/// Trailing/leading dashes are intentionally NOT trimmed — trimming made
+/// distinct valid names collide (e.g. `"a"` and `"-a"` both collapsed to `"a"`).
+/// A result that is empty, `.`, `..`, or consists only of dashes carries no
+/// usable identity, so it falls back to `"service"`. This keeps traversal
+/// neutralized while preserving name distinctness.
 fn safe_component(name: &str) -> String {
     let s: String = name
         .chars()
@@ -100,7 +105,12 @@ fn safe_component(name: &str) -> String {
             }
         })
         .collect();
-    s.trim_matches('-').to_string()
+    match s.as_str() {
+        // Empty, a self/parent marker, or all-dashes (no identity) -> fallback.
+        "" | "." | ".." => "service".to_string(),
+        _ if s.chars().all(|c| c == '-') => "service".to_string(),
+        _ => s,
+    }
 }
 
 #[cfg(test)]
@@ -113,8 +123,11 @@ mod tests {
     }
 
     #[test]
-    fn safe_component_collapses_traversal() {
-        assert_eq!(safe_component("../etc"), "etc");
+    fn safe_component_neutralizes_traversal() {
+        // `.` and `/` both become `-`, so `../etc` can never form a parent-dir
+        // reference. Leading dashes are NOT trimmed (would collide with `etc`),
+        // so the result is `---etc`.
+        assert_eq!(safe_component("../etc"), "---etc");
     }
 
     #[test]
@@ -123,9 +136,23 @@ mod tests {
     }
 
     #[test]
-    fn safe_component_pure_traversal_becomes_empty() {
-        // `..` maps entirely to dashes which then trim away to nothing.
-        assert_eq!(safe_component(".."), "");
+    fn safe_component_pure_traversal_falls_back_to_service() {
+        // `..` maps entirely to dots, which is unsafe (parent dir) -> "service".
+        assert_eq!(safe_component(".."), "service");
+    }
+
+    #[test]
+    fn safe_component_empty_falls_back_to_service() {
+        // All-dashes name collapses to empty -> "service" (was "" before).
+        assert_eq!(safe_component("---"), "service");
+    }
+
+    #[test]
+    fn safe_component_does_not_trim_dashes() {
+        // Trimming would collide "-a" with "a"; both must stay distinct.
+        assert_eq!(safe_component("-a"), "-a");
+        assert_eq!(safe_component("a-"), "a-");
+        assert_eq!(safe_component("a"), "a");
     }
 
     #[test]

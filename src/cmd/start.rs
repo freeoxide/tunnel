@@ -5,7 +5,7 @@
 //! that owns the static server and the `cloudflared` child, then polls the
 //! registry for the discovered public URL — failing fast if the worker dies
 //! before publishing. With `--foreground` the server and tunnel run in-process
-//! and the command blocks until Ctrl+C.
+//! and the command blocks until cloudflared exits or Ctrl+C is received.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -77,8 +77,14 @@ async fn run_background(dir: &Path, name: Option<String>, port: Option<u16>) -> 
     let state = StateDir::new()?;
 
     // --- Port -------------------------------------------------------------
+    // `is_port_free(0)` misleadingly returns true (the kernel treats 0 as
+    // "assign me one"), so reject it explicitly.
     let port = match port {
         Some(p) => {
+            ensure!(
+                p != 0,
+                "port 0 is reserved; pass an explicit port (1-65535) or omit --port"
+            );
             ensure!(port::is_port_free(p), "port {p} is already in use");
             p
         }
@@ -154,28 +160,61 @@ async fn run_background(dir: &Path, name: Option<String>, port: Option<u16>) -> 
                 return Ok(());
             }
             Some(svc) if !proc::pid_alive(svc.worker_pid) => {
-                // Worker died before publishing — clean up and fail fast.
+                // Worker died before publishing — reap any survivors, surface
+                // the reason inline (the entry is removed below, so we can't
+                // send the user to `ft logs` afterwards), then fail fast.
                 proc::shutdown_process_group(worker_pid);
+                let reason = last_reason(&state, &name);
                 let _ = Registry::update(&state, |reg| {
                     reg.remove(id);
                 });
-                bail!(
-                    "worker for '{name}' exited before the tunnel came up — see `ft logs {name}`"
-                );
+                bail!("worker for '{name}' exited before the tunnel came up{reason}");
             }
             _ => {}
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
-    bail!("timed out waiting for the tunnel URL — check `ft logs {name}`")
+    // Timed out: the worker + cloudflared may still be alive and the entry is
+    // still active, so tear them down like the fail-fast path before bailing.
+    proc::shutdown_process_group(worker_pid);
+    let _ = Registry::update(&state, |reg| {
+        reg.remove(id);
+    });
+    let reason = last_reason(&state, &name);
+    bail!("timed out waiting for the tunnel URL{reason}")
+}
+
+/// Best-effort last non-empty log line to surface in a start-failure message.
+/// Checks `tunnel.log` first (cloudflared's own output, where errors usually
+/// appear), then `worker.log`. Returns an empty string if nothing useful is
+/// found.
+fn last_reason(state: &StateDir, name: &str) -> String {
+    let pick = [state.tunnel_log(name), state.worker_log(name)]
+        .into_iter()
+        .find_map(|p| last_line(&p));
+    match pick {
+        Some(line) => format!(":\n  {line}"),
+        None => String::new(),
+    }
+}
+
+fn last_line(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    text.lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .map(str::to_owned)
 }
 
 /// Foreground flow: run the server and tunnel in this process and block until
-/// interrupted. No registry entry is written.
+/// cloudflared exits or Ctrl+C is received. No registry entry is written.
 async fn run_foreground(dir: &Path, name: Option<String>, port: Option<u16>) -> Result<()> {
     use crate::static_server;
     use std::time::Duration;
 
+    /// Grace window after SIGTERM before SIGKILL'ing cloudflared.
+    const CLOUDFLARED_GRACE: Duration = Duration::from_secs(2);
     /// Upper bound on draining in-flight requests on Ctrl-C before we abort the
     /// server task, so a stuck request can't hang the foreground command.
     const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -184,6 +223,10 @@ async fn run_foreground(dir: &Path, name: Option<String>, port: Option<u16>) -> 
 
     let port = match port {
         Some(p) => {
+            ensure!(
+                p != 0,
+                "port 0 is reserved; pass an explicit port (1-65535) or omit --port"
+            );
             ensure!(port::is_port_free(p), "port {p} is already in use");
             p
         }
@@ -225,25 +268,53 @@ async fn run_foreground(dir: &Path, name: Option<String>, port: Option<u16>) -> 
         }));
     }
 
-    tokio::signal::ctrl_c()
-        .await
-        .context("installing Ctrl-C handler")?;
+    // Keep the foreground alive until cloudflared exits on its own OR Ctrl-C is
+    // received. Racing child.wait() ensures that if cloudflared dies before the
+    // URL is found (or any time later) we tear down instead of hanging forever.
+    let exit_reason = tokio::select! {
+        status = child.wait() => {
+            match status {
+                Ok(s) => tracing::info!(?s, "cloudflared exited"),
+                Err(e) => tracing::error!(%e, "waiting on cloudflared failed"),
+            }
+            ReaderExit::ChildExited
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("received Ctrl-C, shutting down foreground tunnel");
+            ReaderExit::Signal
+        }
+    };
 
-    tracing::info!("received Ctrl-C, shutting down foreground tunnel");
-
-    if let Some(pid) = tunnel_pid {
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid as i32),
-            nix::sys::signal::Signal::SIGTERM,
-        );
+    // If cloudflared may still be alive, shut it down and reap it to avoid a
+    // transient zombie. On ChildExited the select's wait() already reaped it.
+    if matches!(exit_reason, ReaderExit::Signal) {
+        if let Some(pid) = tunnel_pid {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+        }
+        if tokio::time::timeout(CLOUDFLARED_GRACE, child.wait())
+            .await
+            .is_err()
+            && let Some(pid) = tunnel_pid
+        {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        let _ = child.wait().await; // ensure reaped
     }
 
     for task in tasks {
         task.abort();
     }
 
-    // `serve`'s own Ctrl-C handler has already begun draining; bound it so a
-    // stuck request can't hang the foreground command, falling back to abort.
+    // `serve`'s own Ctrl-C handler has already begun draining on Ctrl-C; bound
+    // it so a stuck request can't hang the foreground command, falling back to
+    // abort. (On cloudflared-initiated exit, serve is still running until we
+    // abort/await it here.)
     match tokio::time::timeout(SERVER_SHUTDOWN_TIMEOUT, &mut server_handle).await {
         Ok(_) => {}
         Err(_) => {
@@ -256,6 +327,12 @@ async fn run_foreground(dir: &Path, name: Option<String>, port: Option<u16>) -> 
     }
 
     Ok(())
+}
+
+/// Why the foreground keep-alive loop ended — drives cloudflared teardown.
+enum ReaderExit {
+    ChildExited,
+    Signal,
 }
 
 /// Read `lines` to EOF, mirroring each to stdout, and print the foreground
