@@ -32,12 +32,20 @@ impl StateDir {
         self.root.join("registry.json")
     }
 
+    /// Advisory lock file serializing all registry mutations.
+    pub fn lock_path(&self) -> PathBuf {
+        self.root.join("registry.lock")
+    }
+
     pub fn services_dir(&self) -> PathBuf {
         self.root.join("services")
     }
 
+    /// Per-service directory. The name is reduced to a single safe path segment
+    /// so a registry-controlled (possibly hand-edited) name can never traverse
+    /// out of `services/` via `..` or separators.
     pub fn service_dir(&self, name: &str) -> PathBuf {
-        self.services_dir().join(name)
+        self.services_dir().join(safe_component(name))
     }
 
     pub fn worker_log(&self, name: &str) -> PathBuf {
@@ -61,13 +69,36 @@ impl StateDir {
 }
 
 /// Resolve the XDG state base directory (`$XDG_STATE_HOME`, else `~/.local/state`).
+/// A relative `XDG_STATE_HOME` is made absolute against the current directory so
+/// the registry/log tree always lives at a stable absolute location.
 fn state_base() -> Result<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_STATE_HOME").filter(|s| !s.is_empty()) {
-        return Ok(PathBuf::from(xdg));
+        let p = PathBuf::from(xdg);
+        if p.is_absolute() {
+            return Ok(p);
+        }
+        return Ok(std::path::absolute(&p).context("resolving relative XDG_STATE_HOME")?);
     }
     let home = BaseDirs::new()
         .context("could not determine a home directory for state storage")?
         .home_dir()
         .to_path_buf();
     Ok(home.join(".local").join("state"))
+}
+
+/// Reduce a name to a single safe path segment: only `[A-Za-z0-9_-]`, with
+/// surrounding dashes trimmed. Valid service names are unchanged; a hostile
+/// name like `../etc` collapses to `etc`.
+fn safe_component(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    s.trim_matches('-').to_string()
 }

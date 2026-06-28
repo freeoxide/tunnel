@@ -1,9 +1,45 @@
 //! Persistence and querying of the service registry.
+//!
+//! All mutations go through [`Registry::update`], which holds an exclusive
+//! `flock` on `registry.lock` for the whole load → modify → save sequence. This
+//! serializes concurrent `ft` invocations so they cannot clobber each other's
+//! writes, allocate duplicate IDs, or erase fields another writer just published.
 
 use crate::error::Result;
 use crate::model::{Registry, Service};
 use crate::state::StateDir;
 use anyhow::Context;
+use std::fs::OpenOptions;
+use std::os::unix::io::AsRawFd;
+
+/// An advisory lock on the registry, released on drop.
+struct RegistryLock(std::fs::File);
+
+impl Drop for RegistryLock {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn acquire_lock(state: &StateDir) -> Result<RegistryLock> {
+    let path = state.lock_path();
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening registry lock {}", path.display()))?;
+    // Block until we hold an exclusive advisory lock on the lock file.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(anyhow::anyhow!(
+            "locking registry: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(RegistryLock(file))
+}
 
 impl Registry {
     /// Load the registry, returning an empty one if it does not yet exist.
@@ -33,10 +69,23 @@ impl Registry {
         Ok(())
     }
 
-    /// Allocate the next service ID and advance the counter.
+    /// Run `f` against a fresh registry snapshot under an exclusive lock, then
+    /// persist. Use for every mutation so concurrent writers are serialized.
+    pub fn update<R, F>(state: &StateDir, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Registry) -> R,
+    {
+        let _lock = acquire_lock(state)?;
+        let mut reg = Registry::load(state)?;
+        let result = f(&mut reg);
+        reg.save(state)?;
+        Ok(result)
+    }
+
+    /// Allocate the next service ID and advance the counter (saturating).
     pub fn allocate_id(&mut self) -> u64 {
         let id = self.next_id.max(1);
-        self.next_id = id + 1;
+        self.next_id = self.next_id.saturating_add(1);
         id
     }
 

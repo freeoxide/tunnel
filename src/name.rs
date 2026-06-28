@@ -14,6 +14,11 @@ pub fn validate_name(name: &str) -> Result<()> {
     if name.len() > 64 {
         bail!("service name cannot be longer than 64 characters");
     }
+    if name.chars().all(|c| c.is_ascii_digit()) {
+        // An all-digit name would be indistinguishable from a numeric ID when
+        // used as a target, so it could never be addressed by name.
+        bail!("service name cannot be all digits — it would clash with numeric IDs");
+    }
     if !name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')

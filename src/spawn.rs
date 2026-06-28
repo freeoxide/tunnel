@@ -66,16 +66,18 @@ pub fn spawn_worker(id: u64, name: &str, dir: &Path, port: u16) -> Result<u32> {
     .stdout(Stdio::from(stdout_file))
     .stderr(Stdio::from(stderr_file));
 
-    // New process group: this child becomes group leader (pgid == child pid),
-    // so a later negative-pid signal reaches the whole tree.
-    cmd.process_group(0);
-
-    // New session: detach from any controlling terminal so the worker is not
-    // killed when the parent's session ends (e.g. on shell logout).
+    // New session via setsid(): the child becomes a session leader AND the
+    // leader of a fresh process group whose id equals its pid — so a later
+    // kill(-worker_pid) reaches the whole tree, including cloudflared, which
+    // inherits this group. We deliberately do NOT also call process_group(0):
+    // std applies that (via setpgid) before pre_exec, which would make the
+    // child a group leader first and cause setsid() to fail with EPERM. The
+    // error is propagated rather than swallowed so a failure to detach is loud.
     unsafe {
         cmd.pre_exec(|| {
-            nix::unistd::setsid().ok();
-            Ok(())
+            nix::unistd::setsid()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("setsid failed: {e}")))
+                .map(|_| ())
         });
     }
 

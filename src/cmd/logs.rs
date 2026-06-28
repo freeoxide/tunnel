@@ -48,9 +48,14 @@ pub async fn run(target: String, follow: bool) -> Result<()> {
 async fn print_tail(path: &PathBuf, label: &str) -> Result<()> {
     println!("--- {label} ---");
 
-    let mut file = tokio::fs::File::open(path)
-        .await
-        .with_context(|| format!("opening log {}", path.display()))?;
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("  (no {label}.log yet)");
+            return Ok(());
+        }
+        Err(e) => bail!("opening log {}: {}", path.display(), e),
+    };
     let mut buf = Vec::new();
     file.read_to_end(&mut buf).await.context("reading log file")?;
 

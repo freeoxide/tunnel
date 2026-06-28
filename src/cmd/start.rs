@@ -1,10 +1,11 @@
 //! The START command.
 //!
 //! `ft <dir>` (no subcommand) starts a tunnel for a local directory. The
-//! default background flow spawns a detached worker that owns the static
-//! server and the `cloudflared` child; the parent then polls the registry for
-//! the discovered public URL and returns. With `--foreground` the server and
-//! tunnel run in-process and the command blocks until Ctrl+C.
+//! default background flow reserves a registry entry, spawns a detached worker
+//! that owns the static server and the `cloudflared` child, then polls the
+//! registry for the discovered public URL — failing fast if the worker dies
+//! before publishing. With `--foreground` the server and tunnel run in-process
+//! and the command blocks until Ctrl+C.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +21,7 @@ use crate::model::{Registry, Service, ServiceKind};
 use crate::name;
 use crate::output;
 use crate::port;
+use crate::proc;
 use crate::spawn;
 use crate::state::StateDir;
 
@@ -30,9 +32,7 @@ const POLL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Entry point for the START command.
 ///
-/// `dir` defaults to `.` when the caller passes `None`. When `foreground` is
-/// true the server and tunnel run in this process (no registry entry); otherwise
-/// a detached worker is spawned and the parent waits for the URL.
+/// `dir` defaults to `.` when the caller passes `None`.
 pub async fn run(dir: Option<PathBuf>, name: Option<String>, port: Option<u16>, foreground: bool) -> Result<()> {
     let dir = dir.unwrap_or_else(|| PathBuf::from("."));
     let dir = resolve_dir(&dir)?;
@@ -45,15 +45,15 @@ pub async fn run(dir: Option<PathBuf>, name: Option<String>, port: Option<u16>, 
 }
 
 /// Resolve a directory to an absolute, existing, readable path.
-///
-/// Friendly errors for the common failure modes (missing / not a directory /
-/// unreadable) keep the CLI output clean.
 fn resolve_dir(dir: &Path) -> Result<PathBuf> {
     let abs = std::path::absolute(dir)
         .with_context(|| format!("resolving directory {}", dir.display()))?;
 
-    if !abs.exists() || !abs.is_dir() {
+    if !abs.exists() {
         bail!("directory '{}' does not exist", abs.display());
+    }
+    if !abs.is_dir() {
+        bail!("'{}' is not a directory", abs.display());
     }
     if !is_readable(&abs) {
         bail!("directory '{}' is not readable", abs.display());
@@ -66,29 +66,10 @@ fn is_readable(dir: &Path) -> bool {
     std::fs::read_dir(dir).is_ok()
 }
 
-/// Background flow: validate inputs, write the registry entry, spawn the
-/// detached worker, then poll for the public URL.
+/// Background flow: reserve the entry, spawn the detached worker, then poll for
+/// the public URL (failing fast if the worker dies first).
 async fn run_background(dir: &Path, name: Option<String>, port: Option<u16>) -> Result<()> {
     let state = StateDir::new()?;
-
-    // --- Name -------------------------------------------------------------
-    // Validate an explicit name (and reject duplicates), or generate a unique
-    // one derived from the directory basename.
-    let mut registry = Registry::load(&state)?;
-    let name = match name {
-        Some(n) => {
-            name::validate_name(&n)?;
-            ensure!(
-                !registry.name_exists(&n),
-                "a service named '{n}' already exists"
-            );
-            n
-        }
-        None => {
-            let base = name::generate_name(dir);
-            name::unique_name(&registry, &base)
-        }
-    };
 
     // --- Port -------------------------------------------------------------
     let port = match port {
@@ -102,65 +83,84 @@ async fn run_background(dir: &Path, name: Option<String>, port: Option<u16>) -> 
     // --- cloudflared ------------------------------------------------------
     cloudflared::ensure_installed()?;
 
-    // --- State + registry entry -------------------------------------------
     state.ensure()?;
-    std::fs::create_dir_all(state.service_dir(&name))
-        .with_context(|| format!("creating service directory for '{name}'"))?;
 
-    // Reload so the id is allocated against the freshest registry; the worker
-    // recovers this same entry by name.
-    registry = Registry::load(&state)?;
-    let id = registry.allocate_id();
-    let service = Service {
-        id,
-        name: name.clone(),
-        kind: ServiceKind::Static,
-        dir: dir.to_path_buf(),
-        port,
-        local_url: format!("http://127.0.0.1:{port}"),
-        public_url: None,
-        worker_pid: 0,
-        tunnel_pid: None,
-        created_at: chrono::Utc::now(),
-        state_dir: state.service_dir(&name),
-    };
-    registry.services.push(service);
-    registry.save(&state)?;
+    // --- Reserve name + id + entry atomically -----------------------------
+    // All under the registry lock: no duplicate names, no duplicate ids, and
+    // the entry exists before the worker is spawned. worker_pid is 0 until the
+    // worker is spawned below.
+    let (id, name) = Registry::update(&state, |reg| -> Result<(u64, String)> {
+        let name = match &name {
+            Some(n) => {
+                name::validate_name(n)?;
+                ensure!(!reg.name_exists(n), "a service named '{n}' already exists");
+                n.clone()
+            }
+            None => name::unique_name(reg, &name::generate_name(dir)),
+        };
+        std::fs::create_dir_all(state.service_dir(&name))
+            .with_context(|| format!("creating service directory for '{name}'"))?;
+        let id = reg.allocate_id();
+        reg.services.push(Service {
+            id,
+            name: name.clone(),
+            kind: ServiceKind::Static,
+            dir: dir.to_path_buf(),
+            port,
+            local_url: format!("http://127.0.0.1:{port}"),
+            public_url: None,
+            worker_pid: 0,
+            tunnel_pid: None,
+            created_at: chrono::Utc::now(),
+            state_dir: state.service_dir(&name),
+        });
+        Ok((id, name))
+    })??;
 
     // --- Spawn worker -----------------------------------------------------
-    let worker_pid = spawn::spawn_worker(id, &name, dir, port)?;
-    // Record the worker pid so liveness checks work immediately.
-    {
-        let mut registry = Registry::load(&state)?;
-        if let Some(svc) = registry.find_mut(&name) {
+    let worker_pid = match spawn::spawn_worker(id, &name, dir, port) {
+        Ok(pid) => pid,
+        Err(e) => {
+            // Release the reserved entry on spawn failure.
+            let _ = Registry::update(&state, |reg| {
+                reg.remove(id);
+            });
+            return Err(e);
+        }
+    };
+    // Record the real worker pid under the lock so we never clobber the
+    // worker's own public_url write.
+    Registry::update(&state, |reg| {
+        if let Some(svc) = reg.find_mut(&name) {
             svc.worker_pid = worker_pid;
         }
-        registry.save(&state)?;
-    }
+    })?;
 
-    // --- Poll for the tunnel URL -----------------------------------------
-    let mut final_service = None;
+    // --- Poll for the tunnel URL (fail-fast on worker death) --------------
     let deadline = Instant::now() + POLL_TIMEOUT;
-    while Instant::now() < deadline {
-        let registry = Registry::load(&state)?;
-        if let Some(svc) = registry.find(&name) {
-            if svc.public_url.is_some() {
-                final_service = Some(svc.clone());
-                break;
+    loop {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let snapshot = Registry::load(&state)?.find(&name).cloned();
+        match snapshot {
+            Some(svc) if svc.public_url.is_some() => {
+                output::print_started(&svc);
+                return Ok(());
             }
+            Some(svc) if !proc::pid_alive(svc.worker_pid) => {
+                // Worker died before publishing — clean up and fail fast.
+                proc::shutdown_process_group(worker_pid);
+                let _ = Registry::update(&state, |reg| {
+                    reg.remove(id);
+                });
+                bail!("worker for '{name}' exited before the tunnel came up — see `ft logs {name}`");
+            }
+            _ => {}
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
-
-    match final_service {
-        Some(svc) => {
-            output::print_started(&svc);
-            Ok(())
-        }
-        None => {
-            bail!("timed out waiting for the tunnel URL — check 'ft logs {name}'")
-        }
-    }
+    bail!("timed out waiting for the tunnel URL — check `ft logs {name}`")
 }
 
 /// Foreground flow: run the server and tunnel in this process and block until
@@ -191,9 +191,7 @@ async fn run_foreground(dir: &Path, name: Option<String>, port: Option<u16>) -> 
     let tunnel_pid = child.id();
 
     // Mirror cloudflared's combined output to stdout and print the success
-    // banner on first URL discovery. First discovery wins. `ChildStdout` and
-    // `ChildStderr` are distinct types, so each stream gets its own reader task
-    // sharing the same discovery flag.
+    // banner on first URL discovery.
     let found = Arc::new(AtomicBool::new(false));
 
     let mut tasks = Vec::new();
@@ -212,7 +210,6 @@ async fn run_foreground(dir: &Path, name: Option<String>, port: Option<u16>) -> 
         }));
     }
 
-    // Wait for Ctrl+C, then signal cloudflared and clean up.
     tokio::signal::ctrl_c()
         .await
         .context("installing Ctrl-C handler")?;
@@ -236,10 +233,6 @@ async fn run_foreground(dir: &Path, name: Option<String>, port: Option<u16>) -> 
 
 /// Read `lines` to EOF, mirroring each to stdout, and print the foreground
 /// success banner on the first discovered Quick Tunnel URL.
-///
-/// Shared across cloudflared's stdout and stderr reader tasks via `found`
-/// (first discovery wins) and the borrow-checked `&display_name`/`port` (both
-/// `Copy`/cheap, so the borrow is sufficient).
 async fn drain_and_announce<R>(
     mut lines: tokio::io::Lines<R>,
     found: Arc<AtomicBool>,

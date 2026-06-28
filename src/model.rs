@@ -65,6 +65,13 @@ impl Service {
     /// The static server runs in-process inside the worker, so worker liveness
     /// implies server liveness.
     pub fn status(&self) -> ServiceStatus {
+        // A worker_pid of 0 means the parent reserved the entry but has not yet
+        // recorded the spawned worker's pid. Treat that as Starting rather than
+        // probing pid 0 (which would otherwise read as Stale during the spawn
+        // window).
+        if self.worker_pid == 0 {
+            return ServiceStatus::Starting;
+        }
         let alive = crate::proc::pid_alive(self.worker_pid);
         match (alive, self.public_url.as_ref()) {
             (false, _) => ServiceStatus::Stale,

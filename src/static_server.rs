@@ -35,6 +35,12 @@ pub async fn serve(router: Router, port: u16) -> crate::error::Result<()> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
         .with_context(|| format!("failed to bind 127.0.0.1:{port}"))?;
+    serve_on(router, listener).await
+}
+
+/// Serve on an already-bound listener. Lets the caller bind (and fail fast on a
+/// port conflict) before committing to spawning the tunnel.
+pub async fn serve_on(router: Router, listener: tokio::net::TcpListener) -> crate::error::Result<()> {
     axum::serve(listener, router).await?;
     Ok(())
 }

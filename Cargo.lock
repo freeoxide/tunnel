@@ -345,6 +345,7 @@ dependencies = [
  "clap",
  "comfy-table",
  "directories",
+ "libc",
  "nix",
  "open",
  "serde",

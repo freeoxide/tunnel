@@ -2,7 +2,6 @@
 
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use std::io;
 use std::path::Path;
 
 /// True if process `pid` exists and its command line contains `needle`.
@@ -29,15 +28,15 @@ pub fn pid_alive(pid: u32) -> bool {
     pid_matches(pid, "run-worker")
 }
 
-/// Send `SIGTERM` to an entire process group.
-///
-/// `pgid` is expected to be the worker's PID, since the worker calls
-/// `setsid()` on spawn (so its process-group id equals its pid). A negative
-/// pid targets the whole group, which includes the `cloudflared` child once it
-/// inherits the worker's group.
-pub fn kill_process_group(pgid: u32) -> io::Result<()> {
-    kill(Pid::from_raw(-(pgid as i32)), Signal::SIGTERM)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+/// Gracefully tear down a process group: `SIGTERM`, give it a short grace
+/// window to exit, then `SIGKILL` to guarantee cleanup. Both signals target the
+/// whole group (negative pid) and are best-effort — members that are already
+/// gone return `ESRCH`, which we ignore.
+pub fn shutdown_process_group(pgid: u32) {
+    let raw = -(pgid as i32);
+    let _ = kill(Pid::from_raw(raw), Signal::SIGTERM);
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let _ = kill(Pid::from_raw(raw), Signal::SIGKILL);
 }
 
 /// Read `/proc/<pid>/cmdline` and report whether any argument contains `needle`.
