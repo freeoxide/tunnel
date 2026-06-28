@@ -29,6 +29,10 @@ use crate::state::StateDir;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Upper bound on how long the parent will wait for the tunnel URL.
 const POLL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Most bytes read from a log when surfacing a start-failure reason. Logs can
+/// grow large; only the trailing window is examined (the first, partial line
+/// after a mid-file seek is skipped).
+const LAST_REASON_CAP: u64 = 16 * 1024;
 
 /// Entry point for the START command.
 ///
@@ -138,10 +142,13 @@ async fn run_background(dir: &Path, name: Option<String>, port: Option<u16>) -> 
             return Err(e);
         }
     };
-    // Record the real worker pid under the lock so we never clobber the
-    // worker's own public_url write.
+    // Record the real worker pid under the lock. Key by the stable numeric id,
+    // not the name: the name may be reused for a fresh service after a kill,
+    // and an id key is immune to that (and matches how the worker looks itself
+    // up), so a concurrent kill cannot make us record the pid against the wrong
+    // entry.
     Registry::update(&state, |reg| {
-        if let Some(svc) = reg.find_mut(&name) {
+        if let Some(svc) = reg.find_mut(&id.to_string()) {
             svc.worker_pid = worker_pid;
         }
     })?;
@@ -152,7 +159,7 @@ async fn run_background(dir: &Path, name: Option<String>, port: Option<u16>) -> 
         if Instant::now() >= deadline {
             break;
         }
-        let snapshot = Registry::load(&state)?.find(&name).cloned();
+        let snapshot = Registry::load(&state)?.find(&id.to_string()).cloned();
         match snapshot {
             Some(svc) if svc.public_url.is_some() => {
                 output::print_started(&svc);
@@ -162,6 +169,18 @@ async fn run_background(dir: &Path, name: Option<String>, port: Option<u16>) -> 
                 // Worker died before publishing — reap any survivors, surface
                 // the reason inline (the entry is removed below, so we can't
                 // send the user to `ft logs` afterwards), then fail fast.
+                proc::shutdown_process_group(worker_pid);
+                let reason = last_reason(&state, &name);
+                let _ = Registry::update(&state, |reg| {
+                    reg.remove(id);
+                });
+                bail!("worker for '{name}' exited before the tunnel came up{reason}");
+            }
+            None => {
+                // Our entry vanished — a concurrent `ft kill` removed it, or the
+                // worker self-removed on its own failure. Tear the worker down
+                // and bail now instead of polling the full 30s with a live,
+                // orphaned worker that nothing in the registry points at.
                 proc::shutdown_process_group(worker_pid);
                 let reason = last_reason(&state, &name);
                 let _ = Registry::update(&state, |reg| {
@@ -197,9 +216,26 @@ fn last_reason(state: &StateDir, name: &str) -> String {
     }
 }
 
+/// The last non-empty line of `path`, reading at most `LAST_REASON_CAP`
+/// trailing bytes so a chatty cloudflared cannot make a start-failure message
+/// slurp megabytes into memory.
 fn last_line(path: &Path) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
-    let text = String::from_utf8_lossy(&bytes);
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len > LAST_REASON_CAP {
+        // Seek into the trailing window; the first "line" then starts mid-file
+        // and is likely partial, so drop everything up to the first newline.
+        file.seek(SeekFrom::Start(len - LAST_REASON_CAP)).ok()?;
+    }
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    let text: &str = if len > LAST_REASON_CAP {
+        text.find('\n').map(|i| &text[i + 1..]).unwrap_or("")
+    } else {
+        &text
+    };
     text.lines()
         .map(str::trim)
         .rfind(|l| !l.is_empty())
