@@ -74,10 +74,10 @@ impl StateDir {
 fn state_base() -> Result<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_STATE_HOME").filter(|s| !s.is_empty()) {
         let p = PathBuf::from(xdg);
-        if p.is_absolute() {
-            return Ok(p);
+        if !p.is_absolute() {
+            return std::path::absolute(&p).context("resolving relative XDG_STATE_HOME");
         }
-        return Ok(std::path::absolute(&p).context("resolving relative XDG_STATE_HOME")?);
+        return Ok(p);
     }
     let home = BaseDirs::new()
         .context("could not determine a home directory for state storage")?
@@ -101,4 +101,35 @@ fn safe_component(name: &str) -> String {
         })
         .collect();
     s.trim_matches('-').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_component_passes_simple_name() {
+        assert_eq!(safe_component("blog"), "blog");
+    }
+
+    #[test]
+    fn safe_component_collapses_traversal() {
+        assert_eq!(safe_component("../etc"), "etc");
+    }
+
+    #[test]
+    fn safe_component_joins_separators_with_dashes() {
+        assert_eq!(safe_component("a/b/c"), "a-b-c");
+    }
+
+    #[test]
+    fn safe_component_pure_traversal_becomes_empty() {
+        // `..` maps entirely to dashes which then trim away to nothing.
+        assert_eq!(safe_component(".."), "");
+    }
+
+    #[test]
+    fn safe_component_keeps_underscores_and_dashes() {
+        assert_eq!(safe_component("blog_1-2"), "blog_1-2");
+    }
 }

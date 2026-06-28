@@ -1,6 +1,6 @@
 //! Process introspection and signaling helpers.
 
-use nix::sys::signal::{kill, Signal};
+use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use std::path::Path;
 
@@ -13,7 +13,7 @@ use std::path::Path;
 pub fn pid_matches(pid: u32, needle: &str) -> bool {
     #[cfg(target_os = "linux")]
     {
-        return cmdline_contains(pid, needle);
+        cmdline_contains(pid, needle)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -46,9 +46,11 @@ fn cmdline_contains(pid: u32, needle: &str) -> bool {
     let Ok(bytes) = std::fs::read(&path) else {
         return false;
     };
-    bytes
-        .split(|b| *b == 0)
-        .any(|arg| std::str::from_utf8(arg).map(|s| s.contains(needle)).unwrap_or(false))
+    bytes.split(|b| *b == 0).any(|arg| {
+        std::str::from_utf8(arg)
+            .map(|s| s.contains(needle))
+            .unwrap_or(false)
+    })
 }
 
 #[cfg(not(target_os = "linux"))]

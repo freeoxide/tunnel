@@ -29,6 +29,10 @@ const REGISTRY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 const REGISTRY_LOOKUP_INTERVAL: Duration = Duration::from_millis(100);
 /// Grace window after SIGTERM before SIGKILL'ing cloudflared.
 const CLOUDFLARED_GRACE: Duration = Duration::from_secs(2);
+/// Upper bound on how long we wait for in-flight requests to drain after
+/// signalling graceful shutdown. If a request is stuck, we abort the server
+/// task as a fallback so it can't hang the worker indefinitely.
+const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Run the worker to completion.
 pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
@@ -68,19 +72,33 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
     tracing::info!("static server bound on 127.0.0.1:{port}");
 
     let router = static_server::router(dir.clone());
-    let mut server_handle = tokio::spawn(async move { static_server::serve_on(router, listener).await });
+
+    // Graceful shutdown channel: on the teardown path we fire `shutdown_tx`,
+    // which lets axum stop accepting and drain in-flight requests instead of
+    // aborting the server task (and dropping the requests) mid-flight.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut server_handle = tokio::spawn(async move {
+        static_server::serve_on(router, listener, async {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
 
     // cloudflared
     if let Err(e) = cloudflared::ensure_installed() {
         tracing::error!(%e, "cloudflared unavailable");
-        server_handle.abort();
+        // Nothing is serving the tunnel yet; tear the static server down
+        // gracefully (it may already have accepted connections).
+        let _ = shutdown_tx.send(());
+        let _ = tokio::time::timeout(SERVER_SHUTDOWN_TIMEOUT, &mut server_handle).await;
         return Err(e);
     }
     let mut child = match cloudflared::spawn(port, tunnel_log.clone()) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(%e, "failed to spawn cloudflared");
-            server_handle.abort();
+            let _ = shutdown_tx.send(());
+            let _ = tokio::time::timeout(SERVER_SHUTDOWN_TIMEOUT, &mut server_handle).await;
             return Err(e);
         }
     };
@@ -160,13 +178,15 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
                 nix::sys::signal::Signal::SIGTERM,
             );
         }
-        if tokio::time::timeout(CLOUDFLARED_GRACE, child.wait()).await.is_err() {
-            if let Some(pid) = tunnel_pid {
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(pid as i32),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-            }
+        if tokio::time::timeout(CLOUDFLARED_GRACE, child.wait())
+            .await
+            .is_err()
+            && let Some(pid) = tunnel_pid
+        {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
         }
         let _ = child.wait().await; // ensure reaped
     }
@@ -174,7 +194,23 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
     for task in reader_tasks {
         task.abort();
     }
-    server_handle.abort();
+
+    // Drain in-flight requests: fire the shutdown signal and let axum finish
+    // what it's serving, with a bounded timeout so a stuck request can't hang
+    // the worker. If the drain doesn't complete in time, abort as a fallback.
+    let _ = shutdown_tx.send(());
+    match tokio::time::timeout(SERVER_SHUTDOWN_TIMEOUT, &mut server_handle).await {
+        Ok(Ok(Ok(()))) => tracing::info!("static server drained and exited"),
+        Ok(Ok(Err(e))) => tracing::error!(%e, "static server task failed during shutdown"),
+        Ok(Err(e)) => tracing::error!(%e, "static server task panicked during shutdown"),
+        Err(_) => {
+            tracing::warn!(
+                "static server did not drain within {:?}, aborting",
+                SERVER_SHUTDOWN_TIMEOUT
+            );
+            server_handle.abort();
+        }
+    }
 
     tracing::info!("worker exiting");
     Ok(())
@@ -214,14 +250,13 @@ where
                     let _ = f.flush().await;
                 }
 
-                if !ctx.url_found.load(Ordering::Acquire) {
-                    if let Some(url) = cloudflared::extract_url(&line) {
-                        if !ctx.url_found.swap(true, Ordering::AcqRel) {
-                            tracing::info!(%url, "discovered tunnel URL");
-                            if let Err(e) = publish_url(&ctx, url) {
-                                tracing::error!(%e, "failed to record tunnel URL");
-                            }
-                        }
+                if !ctx.url_found.load(Ordering::Acquire)
+                    && let Some(url) = cloudflared::extract_url(&line)
+                    && !ctx.url_found.swap(true, Ordering::AcqRel)
+                {
+                    tracing::info!(%url, "discovered tunnel URL");
+                    if let Err(e) = publish_url(&ctx, url) {
+                        tracing::error!(%e, "failed to record tunnel URL");
                     }
                 }
             }
@@ -256,7 +291,7 @@ fn publish_url(ctx: &ReaderCtx, url: String) -> Result<()> {
 /// already installed.
 fn init_tracing(worker_log: &Path, server_log: &Path) {
     use std::sync::Mutex;
-    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+    use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
     // tower_http request traces -> server.log; everything else -> worker.log.
     // Each layer is Option-wrapped so a failure to open one log file just drops

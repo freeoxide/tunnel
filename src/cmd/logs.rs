@@ -57,7 +57,9 @@ async fn print_tail(path: &PathBuf, label: &str) -> Result<()> {
         Err(e) => bail!("opening log {}: {}", path.display(), e),
     };
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf).await.context("reading log file")?;
+    file.read_to_end(&mut buf)
+        .await
+        .context("reading log file")?;
 
     let text = String::from_utf8_lossy(&buf);
     let tail: Vec<&str> = text.lines().rev().take(TAIL_LINES).collect::<Vec<_>>();

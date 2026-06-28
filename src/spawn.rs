@@ -47,8 +47,8 @@ pub fn spawn_worker(id: u64, name: &str, dir: &Path, port: u16) -> Result<u32> {
         .open(&worker_log)
         .with_context(|| format!("opening worker log {}", worker_log.display()))?;
 
-    let exe = std::env::current_exe()
-        .context("locating the current executable to spawn the worker")?;
+    let exe =
+        std::env::current_exe().context("locating the current executable to spawn the worker")?;
 
     let mut cmd = Command::new(exe);
     cmd.args([
@@ -76,7 +76,7 @@ pub fn spawn_worker(id: u64, name: &str, dir: &Path, port: u16) -> Result<u32> {
     unsafe {
         cmd.pre_exec(|| {
             nix::unistd::setsid()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("setsid failed: {e}")))
+                .map_err(|e| std::io::Error::other(format!("setsid failed: {e}")))
                 .map(|_| ())
         });
     }

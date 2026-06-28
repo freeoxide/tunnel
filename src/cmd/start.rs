@@ -8,8 +8,8 @@
 //! and the command blocks until Ctrl+C.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail, ensure};
@@ -33,7 +33,12 @@ const POLL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Entry point for the START command.
 ///
 /// `dir` defaults to `.` when the caller passes `None`.
-pub async fn run(dir: Option<PathBuf>, name: Option<String>, port: Option<u16>, foreground: bool) -> Result<()> {
+pub async fn run(
+    dir: Option<PathBuf>,
+    name: Option<String>,
+    port: Option<u16>,
+    foreground: bool,
+) -> Result<()> {
     let dir = dir.unwrap_or_else(|| PathBuf::from("."));
     let dir = resolve_dir(&dir)?;
 
@@ -154,7 +159,9 @@ async fn run_background(dir: &Path, name: Option<String>, port: Option<u16>) -> 
                 let _ = Registry::update(&state, |reg| {
                     reg.remove(id);
                 });
-                bail!("worker for '{name}' exited before the tunnel came up — see `ft logs {name}`");
+                bail!(
+                    "worker for '{name}' exited before the tunnel came up — see `ft logs {name}`"
+                );
             }
             _ => {}
         }
@@ -167,6 +174,11 @@ async fn run_background(dir: &Path, name: Option<String>, port: Option<u16>) -> 
 /// interrupted. No registry entry is written.
 async fn run_foreground(dir: &Path, name: Option<String>, port: Option<u16>) -> Result<()> {
     use crate::static_server;
+    use std::time::Duration;
+
+    /// Upper bound on draining in-flight requests on Ctrl-C before we abort the
+    /// server task, so a stuck request can't hang the foreground command.
+    const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
     let display_name = name.unwrap_or_else(|| name::generate_name(dir));
 
@@ -181,7 +193,10 @@ async fn run_foreground(dir: &Path, name: Option<String>, port: Option<u16>) -> 
     cloudflared::ensure_installed()?;
 
     let router = static_server::router(dir.to_path_buf());
-    let server_handle = tokio::spawn(async move {
+    // `serve` installs its own Ctrl-C handler for graceful shutdown: on Ctrl-C
+    // it stops accepting and drains in-flight requests. We keep the JoinHandle
+    // so we can bound that drain below.
+    let mut server_handle = tokio::spawn(async move {
         if let Err(e) = static_server::serve(router, port).await {
             tracing::error!(%e, "static server exited with error");
         }
@@ -226,7 +241,19 @@ async fn run_foreground(dir: &Path, name: Option<String>, port: Option<u16>) -> 
     for task in tasks {
         task.abort();
     }
-    server_handle.abort();
+
+    // `serve`'s own Ctrl-C handler has already begun draining; bound it so a
+    // stuck request can't hang the foreground command, falling back to abort.
+    match tokio::time::timeout(SERVER_SHUTDOWN_TIMEOUT, &mut server_handle).await {
+        Ok(_) => {}
+        Err(_) => {
+            tracing::warn!(
+                "static server did not drain within {:?}, aborting",
+                SERVER_SHUTDOWN_TIMEOUT
+            );
+            server_handle.abort();
+        }
+    }
 
     Ok(())
 }
@@ -243,16 +270,16 @@ async fn drain_and_announce<R>(
 {
     while let Ok(Some(line)) = lines.next_line().await {
         println!("{line}");
-        if !found.load(Ordering::Acquire) {
-            if let Some(url) = cloudflared::extract_url(&line) {
-                println!();
-                println!("Started {display_name}");
-                println!();
-                println!("Local:   http://127.0.0.1:{port}");
-                println!("Public:  {url}");
-                println!();
-                found.store(true, Ordering::Release);
-            }
+        if !found.load(Ordering::Acquire)
+            && let Some(url) = cloudflared::extract_url(&line)
+        {
+            println!();
+            println!("Started {display_name}");
+            println!();
+            println!("Local:   http://127.0.0.1:{port}");
+            println!("Public:  {url}");
+            println!();
+            found.store(true, Ordering::Release);
         }
     }
 }

@@ -23,9 +23,7 @@ pub fn validate_name(name: &str) -> Result<()> {
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
-        bail!(
-            "service name '{name}' is invalid — only letters, numbers, '-' and '_' are allowed"
-        );
+        bail!("service name '{name}' is invalid — only letters, numbers, '-' and '_' are allowed");
     }
     Ok(())
 }
@@ -68,5 +66,125 @@ pub fn unique_name(registry: &Registry, base: &str) -> String {
             return candidate;
         }
         n += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Registry, Service, ServiceKind};
+    use std::path::PathBuf;
+
+    fn service_named(name: &str) -> Service {
+        Service {
+            id: 1,
+            name: name.to_string(),
+            kind: ServiceKind::Static,
+            dir: PathBuf::from("/tmp"),
+            port: 8000,
+            local_url: "http://127.0.0.1:8000".to_string(),
+            public_url: None,
+            worker_pid: 0,
+            tunnel_pid: None,
+            created_at: chrono::Utc::now(),
+            state_dir: PathBuf::from("/tmp"),
+        }
+    }
+
+    // --- validate_name ---------------------------------------------------
+
+    #[test]
+    fn validate_name_accepts_valid() {
+        assert!(validate_name("blog").is_ok());
+    }
+
+    #[test]
+    fn validate_name_allows_underscores_and_dashes() {
+        assert!(validate_name("blog_1-2").is_ok());
+    }
+
+    #[test]
+    fn validate_name_rejects_spaces() {
+        assert!(validate_name("my blog").is_err());
+    }
+
+    #[test]
+    fn validate_name_rejects_slash() {
+        assert!(validate_name("a/b").is_err());
+    }
+
+    #[test]
+    fn validate_name_rejects_empty() {
+        assert!(validate_name("").is_err());
+    }
+
+    #[test]
+    fn validate_name_rejects_too_long() {
+        let long = "a".repeat(65);
+        assert!(validate_name(&long).is_err());
+    }
+
+    #[test]
+    fn validate_name_accepts_exactly_64_chars() {
+        let max = "a".repeat(64);
+        assert!(validate_name(&max).is_ok());
+    }
+
+    #[test]
+    fn validate_name_rejects_all_digits() {
+        assert!(validate_name("12345").is_err());
+    }
+
+    // --- generate_name ---------------------------------------------------
+
+    #[test]
+    fn generate_name_simple_basename() {
+        assert_eq!(generate_name(&PathBuf::from("/home/u/blog")), "blog");
+    }
+
+    #[test]
+    fn generate_name_parent_dotdot() {
+        // `..` has no usable file_name, so we fall back to the default.
+        assert_eq!(generate_name(&PathBuf::from("..")), "service");
+    }
+
+    #[test]
+    fn generate_name_trailing_slash() {
+        // A trailing separator strips the final empty component; file_name is
+        // the last real segment.
+        assert_eq!(generate_name(&PathBuf::from("/home/u/blog/")), "blog");
+    }
+
+    #[test]
+    fn generate_name_empty_to_default() {
+        assert_eq!(generate_name(&PathBuf::from("")), "service");
+    }
+
+    #[test]
+    fn generate_name_sanitizes_unsafe_chars() {
+        assert_eq!(generate_name(&PathBuf::from("/home/u/my blog!")), "my-blog");
+    }
+
+    // --- unique_name -----------------------------------------------------
+
+    #[test]
+    fn unique_name_base_free() {
+        let registry = Registry::default();
+        assert_eq!(unique_name(&registry, "blog"), "blog");
+    }
+
+    #[test]
+    fn unique_name_base_taken() {
+        let mut registry = Registry::default();
+        registry.services.push(service_named("blog"));
+        assert_eq!(unique_name(&registry, "blog"), "blog-2");
+    }
+
+    #[test]
+    fn unique_name_base_and_base_2_taken() {
+        let mut registry = Registry::default();
+        registry.services.push(service_named("blog"));
+        registry.services.push(service_named("blog-2"));
+        assert_eq!(unique_name(&registry, "blog"), "blog-3");
     }
 }

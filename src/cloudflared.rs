@@ -84,3 +84,59 @@ pub fn spawn(port: u16, _tunnel_log: PathBuf) -> Result<Child> {
         .context("failed to spawn cloudflared tunnel process")?;
     Ok(child)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::extract_url;
+
+    #[test]
+    fn real_cloudflared_table_line() {
+        let line = "...  |  https://random-words.trycloudflare.com  |";
+        assert_eq!(
+            extract_url(line),
+            Some("https://random-words.trycloudflare.com".to_string())
+        );
+    }
+
+    #[test]
+    fn trailing_punctuation_stripped() {
+        let line = "url: https://x-y.trycloudflare.com.";
+        assert_eq!(
+            extract_url(line),
+            Some("https://x-y.trycloudflare.com".to_string())
+        );
+    }
+
+    #[test]
+    fn plain_url() {
+        let line = "https://x.trycloudflare.com";
+        assert_eq!(
+            extract_url(line),
+            Some("https://x.trycloudflare.com".to_string())
+        );
+    }
+
+    #[test]
+    fn non_tunnel_https_url_ignored() {
+        let line = "https://developers.cloudflare.com/cloudflare-one/connections/";
+        assert_eq!(extract_url(line), None);
+    }
+
+    #[test]
+    fn no_url_returns_none() {
+        let line = "cloudflared is starting up, please wait";
+        assert_eq!(extract_url(line), None);
+    }
+
+    #[test]
+    fn picks_trycloudflare_among_two_urls() {
+        // The first https:// is the tunnel URL; a later non-tunnel URL is
+        // present but never examined. extract_url scans left-to-right and
+        // returns as soon as it finds the trycloudflare host.
+        let line = "your tunnel: https://my-tunnel.trycloudflare.com  docs: https://developers.cloudflare.com/";
+        assert_eq!(
+            extract_url(line),
+            Some("https://my-tunnel.trycloudflare.com".to_string())
+        );
+    }
+}

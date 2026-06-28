@@ -1,6 +1,6 @@
 //! The `open` command: open a service's public URL in the default browser.
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 
 use crate::error::Result;
 use crate::model::Registry;
@@ -22,6 +22,6 @@ pub async fn run(target: String) -> Result<()> {
         bail!("service '{}' has no public URL yet", service.name);
     };
 
-    open::that(url)?;
+    open::that(url).with_context(|| format!("could not open a browser for '{}'", service.name))?;
     Ok(())
 }

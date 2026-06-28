@@ -21,10 +21,11 @@ pub async fn run(target: String) -> Result<()> {
 
     // Find and remove the entry atomically under the registry lock so a
     // concurrent writer cannot resurrect or duplicate it.
-    let service = Registry::update(&state, |reg| reg.find(&target).cloned().map(|svc| {
-        reg.remove(svc.id);
-        svc
-    }))?;
+    let service = Registry::update(&state, |reg| {
+        reg.find(&target).cloned().inspect(|svc| {
+            reg.remove(svc.id);
+        })
+    })?;
 
     let Some(service) = service else {
         bail!("no service matches '{target}'");

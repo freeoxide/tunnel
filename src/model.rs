@@ -98,3 +98,32 @@ impl Default for Registry {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use std::path::PathBuf;
+
+    #[test]
+    fn status_starting_when_worker_pid_zero() {
+        // A worker_pid of 0 means the parent reserved the entry but hasn't yet
+        // recorded the spawned pid. This branch never touches the filesystem,
+        // so it is safe to unit-test without /proc.
+        let svc = Service {
+            id: 1,
+            name: "alpha".to_string(),
+            kind: ServiceKind::Static,
+            dir: PathBuf::from("/tmp/dir"),
+            port: 1234,
+            local_url: "http://127.0.0.1:1234".to_string(),
+            public_url: Some("https://example.trycloudflare.com".to_string()),
+            worker_pid: 0,
+            tunnel_pid: None,
+            created_at: Utc::now(),
+            state_dir: PathBuf::from("/tmp/state"),
+        };
+        // Even with a public_url present, a zero worker_pid must read as Starting.
+        assert_eq!(svc.status(), ServiceStatus::Starting);
+    }
+}
