@@ -88,11 +88,22 @@ pub fn spawn(port: u16, _tunnel_log: PathBuf) -> Result<Child> {
     // Best-effort: on Linux, ask the kernel to SIGKILL cloudflared if its
     // parent (the worker) dies — even via SIGKILL or OOM — so we never leave
     // an orphaned tunnel behind when the worker is killed abnormally while
-    // cloudflared is idle. prctl result is ignored (best-effort).
+    // cloudflared is idle.
+    //
+    // There is an inherent fork→prctl window: if the worker is SIGKILL'd in
+    // that window the child has not installed PDEATHSIG yet, gets reparented to
+    // init (pid 1), and the signal would never fire. Close that race by
+    // re-checking getppid() after prctl and refusing to exec if we already lost
+    // the parent — spawn() then surfaces a normal error instead of an orphan.
     #[cfg(target_os = "linux")]
     unsafe {
         cmd.pre_exec(|| {
             let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong);
+            if libc::getppid() == 1 {
+                return Err(std::io::Error::other(
+                    "parent died before prctl(PR_SET_PDEATHSIG); refusing to exec",
+                ));
+            }
             Ok(())
         });
     }
