@@ -59,6 +59,19 @@ pub fn extract_url(text: &str) -> Option<String> {
     None
 }
 
+/// True if `url` is an `https://` URL whose host ends with `.trycloudflare.com`.
+///
+/// Used to re-validate a stored `public_url` before it is handed to the browser
+/// launcher: `public_url` lives in the user-editable `registry.json`, so we
+/// cannot assume it still has the shape [`extract_url`] produced.
+pub fn is_tunnel_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest.split(['/', '?']).next().unwrap_or("");
+    !host.is_empty() && host.ends_with(".trycloudflare.com")
+}
+
 /// Spawn a `cloudflared` Quick Tunnel pointing at the local server.
 ///
 /// The child's `stdout` and `stderr` are piped; the caller is responsible
@@ -116,7 +129,7 @@ pub fn spawn(port: u16, _tunnel_log: PathBuf) -> Result<Child> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_url;
+    use super::{extract_url, is_tunnel_url};
 
     #[test]
     fn real_cloudflared_table_line() {
@@ -178,5 +191,24 @@ mod tests {
             extract_url(line),
             Some("https://real-tunnel.trycloudflare.com".to_string())
         );
+    }
+
+    #[test]
+    fn is_tunnel_url_accepts_valid() {
+        assert!(is_tunnel_url("https://foo-bar.trycloudflare.com"));
+        assert!(is_tunnel_url(
+            "https://foo-bar.trycloudflare.com/some/path?x=1"
+        ));
+    }
+
+    #[test]
+    fn is_tunnel_url_rejects_non_https_and_spoofs() {
+        assert!(!is_tunnel_url("http://foo.trycloudflare.com"));
+        assert!(!is_tunnel_url("ftp://foo.trycloudflare.com"));
+        // No leading dot: not a subdomain of trycloudflare.com.
+        assert!(!is_tunnel_url("https://eviltrycloudflare.com"));
+        // Suffix trick: host taken before any '/'.
+        assert!(!is_tunnel_url("https://foo.trycloudflare.com.evil.example"));
+        assert!(!is_tunnel_url("not a url"));
     }
 }

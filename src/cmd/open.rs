@@ -2,6 +2,7 @@
 
 use anyhow::bail;
 
+use crate::cloudflared;
 use crate::error::Result;
 use crate::model::Registry;
 use crate::state::StateDir;
@@ -25,6 +26,16 @@ pub async fn run(target: String) -> Result<()> {
     let Some(url) = service.public_url.as_deref() else {
         bail!("service '{}' has no public URL yet", service.name);
     };
+
+    // `public_url` normally comes from `extract_url`, but it is stored in the
+    // user-editable registry.json — re-check its shape before handing it to the
+    // browser launcher so a tampered field can't point xdg-open elsewhere.
+    if !cloudflared::is_tunnel_url(url) {
+        bail!(
+            "service '{}' has a malformed public URL (expected https://*.trycloudflare.com)",
+            service.name
+        );
+    }
 
     // Print the URL unconditionally so it is available even when no browser
     // can be launched.
