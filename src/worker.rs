@@ -56,20 +56,13 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
     let deadline = std::time::Instant::now() + REGISTRY_LOOKUP_TIMEOUT;
     let mut found_entry = false;
     while std::time::Instant::now() < deadline {
-        let located = Registry::update(&state, |reg| {
-            if let Some(svc) = reg.find_mut(&id.to_string()) {
-                // Self-register our pid if the parent never recorded it (e.g. it
-                // died between spawn and recording), so `ft kill` can still
-                // reach us.
-                if svc.worker_pid == 0 {
-                    svc.worker_pid = std::process::id();
-                }
-                true
-            } else {
-                false
-            }
-        })?;
-        if located {
+        // Read-only probe: the parent reserves our entry before spawning us, so
+        // we just wait for it to land. A plain `load` takes NO advisory lock and
+        // does NOT rewrite the registry — an earlier revision used
+        // `Registry::update` here, which contended with the parent's pid-record
+        // and every concurrent `ft` command by rewriting all of registry.json
+        // every 100ms.
+        if Registry::load(&state)?.find(&id.to_string()).is_some() {
             found_entry = true;
             break;
         }
@@ -82,6 +75,16 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
         });
         anyhow::bail!("registry entry for service id={id} never appeared");
     }
+    // Self-register our pid once (the parent records it normally, but if it died
+    // between spawn and recording this keeps `ft kill` able to reach us). A
+    // single locked write — the probe loop above was read-only.
+    Registry::update(&state, |reg| {
+        if let Some(svc) = reg.find_mut(&id.to_string())
+            && svc.worker_pid == 0
+        {
+            svc.worker_pid = std::process::id();
+        }
+    })?;
 
     // Bind the listener now (fail-fast): if the port is taken, the worker exits
     // immediately and the parent's poll detects the dead worker instead of
