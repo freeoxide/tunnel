@@ -18,8 +18,12 @@ use tower_http::trace::TraceLayer;
 /// The directory contents are mapped directly onto the root path, so a
 /// request to `/foo.html` resolves to `dir/foo.html`.
 pub fn router(dir: PathBuf) -> Router {
+    // axum 0.8 removed `nest_service("/")` ("nesting at the root is no longer
+    // supported"). Serving the directory as the fallback service covers every
+    // path: `index.html` at `/` and the matching file beneath it elsewhere,
+    // with a 404 for anything missing.
     Router::new()
-        .nest_service("/", ServeDir::new(dir))
+        .fallback_service(ServeDir::new(dir))
         .layer(TraceLayer::new_for_http())
 }
 

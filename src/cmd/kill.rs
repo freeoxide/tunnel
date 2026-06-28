@@ -10,9 +10,11 @@ use crate::state::StateDir;
 
 /// Stop the service matching `target` and remove its registry entry.
 ///
-/// If the worker process is alive, its whole process group is signalled
-/// (best-effort; `ESRCH` is ignored). The registry entry is removed and saved
-/// regardless, so a stale entry is also cleaned up here.
+/// `cloudflared` lives in the worker's process group, so signalling that group
+/// reaches both. We only signal when at least one member is confirmed ours (via
+/// the command-line match), so a PID or process-group that was reused by an
+/// unrelated process is never signalled. The registry entry is removed and
+/// saved regardless, so a stale entry is cleaned up here too.
 pub async fn run(target: String) -> Result<()> {
     let state = StateDir::new()?;
     let mut registry = Registry::load(&state)?;
@@ -21,21 +23,25 @@ pub async fn run(target: String) -> Result<()> {
         bail!("no service matches '{target}'");
     };
 
-    let was_alive = proc::pid_alive(service.worker_pid);
-    if was_alive {
-        // Best-effort signal: the foundation maps nix errors to an opaque
-        // io::Error, so we cannot distinguish ESRCH (already dead) from a real
-        // failure. Either way we still remove the registry entry below, so a
-        // transient signalling error is not fatal.
+    let worker_alive = proc::pid_matches(service.worker_pid, "run-worker");
+    let cloudflared_alive = service
+        .tunnel_pid
+        .map(|p| proc::pid_matches(p, "cloudflared"))
+        .unwrap_or(false);
+
+    // Signal the worker's whole group only when we can confirm at least one
+    // member is ours. This reaps an orphaned cloudflared even when the worker
+    // leader has already died (cloudflared still has the worker's pgid).
+    if worker_alive || cloudflared_alive {
         if let Err(e) = proc::kill_process_group(service.worker_pid) {
-            tracing::debug!(%e, "signalling worker {} (best-effort)", service.worker_pid);
+            tracing::debug!(%e, "signalling worker group {} (best-effort)", service.worker_pid);
         }
     }
 
     registry.remove(service.id);
     registry.save(&state)?;
 
-    if was_alive {
+    if worker_alive {
         output::print_stopped(&service.name);
     } else {
         output::print_removed_stale(&service.name);

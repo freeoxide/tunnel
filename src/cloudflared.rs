@@ -73,14 +73,11 @@ pub fn spawn(port: u16, _tunnel_log: PathBuf) -> Result<Child> {
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::piped());
 
-    // Run cloudflared in its own session so it survives a Ctrl+C in the
-    // foreground flow and can be signalled independently of the worker.
-    unsafe {
-        cmd.pre_exec(|| {
-            nix::unistd::setsid().ok();
-            Ok(())
-        });
-    }
+    // cloudflared deliberately inherits the spawner's process group: in the
+    // worker flow it joins the worker's group so `kill(-worker_pid)` reaches it
+    // directly (even if the worker has already died and can no longer relay a
+    // signal), and in the foreground flow a terminal Ctrl+C reaches it along
+    // with `ft`. We do NOT `setsid()` here — that would orphan it on kill.
 
     let child = cmd
         .spawn()
