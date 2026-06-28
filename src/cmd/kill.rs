@@ -49,7 +49,7 @@ pub async fn run(target: String) -> Result<()> {
 
     if worker_alive || cloudflared_alive {
         // SIGTERM → grace → SIGKILL on the worker's whole group.
-        proc::shutdown_process_group(service.worker_pid);
+        proc::shutdown_process_group(service.worker_pid).await;
     }
 
     // Re-probe so the user-facing message reflects the actual outcome.

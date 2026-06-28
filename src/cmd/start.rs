@@ -169,7 +169,7 @@ async fn run_background(dir: &Path, name: Option<String>, port: Option<u16>) -> 
                 // Worker died before publishing — reap any survivors, surface
                 // the reason inline (the entry is removed below, so we can't
                 // send the user to `ft logs` afterwards), then fail fast.
-                proc::shutdown_process_group(worker_pid);
+                proc::shutdown_process_group(worker_pid).await;
                 let reason = last_reason(&state, &name);
                 let _ = Registry::update(&state, |reg| {
                     reg.remove(id);
@@ -181,7 +181,7 @@ async fn run_background(dir: &Path, name: Option<String>, port: Option<u16>) -> 
                 // worker self-removed on its own failure. Tear the worker down
                 // and bail now instead of polling the full 30s with a live,
                 // orphaned worker that nothing in the registry points at.
-                proc::shutdown_process_group(worker_pid);
+                proc::shutdown_process_group(worker_pid).await;
                 let reason = last_reason(&state, &name);
                 let _ = Registry::update(&state, |reg| {
                     reg.remove(id);
@@ -194,7 +194,7 @@ async fn run_background(dir: &Path, name: Option<String>, port: Option<u16>) -> 
     }
     // Timed out: the worker + cloudflared may still be alive and the entry is
     // still active, so tear them down like the fail-fast path before bailing.
-    proc::shutdown_process_group(worker_pid);
+    proc::shutdown_process_group(worker_pid).await;
     let _ = Registry::update(&state, |reg| {
         reg.remove(id);
     });

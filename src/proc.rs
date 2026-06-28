@@ -28,11 +28,16 @@ pub fn pid_alive(pid: u32) -> bool {
     pid_matches(pid, "run-worker")
 }
 
-/// Gracefully tear down a process group: `SIGTERM`, give it a short grace
-/// window to exit, then `SIGKILL` to guarantee cleanup. Both signals target the
-/// whole group (negative pid) and are best-effort — members that are already
-/// gone return `ESRCH`, which we ignore.
-pub fn shutdown_process_group(pgid: u32) {
+/// Gracefully tear down a process group: `SIGTERM`, poll for up to the grace
+/// window for it to exit, then `SIGKILL` to guarantee cleanup. Both signals
+/// target the whole group (negative pid) and are best-effort — members that are
+/// already gone return `ESRCH`, which we ignore.
+///
+/// Async: the grace window is spent in `tokio::time::sleep` (with a liveness
+/// poll so we SIGKILL as soon as the group is gone), never blocking the
+/// executor. The earlier `std::thread::sleep` parked a tokio worker thread for
+/// the full 1.5s on every `ft kill` / start-failure teardown.
+pub async fn shutdown_process_group(pgid: u32) {
     // pgid == 0 means "no group recorded": kill(-0) is kill(0), which signals
     // the CALLER's own process group (self-kill). Treat it as a no-op.
     if pgid == 0 {
@@ -40,7 +45,19 @@ pub fn shutdown_process_group(pgid: u32) {
     }
     let raw = -(pgid as i32);
     let _ = kill(Pid::from_raw(raw), Signal::SIGTERM);
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // Poll group liveness (kill -pgid with signal 0 returns ESRCH once no
+    // process remains in the group) so we usually return well before the grace
+    // window elapses, and never block the runtime while waiting.
+    let deadline = std::time::Duration::from_millis(1500);
+    let step = std::time::Duration::from_millis(50);
+    let mut waited = std::time::Duration::ZERO;
+    while waited < deadline {
+        if kill(Pid::from_raw(raw), None).is_err() {
+            return; // group is gone
+        }
+        tokio::time::sleep(step).await;
+        waited += step;
+    }
     let _ = kill(Pid::from_raw(raw), Signal::SIGKILL);
 }
 
