@@ -344,4 +344,72 @@ mod tests {
         assert!(!reg.name_exists("beta"));
         assert!(!reg.name_exists("1"));
     }
+
+    // --- concurrency: the exclusive flock must serialize writers -------------
+
+    #[test]
+    fn flock_serializes_concurrent_writers() {
+        use crate::state::StateDir;
+        use std::sync::Arc;
+        use std::thread;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::new_at(tmp.path().join("ft-state"));
+        state.ensure().expect("ensure state dir");
+        // Seed an empty registry so load() has a file to flock.
+        Registry::default().save(&state).expect("seed save");
+
+        let n_threads = 8;
+        let per_thread = 5;
+        let state = Arc::new(state);
+        let mut handles = Vec::new();
+        for _ in 0..n_threads {
+            let state = state.clone();
+            handles.push(thread::spawn(move || {
+                let mut ids = Vec::new();
+                for _ in 0..per_thread {
+                    let id = Registry::update(&state, |reg| {
+                        let id = reg.allocate_id();
+                        reg.services.push(dummy_service(id, &format!("svc-{id}")));
+                        id
+                    })
+                    .expect("update under lock");
+                    ids.push(id);
+                }
+                ids
+            }));
+        }
+        let mut all = Vec::new();
+        for h in handles {
+            all.extend(h.join().unwrap());
+        }
+
+        // No duplicate ids were ever handed out.
+        let mut sorted = all.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), all.len(), "duplicate ids allocated: {all:?}");
+        assert_eq!(all.len(), n_threads * per_thread);
+
+        // And every allocation survived to disk (no lost updates).
+        let reg = Registry::load(&state).expect("final load");
+        assert_eq!(reg.services.len(), n_threads * per_thread);
+        assert_eq!(reg.next_id, (n_threads * per_thread + 1) as u64);
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_ids_and_heals_next_id() {
+        let mut reg = Registry {
+            next_id: 1,
+            services: vec![dummy_service(5, "a"), dummy_service(5, "dup")],
+        };
+        assert!(reg.validate().is_err(), "duplicate id must be rejected");
+
+        let mut reg = Registry {
+            next_id: 1, // behind the highest id below
+            services: vec![dummy_service(7, "a")],
+        };
+        assert!(reg.validate().is_ok());
+        assert_eq!(reg.next_id, 8, "next_id healed past the highest existing id");
+    }
 }

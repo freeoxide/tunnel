@@ -210,3 +210,110 @@ mod confinement_tests {
         assert!(!Path::new("/etc/passwd").starts_with(root));
     }
 }
+
+#[cfg(test)]
+mod http_confinement_tests {
+    //! End-to-end confinement checks driving the real Router with tower::oneshot.
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn req(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .expect("build request")
+    }
+
+    #[tokio::test]
+    async fn serves_normal_files_and_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("index.html"), "hello").expect("write");
+        std::fs::create_dir_all(dir.path().join("sub")).expect("mkdir");
+        std::fs::write(dir.path().join("sub").join("f.html"), "x").expect("write");
+
+        let r = router(dir.path().to_path_buf());
+        assert_eq!(r.oneshot(req("/")).await.unwrap().status(), StatusCode::OK);
+
+        let r = router(dir.path().to_path_buf());
+        assert_eq!(
+            r.oneshot(req("/sub/f.html")).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let r = router(dir.path().to_path_buf());
+        assert_eq!(
+            r.oneshot(req("/missing.html")).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn dotfiles_and_dotdirs_are_denied() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(".env"), "SECRET=1").expect("write");
+        std::fs::create_dir_all(dir.path().join(".git")).expect("mkdir");
+        std::fs::write(dir.path().join(".git").join("config"), "x").expect("write");
+
+        let r = router(dir.path().to_path_buf());
+        assert_eq!(
+            r.oneshot(req("/.env")).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+        let r = router(dir.path().to_path_buf());
+        assert_eq!(
+            r.oneshot(req("/.git/config")).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_dir_traversal_is_denied() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("index.html"), "hi").expect("write");
+
+        let r = router(dir.path().to_path_buf());
+        // ServeDir already blocks '..'; the confine guard blocks it earlier.
+        assert_eq!(
+            r.oneshot(req("/../etc/passwd")).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn symlink_escape_outside_root_is_blocked() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A file OUTSIDE the served root.
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        std::fs::write(outside.path().join("secret"), "TOPSECRET").expect("write");
+        std::fs::write(dir.path().join("index.html"), "ok").expect("write");
+        symlink(
+            outside.path().join("secret"),
+            dir.path().join("link"),
+        )
+        .expect("symlink");
+
+        let r = router(dir.path().to_path_buf());
+        assert_eq!(
+            r.oneshot(req("/link")).await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "a symlink escaping the root must not be served"
+        );
+    }
+
+    #[tokio::test]
+    async fn x_content_type_options_nosniff_is_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("index.html"), "hi").expect("write");
+        let r = router(dir.path().to_path_buf());
+        let resp = r.oneshot(req("/")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+    }
+}

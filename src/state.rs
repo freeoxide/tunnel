@@ -24,6 +24,13 @@ impl StateDir {
         Ok(Self { root })
     }
 
+    /// Construct a `StateDir` rooted directly at `root` (deriving registry/lock/
+    /// services paths from it). Used by tests to point at a temp directory
+    /// without mutating `XDG_STATE_HOME` (an `unsafe` operation in edition 2024).
+    pub(crate) fn new_at(root: PathBuf) -> Self {
+        Self { root }
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
