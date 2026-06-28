@@ -23,24 +23,29 @@ pub async fn run() -> Result<()> {
     let state = StateDir::new()?;
 
     let pruned = Registry::update(&state, |reg| {
-        // Collect the stale services (worker dead, not merely starting) and
-        // best-effort SIGTERM any cloudflared child they leave behind.
-        let stale: Vec<String> = reg
-            .services
-            .iter()
-            .filter(|s| s.worker_pid != 0 && !proc::pid_alive(s.worker_pid))
-            .inspect(|s| {
-                if let Some(tpid) = s.tunnel_pid {
+        // Single pass so a service's fate is decided once (no TOCTOU between a
+        // filter probe and a later retain probe). Stale = recorded worker that
+        // is no longer alive (cmdline-checked, so PID reuse is defeated).
+        let mut stale_names = Vec::new();
+        let mut keep = Vec::new();
+        for s in std::mem::take(&mut reg.services) {
+            let is_stale = s.worker_pid != 0 && !proc::pid_alive(s.worker_pid);
+            if is_stale {
+                // Best-effort reap of an orphaned cloudflared, gated on a
+                // cmdline identity check so a recycled PID is never signalled
+                // (mirrors kill.rs).
+                if let Some(tpid) = s.tunnel_pid
+                    && proc::pid_matches(tpid, "cloudflared")
+                {
                     let _ = kill(Pid::from_raw(tpid as i32), Signal::SIGTERM);
                 }
-            })
-            .map(|s| s.name.clone())
-            .collect();
-
-        // Keep starting entries (worker_pid == 0) and live entries.
-        reg.services
-            .retain(|s| s.worker_pid == 0 || proc::pid_alive(s.worker_pid));
-        stale
+                stale_names.push(s.name);
+            } else {
+                keep.push(s);
+            }
+        }
+        reg.services = keep;
+        stale_names
     })?;
 
     if pruned.is_empty() {

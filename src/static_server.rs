@@ -24,7 +24,7 @@
 //!   check tower-http ServeDir already performs.
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -125,9 +125,34 @@ async fn confine(State(root): State<PathBuf>, request: Request, next: Next) -> R
     // Symlink confinement: resolve the candidate for real and require it to
     // stay beneath the canonical root. Escaping symlinks resolve outside `root`
     // and are refused; missing paths fail canonicalize and 404.
-    match std::fs::canonicalize(&candidate) {
-        Ok(resolved) if resolved.starts_with(&root) => next.run(request).await,
-        _ => StatusCode::NOT_FOUND.into_response(),
+    let resolved = match std::fs::canonicalize(&candidate) {
+        Ok(r) => r,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    if !resolved.starts_with(&root) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    // ServeDir serves `<dir>/index.html` for directory requests (its directory-
+    // index feature), and that index.html may itself be a symlink escaping the
+    // root — a vector confine must close, not just the directory itself. So when
+    // the candidate is a directory, also confine its index.html.
+    if resolved.is_dir() && escapes_root(&resolved.join("index.html"), &root) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    next.run(request).await
+}
+
+/// True if `path` exists and canonicalises to a target outside `root`. Used to
+/// confine the directory-index file (`index.html`) that ServeDir resolves on
+/// its own, in addition to the request path itself.
+fn escapes_root(path: &Path, root: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    match std::fs::canonicalize(path) {
+        Ok(r) => !r.starts_with(root),
+        // Exists but unresolvable (e.g. a broken symlink): treat as escaping.
+        Err(_) => true,
     }
 }
 
@@ -302,6 +327,32 @@ mod http_confinement_tests {
             StatusCode::NOT_FOUND,
             "a symlink escaping the root must not be served"
         );
+    }
+
+    #[tokio::test]
+    async fn symlink_escape_via_directory_index_is_blocked() {
+        // ServeDir serves <dir>/index.html for directory requests; an escaping
+        // symlink placed there must be confined too (regression for the C1
+        // index.html bypass).
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("secret"), "TOPSECRET").expect("write");
+        std::fs::create_dir_all(dir.path().join("sub")).expect("mkdir");
+        symlink(
+            outside.path().join("secret"),
+            dir.path().join("sub").join("index.html"),
+        )
+        .expect("symlink");
+
+        for uri in ["/sub/", "/sub", "/sub/index.html"] {
+            let r = router(dir.path().to_path_buf());
+            assert_eq!(
+                r.oneshot(req(uri)).await.unwrap().status(),
+                StatusCode::NOT_FOUND,
+                "{uri} should be confined (index.html is an escaping symlink)"
+            );
+        }
     }
 
     #[tokio::test]

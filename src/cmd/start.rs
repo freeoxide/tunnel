@@ -95,11 +95,16 @@ fn confirm_sensitive(dir: &Path, yes: bool) -> Result<()> {
 
 /// True for directories whose wholesale public exposure is almost certainly a
 /// mistake: the filesystem root and the user's home directory.
+///
+/// Both sides are canonicalised so a symlink alias of `$HOME` (e.g.
+/// `ft ~/house` where `house -> $HOME`) cannot slip past the prompt.
 fn is_sensitive_dir(dir: &Path) -> bool {
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     if dir == Path::new("/") {
         return true;
     }
     if let Some(home) = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()) {
+        let home = std::fs::canonicalize(&home).unwrap_or(home);
         return dir == home;
     }
     false
@@ -284,9 +289,15 @@ fn last_line(path: &Path) -> Option<String> {
     file.read_to_end(&mut buf).ok()?;
     let text = String::from_utf8_lossy(&buf);
     let text: &str = if len > LAST_REASON_CAP {
-        text.find('\n').map(|i| &text[i + 1..]).unwrap_or("")
+        // Skip the partial first line after a mid-file seek. If the window has
+        // no newline at all it is one long line — use it rather than dropping
+        // the reason entirely.
+        match text.find('\n') {
+            Some(i) => &text[i + 1..],
+            None => text.as_ref(),
+        }
     } else {
-        &text
+        text.as_ref()
     };
     text.lines()
         .map(str::trim)
