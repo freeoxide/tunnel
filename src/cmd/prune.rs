@@ -10,9 +10,6 @@
 //! cannot distinguish "just spawned" from "orphaned mid-start", and the
 //! parent's own fail-fast/timeout already cleans the latter.
 
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
-
 use crate::error::Result;
 use crate::model::Registry;
 use crate::proc;
@@ -29,7 +26,16 @@ pub async fn run() -> Result<()> {
         let mut stale_names = Vec::new();
         let mut keep = Vec::new();
         for s in std::mem::take(&mut reg.services) {
-            let is_stale = s.worker_pid != 0 && !proc::pid_alive(s.worker_pid);
+            // Stale = recorded worker that is no longer alive. Background
+            // workers use the cmdline-aware `pid_alive` (PID-reuse safe);
+            // foreground services use a plain liveness probe (their `ft`
+            // cmdline lacks the `run-worker` token).
+            let is_stale = s.worker_pid != 0
+                && if s.foreground {
+                    !proc::process_exists(s.worker_pid)
+                } else {
+                    !proc::pid_alive(s.worker_pid)
+                };
             if is_stale {
                 // Best-effort reap of an orphaned cloudflared, gated on a
                 // cmdline identity check so a recycled PID is never signalled
@@ -37,7 +43,7 @@ pub async fn run() -> Result<()> {
                 if let Some(tpid) = s.tunnel_pid
                     && proc::pid_matches(tpid, "cloudflared")
                 {
-                    let _ = kill(Pid::from_raw(tpid as i32), Signal::SIGTERM);
+                    proc::terminate_orphan(tpid);
                 }
                 stale_names.push(s.name);
             } else {

@@ -10,31 +10,65 @@ file server and fronts it with an ephemeral `cloudflared` Quick Tunnel — givin
 
 ## Install
 
-Build from source with Rust / Cargo:
+### URL installer
+
+**Linux / macOS:**
 
 ```sh
-git clone https://github.com/freeoxide/tunnel.git
-cd tunnel
-cargo build --release
-# binary: target/release/ft
+curl -fsSL https://tunnel.freeoxide.com/install.sh | sh
 ```
 
-Or install it directly from a local checkout:
+GitHub-hosted fallback:
 
 ```sh
-cargo install --path .
+curl -fsSL https://github.com/freeoxide/tunnel/releases/latest/download/install.sh | sh
 ```
 
-`ft` will then be on your `PATH` (typically `~/.cargo/bin/ft`).
+**Windows (PowerShell):**
 
-## Prerequisites
+```powershell
+irm https://tunnel.freeoxide.com/install.ps1 | iex
+```
 
-[`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)
+GitHub-hosted fallback:
+
+```powershell
+irm https://github.com/freeoxide/tunnel/releases/latest/download/install.ps1 | iex
+```
+
+> The `tunnel.freeoxide.com` URLs are the intended primary install host but are
+> served by external website infrastructure that is not part of this repo. Until
+> that is live, use the GitHub-hosted URLs above — they are produced directly by
+> the release workflow and work today.
+
+### Cargo
+
+```sh
+cargo binstall freeoxide-tunnel        # prebuilt binary, no compile
+cargo install freeoxide-tunnel --locked    # build from crates.io
+cargo install --git https://github.com/freeoxide/tunnel --locked  # build from source (main)
+```
+
+### Verify
+
+```sh
+ft --version
+```
+
+### Requirements
+
+[`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads)
 must be installed and on your `PATH`. It is the external binary that creates the Quick Tunnel —
 Freeoxide Tunnel never vendors it. If `ft` cannot find it, it prints a friendly install message
 and exits.
 
-Install cloudflared: <https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/>
+- macOS: `brew install cloudflared`
+- Windows: `winget install Cloudflare.cloudflared`
+- Other platforms: <https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads>
+
+### Platform support
+
+- **Linux**, **macOS**, and **Windows** all support both background (detached worker) and foreground modes.
 
 ## Quick start
 
@@ -90,7 +124,8 @@ ft open blog                              # open the public URL in a browser
 
 ## How it works
 
-`ft <dir>` spawns a detached worker process (a new session via `setsid`) that:
+`ft <dir>` spawns a detached worker process (a new session via `setsid` on Unix, or a process group
+plus a `KILL_ON_JOB_CLOSE` Job Object on Windows) that:
 
 1. Starts a localhost static file server for `<dir>` (axum + tower-http) on the chosen port.
 2. Launches `cloudflared` as a Quick Tunnel pointing at `http://127.0.0.1:<port>`.
@@ -120,10 +155,19 @@ or separators.
 
 ## Platform support
 
-- **Linux** — primary target. Process supervision uses `nix`, `setsid`, and `/proc`.
-- **macOS** — partial / fallback support; some process-management paths are weaker than on Linux.
-- **Windows** — unsupported. The code relies on POSIX process groups, signals, and `/proc`, which
-  Windows does not provide.
+- **Linux** — primary target. PID-reuse-safe identity via `/proc/<pid>/cmdline`; orphaned
+  `cloudflared` is reaped automatically via `PR_SET_PDEATHSIG`. Supports background and foreground.
+- **macOS** — full support. PID-reuse-safe identity via `sysctl(KERN_PROCARGS2)`. There is no
+  `PR_SET_PDEATHSIG` equivalent, so a worker killed abnormally (OOM, `SIGKILL`) leaves its
+  `cloudflared` orphaned until `ft prune` reaps it. Supports background and foreground.
+- **Windows** — full support. The detached worker owns a Job Object (`KILL_ON_JOB_CLOSE`) that
+  gives both whole-tree teardown and the `PR_SET_PDEATHSIG` equivalent (the worker's hard death
+  still reaps its `cloudflared`). PID identity uses `QueryFullProcessImageNameW`. Supports
+  background and foreground.
+
+> macOS binaries are **not code-signed** (signing is intentionally out of scope). The first run of
+> a downloaded binary is quarantined by Gatekeeper; clear it with
+> `xattr -dr com.apple.quarantine /path/to/ft` (or right-click → Open → Open anyway).
 
 ## Project status
 

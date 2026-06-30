@@ -75,31 +75,28 @@ impl StateDir {
     /// by other users on a shared host. Pre-existing directories are
     /// re-chmodded to 0700 so a state tree created by an older build is sealed.
     pub fn ensure(&self) -> Result<()> {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(self.services_dir())
+        // Owner-only (0700) on Unix via the cross-platform helper; a plain
+        // recursive create on Windows (state tree under the user profile is
+        // already user-private).
+        crate::fsutil::ensure_private_dir(self.services_dir())
             .with_context(|| format!("creating state directory {}", self.root.display()))?;
-        let _ = std::fs::set_permissions(
-            self.root(),
-            std::fs::Permissions::from_mode(0o700),
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Re-seal the root itself, which `services_dir()`'s create may not
+            // have touched, so a state tree created by an older build is sealed.
+            let _ = std::fs::set_permissions(self.root(), std::fs::Permissions::from_mode(0o700));
+        }
         Ok(())
     }
 
     /// Create (or reuse) a single service's private directory with mode 0700
     /// and return it. Holds that service's `worker.log`/`server.log`/`tunnel.log`.
     pub fn ensure_service_dir(&self, name: &str) -> Result<PathBuf> {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
         let dir = self.service_dir(name);
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&dir)
+        // Owner-only (0700) on Unix; plain create on Windows.
+        crate::fsutil::ensure_private_dir(&dir)
             .with_context(|| format!("creating service directory for '{name}'"))?;
-        let _ =
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
         Ok(dir)
     }
 }

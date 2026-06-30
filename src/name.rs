@@ -86,8 +86,9 @@ mod tests {
             public_url: None,
             worker_pid: 0,
             tunnel_pid: None,
-            created_at: chrono::Utc::now(),
+            created_at: crate::model::now_utc(),
             state_dir: PathBuf::from("/tmp"),
+            foreground: false,
         }
     }
 
@@ -186,5 +187,48 @@ mod tests {
         registry.services.push(service_named("blog"));
         registry.services.push(service_named("blog-2"));
         assert_eq!(unique_name(&registry, "blog"), "blog-3");
+    }
+
+    // --- property tests ---------------------------------------------------
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// A valid name ([A-Za-z0-9_-], 1..=64, not all digits) is always accepted.
+        #[test]
+        fn validate_name_accepts_valid_inputs(
+            s in "[A-Za-z][A-Za-z0-9_-]{0,62}[A-Za-z0-9]"
+        ) {
+            prop_assert!(validate_name(&s).is_ok(), "{s} should be valid");
+        }
+
+        /// A name with any character outside [A-Za-z0-9_-] is rejected.
+        #[test]
+        fn validate_name_rejects_outside_charset(
+            s in "[A-Za-z0-9_-]*[^A-Za-z0-9_-][A-Za-z0-9_-]*"
+        ) {
+            prop_assert!(validate_name(&s).is_err(), "{s} should be rejected");
+        }
+
+        /// generate_name never yields an empty result and never contains a path
+        /// separator (so it is always a safe single path segment downstream).
+        #[test]
+        fn generate_name_never_empty_or_pathlike(base in "[^\\x00]{0,32}") {
+            let n = generate_name(std::path::Path::new(&base));
+            prop_assert!(!n.is_empty());
+            prop_assert!(!n.contains('/') && !n.contains('\\'), "{n} must not contain a separator");
+        }
+
+        /// unique_name never collides with an existing name in the registry.
+        #[test]
+        fn unique_name_is_truly_unique(
+            existing in proptest::collection::vec("[a-z]{1,5}", 0..8),
+            base in "[a-z]{1,5}"
+        ) {
+            let mut reg = Registry::default();
+            for n in &existing { reg.services.push(service_named(n)); }
+            let picked = unique_name(&reg, &base);
+            prop_assert!(!reg.services.iter().any(|s| s.name == picked));
+        }
     }
 }

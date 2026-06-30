@@ -279,3 +279,242 @@ With the lifecycle work largely done, the **public-trust** items are now the cle
 5. **M1 parent-id-keying** + **fork→prctl `getppid` re-check** — close the residuals cheaply.
 6. **M4 reboot** — `ft prune`/reconcile.
 7. Phase 5 test/CI foundation remains the unlock for everything above.
+
+---
+
+# Extension — Installation and Cross-Platform Support
+
+**Scope:** ship `ft` as an installable, cross-platform CLI (Linux/macOS/Windows) with first-class installers, checksummed release artifacts (signing tracked separately — see §9), and a single predictable cross-platform state directory — while preserving the Unix-hardened process model. **Date:** 2026-06-29. This pass implemented the packaging metadata, installers, release workflow, CI Windows cell, README docs, and the cross-platform `#[cfg]` refactor end to end; see "Implementation Status" below for exactly what landed and the one deliberate deferral (Windows background mode).
+
+---
+
+## 1. Goal and project identity
+
+- **Project:** Freeoxide Tunnel — a small Rust CLI that runs a loopback static file server and fronts it with an ephemeral `cloudflared` Cloudflare Quick Tunnel, exposing a local directory at a public `*.trycloudflare.com` URL in seconds (no Cloudflare account or DNS setup).
+- **Binary name:** `ft`.
+- **Crate:** `freeoxide-tunnel` (published to crates.io under that name).
+- **Repository:** `github.com/freeoxide/tunnel`.
+- **Website / install host:** `tunnel.freeoxide.com`.
+- **License:** MIT. **Edition:** 2024. **MSRV:** 1.85 (edition-2024 floor; pinned so a toolchain/dep bump cannot silently raise the build floor without CI catching it).
+
+The goal of this extension is that a user on any of the supported platforms can install `ft` with one command, run `ft --version`, and immediately `ft ./dist --name blog`.
+
+---
+
+## 2. Installation methods
+
+Six supported paths, all converging on the same binary and on `ft --version` as the smoke check.
+
+### URL installer (one-liner)
+- **Linux / macOS** (`curl | sh`):
+  - Website-hosted: `curl -fsSL https://tunnel.freeoxide.com/install.sh | sh`
+  - GitHub-hosted fallback: `curl -fsSL https://github.com/freeoxide/tunnel/releases/latest/download/install.sh | sh`
+- **Windows** (`irm | iex`, PowerShell):
+  - Website-hosted: `irm https://tunnel.freeoxide.com/install.ps1 | iex`
+  - GitHub-hosted fallback: `irm https://github.com/freeoxide/tunnel/releases/latest/download/install.ps1 | iex`
+
+> The `tunnel.freeoxide.com` URLs are the intended primary install host but are served by external website infrastructure that is not part of this repo; until that is live, the GitHub-hosted URLs above are the working path (produced directly by `release.yml`).
+
+### `cargo install` from crates.io
+`cargo install freeoxide-tunnel --locked` — builds from the published source tarball. `--locked` is recommended so the build uses the reviewed `Cargo.lock`.
+
+### `cargo install` from GitHub
+`cargo install --git https://github.com/freeoxide/tunnel --locked` (main). The standard cargo flags are all supported:
+- `--git <url>` — build from the default branch of the repo.
+- `--tag <tag>` — build from a specific release tag (e.g. `--tag v0.1.0`).
+- `--branch <name>` — build from a branch.
+- `--rev <sha>` — build from a pinned commit.
+- `--path <dir>` — build from a local checkout (for contributors).
+- `--force` — reinstall/overwrite an existing install.
+
+### `cargo binstall` (prebuilt binary, no compile)
+`cargo binstall freeoxide-tunnel` — downloads the matching release archive directly, skipping the source build. The asset layout is declared in `[package.metadata.binstall]` (see §8): archive name `freeoxide-tunnel-<target>{.tgz|.zip}` with `ft`/`ft.exe` at the archive root.
+
+### Manual GitHub release binary download
+- **Linux/macOS:** download `freeoxide-tunnel-<target>.tgz`, verify against `SHA256SUMS`, then `tar -xzf … && mv ft ~/.local/bin/`.
+- **Windows:** download `freeoxide-tunnel-<target>.zip`, verify against `SHA256SUMS`, then `Expand-Archive … -DestinationPath $env:USERPROFILE\.local\bin`.
+
+---
+
+## 3. Release targets
+
+**Full target set (8):**
+| Target | OS / libc | Archive |
+|---|---|---|
+| `x86_64-unknown-linux-gnu` | Linux, glibc | tgz |
+| `aarch64-unknown-linux-gnu` | Linux, glibc | tgz |
+| `x86_64-unknown-linux-musl` | Linux, musl (static) | tgz |
+| `aarch64-unknown-linux-musl` | Linux, musl (static) | tgz |
+| `x86_64-apple-darwin` | macOS (Intel) | tgz |
+| `aarch64-apple-darwin` | macOS (Apple Silicon) | tgz |
+| `x86_64-pc-windows-msvc` | Windows x64 | zip |
+| `aarch64-pc-windows-msvc` | Windows ARM64 | zip |
+
+**MVP targets (5):** `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`.
+**Rationale:** musl gives a single glibc-independent static Linux binary per arch (no `glibc-X.Y` incompatibilities); both macOS arches cover Intel + Apple Silicon natively; `x86_64-pc-windows-msvc` covers the overwhelming Windows majority. The gnu Linux rows ship once a maintainer can validate them on-host; nothing in the toolchain blocks them, they are simply not in the first green matrix. **Note on Windows ARM64:** `aarch64-pc-windows-msvc` *is* built and packaged by `release.yml` today (so the asset exists for ARM64 Windows users), but it is **not** in the on-host-smoke-tested set — it has not yet been run on a real ARM64 Windows machine, so treat it as best-effort until validated.
+
+---
+
+## 4. Cross-platform support
+
+### State directory
+Per-service state (registry, server/worker/tunnel logs) lives under **`~/.local/state/freeoxide/tunnel`** on every platform (`$XDG_STATE_HOME/freeoxide/tunnel` if that env var is set) — a single, predictable, XDG-style location. The `directories` crate is used only to resolve the home directory; the `.local/state/freeoxide/tunnel` suffix is built by hand in `state::state_base`.
+
+> The original plan specified per-OS-conventional locations (macOS `~/Library/Application Support/com.freeoxide.tunnel`, Windows `%LOCALAPPDATA%\freeoxide\tunnel`). Those are **not** implemented: the existing XDG-everywhere design is deliberately kept for cross-platform predictability and to avoid relocating existing users' state. Switching to per-OS dirs would be a small change in `state::state_base` (use `BaseDirs::data_dir()` / `data_local_dir()` on macOS/Windows) — available as a follow-up if platform-conventional locations are preferred.
+
+All on-disk state files are created `0600` and per-service dirs `0700` (the Phase 0 hardening from the main plan), restricting logs and the registry to the owning user on multi-user hosts.
+
+### Install locations
+- **Linux/macOS:** `~/.local/bin` (XDG user-bin convention; the installer creates the dir if missing and prints a PATH-setup notice if it is not on `PATH` — it does NOT auto-edit any shell rc file).
+- **Windows:** `%USERPROFILE%\.local\bin` (mirrors the Unix layout; the installer adds it to the user `PATH`).
+
+### Process handling
+- **Unix (Linux + macOS):** the detached worker `setsid()`s into its own session/process-group (`src/spawn.rs`), `cloudflared` deliberately *joins* that group, and teardown is `kill(-pgid)` (SIGTERM → bounded grace → SIGKILL) reaching the whole tree (`src/proc.rs::shutdown_process_group`). On **Linux** additionally `prctl(PR_SET_PDEATHSIG, SIGKILL)` in `pre_exec` reaps an idle `cloudflared` if the worker is SIGKILL'd/OOM'd (`src/cloudflared.rs`). PID reuse is defeated by reading `/proc/<pid>/cmdline` before signaling (`pid_matches`).
+- **Windows:** the Unix session/group/`PDEATHSIG` model has no direct equivalent. Foreground teardown uses `child.kill()` and Windows creation flags. **Whole-tree teardown via a Win32 Job Object (auto-kill children on close) is future work** — see §"Implementation Status".
+
+---
+
+## 5. `cloudflared` dependency
+
+`cloudflared` is the external binary that actually creates the Cloudflare Quick Tunnel. **Freeoxide Tunnel never vendors or bundles it.** It must be on `PATH`.
+
+- **MVP behavior:** if `ft` cannot find `cloudflared` (`which::which` fails), it prints a single friendly, **multi-platform** install message and exits non-zero — not a raw lookup error. The message names the per-OS install command (`brew install cloudflared` on macOS, `winget install Cloudflare.cloudflared` on Windows, and the package/download options on Linux).
+- **Deferred:** an `ft doctor` health-check subcommand and an `ft install-cloudflared` bootstrap command are **not** in the MVP. They are planned but require per-OS package-manager detection and are lower priority than the core install story.
+
+---
+
+## 6. Install script behavior
+
+### `install.sh` (Linux / macOS) — pseudo-flow
+1. Detect OS (`uname -s` → `Darwin`/`Linux`) and arch (`uname -m` → `x86_64`/`aarch64`/`arm64`), map to a release target triple.
+2. Resolve the latest release tag (or honor a `--version`/`FT_VERSION` override).
+3. Download `freeoxide-tunnel-<target>.tgz` **and** the `SHA256SUMS` file from the GitHub Release.
+4. Verify the archive checksum against `SHA256SUMS`; abort on mismatch (never execute/extract an unverified archive).
+5. Extract `ft` to a temp dir, then move it into `~/.local/bin/ft` (creating the dir).
+6. PATH handling: if `~/.local/bin` is not on `PATH`, print a notice showing the `export PATH=…` line to add and which shell rc files (`~/.bashrc` / `~/.zshrc` / `~/.profile`) to edit. The installer does NOT modify rc files itself — it leaves that to the user.
+7. Verify: run `ft --version`; report success or failure.
+
+### `install.ps1` (Windows) — pseudo-flow
+1. Detect arch (`$env:PROCESSOR_ARCHITECTURE` → `x64`/`arm64`), map to `x86_64-pc-windows-msvc` / `aarch64-pc-windows-msvc`.
+2. Resolve the latest release tag (or honor a `-Version` override).
+3. Download `freeoxide-tunnel-<target>.zip` and `SHA256SUMS`.
+4. Verify the archive hash (`Get-FileHash -Algorithm SHA256`); abort on mismatch.
+5. `Expand-Archive` into `$env:USERPROFILE\.local\bin`.
+6. PATH handling: add `%USERPROFILE%\.local\bin` to the user `PATH` via `[Environment]::SetEnvironmentVariable(..., 'User')` if missing; print a notice that a new shell is needed.
+7. Verify: run `ft --version`; report success or failure.
+
+Both scripts are parse/lint-checked on every release (see §7).
+
+---
+
+## 7. GitHub Actions release plan
+
+**MVP: plain GitHub Actions** (`.github/workflows/release.yml`), not `cargo-dist`.
+
+- **`build` matrix job** — one job per target in the §3 matrix, each cross-compiling `cargo build --release --locked --target <target>`, then packaging the binary **alone at the archive root** (no README, no `Cargo.lock` — exactly what the binstall metadata promises) plus a per-asset `.sha256` sidecar. musl targets install the musl cross-linker (`musl-tools`, `gcc-aarch64-linux-musl`).
+- **`release` job** — downloads all per-target assets, stages `install.sh` / `install.ps1`, assembles a combined `SHA256SUMS` (rebuilt from the sidecars so list and sidecars can never disagree, stably sorted), verifies `sha256sum -c SHA256SUMS`, and uploads everything to the GitHub Release via `softprops/action-gh-release@v2`.
+- **`lint-scripts` / `lint-scripts-windows` jobs** — non-blocking `shellcheck install.sh` and a parse-only `[ScriptBlock]::Create` check on `install.ps1`; an installer nit never holds up the binaries.
+- **`publish` job** — **MANUAL ONLY**: `workflow_dispatch`-gated, behind a protected `publish` environment + `CARGO_REGISTRY_TOKEN` secret, runs `cargo publish --locked --all-features`. Tagging a release does **not** publish; the published crate version is a deliberate, reviewed decision.
+
+**`cargo-dist` considered for later.** It would auto-generate the installer + matrix, but the hand-written pipeline is small, fully under our control, and matches the binstall layout exactly; adopting `cargo-dist` is a future simplification, not a blocker.
+
+CI (`.github/workflows/ci.yml`) builds + tests on **`ubuntu-latest`, `macos-latest`, `windows-latest`** (matrix of stable + `1.85`), with `clippy --all-features --locked -D warnings`, `cargo test --locked`, `cargo build --release --locked`, plus a non-blocking `cargo-deny` + `cargo-audit` supply-chain job.
+
+---
+
+## 8. `Cargo.toml` additions and the `nix` decision
+
+### Package metadata + binstall block (already in `Cargo.toml`)
+```toml
+[package]
+name = "freeoxide-tunnel"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Expose local and static services through temporary tunnels."
+repository = "https://github.com/freeoxide/tunnel"
+homepage = "https://tunnel.freeoxide.com"
+license = "MIT"
+readme = "README.md"
+keywords = ["tunnel", "cloudflare", "cli", "static-server", "localhost"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "ft"
+path = "src/main.rs"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.'cfg(target_os = "windows")']
+pkg-fmt = "zip"
+```
+The `pkg-url` resolves to `…/releases/download/v0.1.0/freeoxide-tunnel-<target>.tgz` (`.zip` on Windows), and `bin-dir` places `ft`/`ft.exe` at the archive root — matching exactly what `release.yml` packages.
+
+### KEEP `nix` (`cfg(unix)`); do NOT adopt `command-group`
+**Decision:** retain `nix` (`features = ["process", "signal"]`) gated to `cfg(unix)`, and `libc` gated to `cfg(target_os = "linux")` for the `PR_SET_PDEATHSIG` path. Do **not** swap in `command-group`.
+
+**Rationale:** `command-group` is built around holding an *anonymous* process-group handle (a `pgid` wrapped in a RAII guard) bound to the lifetime of a single owning `Child`. Freeoxide Tunnel's model is the opposite of that:
+- the worker **detaches and survives** its spawner (`setsid` into its own session, then the worker outlives the `ft start` command that launched it) — there is no short-lived owning `Child` whose lifetime can own the group;
+- later teardown is **kill-by-stored-pid**: `ft kill <name>` reads the recorded `worker_pid` from `registry.json` in a *separate process, much later* and signals `kill(-pgid)`. The group handle must be reconstructable from a bare stored pid across process boundaries.
+
+`command-group`'s anonymous-handle abstraction fights both invariants. The direct `nix` `setsid()` + `kill(-pgid)` calls express exactly the detach-and-survive + kill-by-stored-pid-later model, with no lifetime/ownership friction and no extra dependency on Windows (where `nix` is correctly absent and the whole background flow is deferred anyway).
+
+---
+
+## 9. Platform feature matrix
+
+| Feature | Linux | macOS | Windows |
+|---|:--:|:--:|:--:|
+| Static server (`ft <dir>`) | ✅ | ✅ | ✅ |
+| Quick Tunnel (cloudflared) | ✅ | ✅ | ✅ |
+| Background / detached worker | ✅ | ✅ | ⏳ deferred |
+| Foreground (`--foreground`) | ✅ | ✅ | ✅ |
+| `ft ls` (detail/logs) | ✅ | ✅ | ✅ |
+| `ft kill` | ✅ | ✅ | ⏳* |
+| `ft open` | ✅ | ✅ | ✅ |
+| URL installers (`install.sh`/`install.ps1`) | ✅ | ✅ | ✅ |
+| `cargo install` | ✅ | ✅ | ✅ |
+| `cargo binstall` | ✅ | ✅ | ✅ |
+| Signed binary | 🔜 later | 🔜 later | 🔜 later |
+| System service (`ft service` / unit) | 🔜 later | 🔜 later | 🔜 later |
+
+\* `ft kill` works on Windows for foreground (in-process) use; killing a detached background worker requires the Job-Object group-kill that ships with Windows background mode (deferred).
+
+---
+
+## 10. MVP acceptance criteria
+
+A release passes MVP when all of the following hold on each of the 5 MVP targets:
+
+1. **`cargo install freeoxide-tunnel --locked`** succeeds and produces a working `ft`.
+2. **`cargo binstall freeoxide-tunnel`** fetches the correct prebuilt archive (no source build) and produces a working `ft`.
+3. **URL install** (`curl|sh` / `irm|iex`) installs `ft` to the user bin dir, fixes `PATH`, and verifies.
+4. **`ft --version`** prints the version on all three OSes.
+5. **End-to-end flow** on all three OSes:
+   - `ft ./dist --name blog` starts a tunnel (foreground on Windows; background or foreground on Linux/macOS) and prints a public URL;
+   - `ft ls` lists the running service;
+   - `ft detail blog` shows state + log paths;
+   - `ft logs blog` shows the tail;
+   - `ft kill blog` tears it down (Unix background + all foreground flows).
+
+Foreground mode is the cross-platform baseline; background/detached is the Unix-only path until Windows Job-Object support lands.
+
+---
+
+## Implementation Status (2026-06-29)
+
+This pass landed the **installation and cross-platform plumbing** end to end. Implemented this pass:
+
+- **Full packaging metadata** in `Cargo.toml`: `repository`/`homepage`/`license`/`readme`/`keywords`/`categories`, plus the complete `[package.metadata.binstall]` block (with the `cfg(target_os = "windows")` → `zip` override) so `cargo binstall freeoxide-tunnel` resolves the correct per-target archive with `ft`/`ft.exe` at the root.
+- **`cargo-binstall` support** verified against the archive layout the release workflow produces.
+- **`install.sh`** (Linux/macOS: detect os/arch → map target → download archive + `SHA256SUMS` → verify checksum → extract → install to `~/.local/bin` → PATH handling → `ft --version`) and **`install.ps1`** (Windows: same flow against `.zip` + `Expand-Archive` + `%USERPROFILE%\.local\bin`).
+- **GitHub Actions release workflow** (`.github/workflows/release.yml`): per-target build matrix packaging the binary at the archive root, per-asset `.sha256` sidecars, an assembled + verified combined `SHA256SUMS`, Release upload, non-blocking `shellcheck`/parse-only installer lint jobs, and a **manual-only** crates.io `publish` job gated behind a protected environment.
+- **Windows added to CI** (`.github/workflows/ci.yml`): the build/test matrix now runs on `ubuntu-latest`, `macos-latest`, `windows-latest` across stable + `1.85`, so the non-Unix paths actually compile in CI.
+- **README install docs**: URL installer (website + GitHub-hosted fallback, `curl|sh` and `irm|iex`), `cargo binstall`, `cargo install --locked`, and `cargo install --git`, with the `cloudflared` requirement and `ft --version` smoke check.
+- **Crate now compiles on Windows** with `nix` correctly `cfg(unix)`-gated, `libc` `cfg(target_os = "linux")`-gated, and `pid_matches`/`pid_alive` providing Windows stubs. **Foreground mode works on all three platforms.**
+- **Multi-platform cloudflared missing-binary message** (`src/cloudflared.rs`): a single friendly message names the per-OS install command (`brew install cloudflared` / `winget install Cloudflare.cloudflared` / Linux package) and exits rather than surfacing a raw `which` error.
+
+**ONE deferral — Windows BACKGROUND (detached-worker) mode.** It is explicitly unsupported this pass and errors out clearly (`src/spawn.rs`: `background worker mode is not yet supported on Windows; use ft <dir> --foreground`). Rationale: the Unix background model depends on `setsid()` detach + `kill(-pgid)` whole-tree teardown + `PR_SET_PDEATHSIG` orphan-reaping — none of which have direct Win32 equivalents. A correct Windows background mode requires a **Win32 Job Object** process-group FFI (tie the worker + `cloudflared` to a job that auto-kills its children on close, plus creation-flag-based detach) **and PID-reuse guards** (Windows has no `/proc/<pid>/cmdline`, so the recorded-pid-before-signal defense needs a different mechanism). Both need **on-host Windows testing** to validate; shipping them untested would risk exactly the **orphaned-process bugs** the Unix path is hardened against (worker dies, `cloudflared` lives on as a leaked public tunnel). **Foreground mode — the cross-platform baseline — works on all three platforms today.**

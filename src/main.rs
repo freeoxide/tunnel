@@ -9,6 +9,7 @@ mod cli;
 mod cloudflared;
 mod cmd;
 mod error;
+mod fsutil;
 mod model;
 mod name;
 mod output;

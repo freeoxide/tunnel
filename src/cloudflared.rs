@@ -14,9 +14,12 @@ use tokio::process::{Child, Command};
 const MISSING_MESSAGE: &str = "\
 cloudflared was not found.
 
-Freeoxide Tunnel requires cloudflared for Cloudflare Quick Tunnels.
-Install cloudflared and try again:
-https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/";
+Freeoxide Tunnel uses cloudflared for Cloudflare Quick Tunnels.
+Install cloudflared, then try again:
+
+    Linux:   https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/
+    macOS:   brew install cloudflared
+    Windows: winget install Cloudflare.cloudflared";
 
 /// Ensure `cloudflared` is installed and on `PATH`.
 ///
@@ -210,5 +213,27 @@ mod tests {
         // Suffix trick: host taken before any '/'.
         assert!(!is_tunnel_url("https://foo.trycloudflare.com.evil.example"));
         assert!(!is_tunnel_url("not a url"));
+    }
+
+    // --- property test ----------------------------------------------------
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Anything extract_url returns is always a well-formed Quick Tunnel URL:
+        /// `https://` + a host ending in `.trycloudflare.com`.
+        #[test]
+        fn extract_url_only_yields_tunnel_urls(
+            prefix in "[a-zA-Z0-9 .,|:!?/<>\"'-]{0,40}",
+            slug in "[a-z0-9-]{1,30}",
+            suffix in "[^\\x00]{0,20}"
+        ) {
+            let line = format!("{prefix}https://{slug}.trycloudflare.com{suffix}");
+            if let Some(url) = extract_url(&line) {
+                let rest = url.strip_prefix("https://").unwrap_or("");
+                let host = rest.split(['/', '?']).next().unwrap_or("");
+                prop_assert!(!host.is_empty() && host.ends_with(".trycloudflare.com"), "bad url: {url}");
+            }
+        }
     }
 }

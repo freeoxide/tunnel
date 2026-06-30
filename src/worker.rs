@@ -27,7 +27,9 @@ use crate::static_server;
 /// How long to keep retrying the registry load looking for our entry.
 const REGISTRY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 const REGISTRY_LOOKUP_INTERVAL: Duration = Duration::from_millis(100);
-/// Grace window after SIGTERM before SIGKILL'ing cloudflared.
+/// Grace window after SIGTERM before SIGKILL'ing cloudflared (Unix only; the
+/// Windows teardown force-kills the owned child).
+#[cfg(unix)]
 const CLOUDFLARED_GRACE: Duration = Duration::from_secs(2);
 /// Upper bound on how long we wait for in-flight requests to drain after
 /// signalling graceful shutdown. If a request is stuck, we abort the server
@@ -36,6 +38,27 @@ const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Run the worker to completion.
 pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
+    // Refuse direct invocation: `run-worker` is an internal command that
+    // bypasses the START flow's input validation and the sensitive-directory
+    // confirmation. It is only ever launched by `spawn::spawn_worker`, which
+    // sets `FT_WORKER_TOKEN`; reject anything without a non-empty value.
+    if std::env::var_os("FT_WORKER_TOKEN")
+        .map(|v| v.is_empty())
+        .unwrap_or(true)
+    {
+        anyhow::bail!(
+            "run-worker is an internal command spawned by `ft <dir>`; invoke that instead"
+        );
+    }
+
+    // Windows: place ourselves in a Job Object with KILL_ON_JOB_CLOSE, held for
+    // the lifetime of `run`. When the worker exits for any reason (graceful, ft
+    // kill, OOM, crash) the OS closes the handle and kills the whole tree
+    // (cloudflared) — the PR_SET_PDEATHSIG equivalent. On Unix this is a no-op
+    // (Linux uses PR_SET_PDEATHSIG in cloudflared::spawn).
+    #[cfg(windows)]
+    let _job_guard = crate::proc::create_kill_on_close_job();
+
     let state = StateDir::new()?;
     let worker_log = state.worker_log(&name);
     let server_log = state.server_log(&name);
@@ -146,11 +169,7 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
     // Tee cloudflared output to tunnel.log and scan for the URL (first wins).
     let url_found = Arc::new(AtomicBool::new(false));
     let log_writer = Arc::new(Mutex::new(
-        tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&tunnel_log)
+        crate::fsutil::open_private_append_async(&tunnel_log)
             .await
             .with_context(|| format!("opening tunnel log {}", tunnel_log.display()))?,
     ));
@@ -178,57 +197,70 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
     // Keep alive until cloudflared exits, the server task ends, or we're
     // signalled. Polling server_handle ensures a serve failure (post-bind) is
     // observed rather than silently lost.
-    let mut sig_term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .context("installing SIGTERM handler")?;
-    let mut sig_int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .context("installing SIGINT handler")?;
+    //
+    // The signal arms are platform-split: on Unix we install explicit
+    // SIGTERM/SIGINT handlers (tokio::signal::unix); on Windows we fall back to
+    // ctrl_c(). Both arms are reachable — the background worker runs on every
+    // platform (Unix detaches via setsid, Windows via a Job Object).
+    #[cfg(unix)]
+    {
+        let mut sig_term =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("installing SIGTERM handler")?;
+        let mut sig_int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .context("installing SIGINT handler")?;
 
-    let exit_reason = tokio::select! {
-        status = child.wait() => {
-            match status {
-                Ok(s) => tracing::info!(?s, "cloudflared exited"),
-                Err(e) => tracing::error!(%e, "waiting on cloudflared failed"),
+        let exit_reason = tokio::select! {
+            status = child.wait() => {
+                match status {
+                    Ok(s) => tracing::info!(?s, "cloudflared exited"),
+                    Err(e) => tracing::error!(%e, "waiting on cloudflared failed"),
+                }
+                ReaderExit::ChildExited
             }
-            ReaderExit::ChildExited
-        }
-        res = &mut server_handle => {
-            match res {
-                Ok(Ok(())) => tracing::info!("static server task ended"),
-                Ok(Err(e)) => tracing::error!(%e, "static server task failed"),
-                Err(e) => tracing::error!(%e, "static server task panicked"),
+            res = &mut server_handle => {
+                match res {
+                    Ok(Ok(())) => tracing::info!("static server task ended"),
+                    Ok(Err(e)) => tracing::error!(%e, "static server task failed"),
+                    Err(e) => tracing::error!(%e, "static server task panicked"),
+                }
+                ReaderExit::ServerEnded
             }
-            ReaderExit::ServerEnded
-        }
-        _ = sig_term.recv() => {
-            tracing::info!("received SIGTERM, shutting down");
-            ReaderExit::Signal
-        }
-        _ = sig_int.recv() => {
-            tracing::info!("received SIGINT, shutting down");
-            ReaderExit::Signal
-        }
-    };
-
-    // If cloudflared may still be alive, shut it down and reap it to avoid a
-    // transient zombie. On ChildExited the select's wait() already reaped it.
-    if matches!(exit_reason, ReaderExit::Signal | ReaderExit::ServerEnded) {
-        if let Some(pid) = tunnel_pid {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGTERM,
-            );
-        }
-        if tokio::time::timeout(CLOUDFLARED_GRACE, child.wait())
-            .await
-            .is_err()
-            && let Some(pid) = tunnel_pid
-        {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-        }
-        let _ = child.wait().await; // ensure reaped
+            _ = sig_term.recv() => {
+                tracing::info!("received SIGTERM, shutting down");
+                ReaderExit::Signal
+            }
+            _ = sig_int.recv() => {
+                tracing::info!("received SIGINT, shutting down");
+                ReaderExit::Signal
+            }
+        };
+        teardown_on_exit(exit_reason, tunnel_pid, &mut child).await;
+    }
+    #[cfg(not(unix))]
+    {
+        let exit_reason = tokio::select! {
+            status = child.wait() => {
+                match status {
+                    Ok(s) => tracing::info!(?s, "cloudflared exited"),
+                    Err(e) => tracing::error!(%e, "waiting on cloudflared failed"),
+                }
+                ReaderExit::ChildExited
+            }
+            res = &mut server_handle => {
+                match res {
+                    Ok(Ok(())) => tracing::info!("static server task ended"),
+                    Ok(Err(e)) => tracing::error!(%e, "static server task failed"),
+                    Err(e) => tracing::error!(%e, "static server task panicked"),
+                }
+                ReaderExit::ServerEnded
+            }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("received Ctrl-C, shutting down");
+                ReaderExit::Signal
+            }
+        };
+        teardown_on_exit(exit_reason, tunnel_pid, &mut child).await;
     }
 
     for task in reader_tasks {
@@ -261,6 +293,51 @@ enum ReaderExit {
     ChildExited,
     ServerEnded,
     Signal,
+}
+
+/// If cloudflared may still be alive, shut it down and reap it to avoid a
+/// transient zombie. On `ChildExited` the select's `wait()` already reaped it,
+/// so nothing to do. On Unix we send a graceful SIGTERM and escalate to SIGKILL
+/// after the grace window; on Windows there is no signal/group teardown, so we
+/// force-kill the owned tokio child directly (the worker's Job Object would
+/// also reap it on the worker's own exit).
+async fn teardown_on_exit(
+    exit_reason: ReaderExit,
+    tunnel_pid: Option<u32>,
+    child: &mut tokio::process::Child,
+) {
+    if !matches!(exit_reason, ReaderExit::Signal | ReaderExit::ServerEnded) {
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        if let Some(pid) = tunnel_pid {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+        }
+        if tokio::time::timeout(CLOUDFLARED_GRACE, child.wait())
+            .await
+            .is_err()
+            && let Some(pid) = tunnel_pid
+        {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // No graceful signal path on Windows; force-kill the owned child. The
+        // pid is irrelevant here because the owned handle is the kill vector.
+        let _ = tunnel_pid;
+        let _ = child.start_kill();
+    }
+
+    let _ = child.wait().await; // ensure reaped
 }
 
 /// Shared context handed to each output-reader task.
@@ -336,19 +413,15 @@ fn publish_url(ctx: &ReaderCtx, url: String) -> Result<()> {
 /// worker/ft traces go to `worker.log`. Fire-once; a no-op if a subscriber is
 /// already installed.
 fn init_tracing(worker_log: &Path, server_log: &Path) {
-    use std::os::unix::fs::OpenOptionsExt;
     use std::sync::Mutex;
     use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
     // tower_http request traces -> server.log; everything else -> worker.log.
     // Each layer is Option-wrapped so a failure to open one log file just drops
-    // that sink rather than aborting tracing setup. Mode 0600: server.log can
-    // carry request URIs.
-    let server_layer = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(server_log)
+    // that sink rather than aborting tracing setup. Mode 0600 on Unix (server.log
+    // can carry request URIs); plain create on Windows via the cross-platform
+    // helper.
+    let server_layer = crate::fsutil::open_private_append(server_log)
         .ok()
         .map(|f| {
             fmt::layer()
@@ -357,11 +430,7 @@ fn init_tracing(worker_log: &Path, server_log: &Path) {
                 .with_filter(EnvFilter::new("tower_http=trace"))
         });
 
-    let worker_layer = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(worker_log)
+    let worker_layer = crate::fsutil::open_private_append(worker_log)
         .ok()
         .map(|f| {
             fmt::layer()

@@ -91,6 +91,14 @@ pub fn print_detail(service: &Service) {
     println!("Name:         {}", service.name);
     println!("ID:           {}", service.id);
     println!("Status:       {}", service.status().as_str());
+    println!(
+        "Mode:         {}",
+        if service.foreground {
+            "foreground"
+        } else {
+            "background"
+        }
+    );
     println!("Directory:    {}", service.dir.display());
     println!("Port:         {}", service.port);
     println!("Worker PID:   {}", service.worker_pid);
