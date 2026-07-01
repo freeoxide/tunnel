@@ -204,8 +204,8 @@ pub async fn serve_on(
 #[cfg(test)]
 mod confinement_tests {
     //! Logic-only checks for the path decisions inside `confine`. Full HTTP
-    //! confinement (symlink escape, dotfiles, traversal) is exercised in
-    //! `tests/static_server_security.rs`.
+    //! confinement (symlink escape, dotfiles, traversal, junction) is exercised
+    //! inline in `http_confinement_tests` below.
     use std::path::Path;
 
     #[test]
@@ -307,6 +307,7 @@ mod http_confinement_tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn symlink_escape_outside_root_is_blocked() {
         use std::os::unix::fs::symlink;
@@ -315,11 +316,7 @@ mod http_confinement_tests {
         let outside = tempfile::tempdir().expect("outside tempdir");
         std::fs::write(outside.path().join("secret"), "TOPSECRET").expect("write");
         std::fs::write(dir.path().join("index.html"), "ok").expect("write");
-        symlink(
-            outside.path().join("secret"),
-            dir.path().join("link"),
-        )
-        .expect("symlink");
+        symlink(outside.path().join("secret"), dir.path().join("link")).expect("symlink");
 
         let r = router(dir.path().to_path_buf());
         assert_eq!(
@@ -329,6 +326,7 @@ mod http_confinement_tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn symlink_escape_via_directory_index_is_blocked() {
         // ServeDir serves <dir>/index.html for directory requests; an escaping
@@ -365,6 +363,45 @@ mod http_confinement_tests {
         assert_eq!(
             resp.headers().get("x-content-type-options").unwrap(),
             "nosniff"
+        );
+    }
+
+    /// Windows: a directory junction (a reparse point) pointing outside the
+    /// served root must be confined just like a Unix symlink. `std::fs::canonicalize`
+    /// resolves junctions, so `confine`'s canonicalize-then-`starts_with` rejects
+    /// the escape. (Runs only on the Windows CI matrix, where `mklink /J` exists.)
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn junction_escape_outside_root_is_blocked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        std::fs::write(outside.path().join("secret"), "TOPSECRET").expect("write");
+        std::fs::write(dir.path().join("index.html"), "ok").expect("write");
+
+        // Create a junction `dir/link -> outside` via cmd (no admin needed for /J).
+        let status = std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                &dir.path().join("link").to_string_lossy(),
+                &outside.path().to_string_lossy(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("run mklink");
+        // If mklink is unavailable in some environment, skip rather than fail.
+        if !status.success() {
+            eprintln!("skipping: mklink /J failed");
+            return;
+        }
+
+        let r = router(dir.path().to_path_buf());
+        assert_eq!(
+            r.oneshot(req("/link")).await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "a junction escaping the root must not be served"
         );
     }
 }

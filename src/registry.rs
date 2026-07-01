@@ -6,42 +6,41 @@
 //! writes, allocate duplicate IDs, or erase fields another writer just published.
 
 use crate::error::Result;
+use crate::fsutil;
 use crate::model::{Registry, Service};
 use crate::state::StateDir;
 use anyhow::Context;
+use fs2::FileExt;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::AsRawFd;
 
 /// An advisory lock on the registry, released on drop.
-struct RegistryLock(std::fs::File);
-
-impl Drop for RegistryLock {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
-}
+///
+/// `fs2` grants a cross-platform exclusive lock — `flock(LOCK_EX)` on Unix and
+/// `LockFileEx` on Windows — bound to this file handle. Both OSes release the
+/// lock automatically when the handle is closed, so dropping this guard (which
+/// drops and closes the file) frees it without an explicit unlock call. Calling
+/// `fs2::FileExt::unlock` directly trips a `clippy::incompatible_msrv` false
+/// positive that misattributes the trait method to the std library, so we rely
+/// on close-on-drop instead.
+struct RegistryLock(#[allow(dead_code)] std::fs::File);
 
 fn acquire_lock(state: &StateDir) -> Result<RegistryLock> {
     let path = state.lock_path();
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .mode(0o600)
+    let mut opts = OpenOptions::new();
+    opts.create(true).read(true).write(true);
+    fsutil::apply_private_mode(&mut opts);
+    let file = opts
         .open(&path)
         .with_context(|| format!("opening registry lock {}", path.display()))?;
     // Block until we hold an exclusive advisory lock on the lock file.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(anyhow::anyhow!(
-            "locking registry: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
+    file.lock_exclusive()
+        .with_context(|| format!("locking registry {}", path.display()))?;
+    // Now that we hold the exclusive lock, drop any leftover temp file from a
+    // save that crashed before its rename. Doing this HERE (under the lock)
+    // rather than on every unlocked `load` means a concurrent read-only command
+    // can never delete a writer's in-flight temp mid-save and fail its commit.
+    let _ = std::fs::remove_file(state.registry_path().with_extension("json.tmp"));
     Ok(RegistryLock(file))
 }
 
@@ -65,9 +64,9 @@ impl Registry {
     /// longer brick the whole CLI.
     pub fn load(state: &StateDir) -> Result<Registry> {
         let path = state.registry_path();
-        // A leftover .tmp means a prior save crashed before the rename; drop it
-        // so we never accidentally load a half-written file.
-        let _ = std::fs::remove_file(path.with_extension("json.tmp"));
+        // NOTE: orphan `registry.json.tmp` cleanup is performed under the lock
+        // in `acquire_lock`, not here — `load` is also called by unlocked
+        // read-only commands, which must not race a concurrent writer's temp.
 
         if let Some(bytes) = std::fs::read(&path).ok()
             && !bytes.iter().all(u8::is_ascii_whitespace)
@@ -88,8 +87,7 @@ impl Registry {
 
     /// Decode + validate a registry blob.
     fn parse(bytes: &[u8]) -> Result<Registry> {
-        let mut reg: Registry =
-            serde_json::from_slice(bytes).context("decoding registry")?;
+        let mut reg: Registry = serde_json::from_slice(bytes).context("decoding registry")?;
         reg.validate().context("validating registry")?;
         Ok(reg)
     }
@@ -116,11 +114,10 @@ impl Registry {
         let tmp = path.with_extension("json.tmp");
         let data = serde_json::to_vec_pretty(self).context("encoding registry")?;
         {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
+            let mut opts = OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            fsutil::apply_private_mode(&mut opts);
+            let mut file = opts
                 .open(&tmp)
                 .with_context(|| format!("writing registry temp file {}", tmp.display()))?;
             file.write_all(&data)
@@ -227,7 +224,6 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use crate::model::{Registry, Service, ServiceKind};
-    use chrono::Utc;
     use std::path::PathBuf;
 
     fn dummy_service(id: u64, name: &str) -> Service {
@@ -241,8 +237,9 @@ mod tests {
             public_url: None,
             worker_pid: 0,
             tunnel_pid: None,
-            created_at: Utc::now(),
+            created_at: crate::model::now_utc(),
             state_dir: PathBuf::from("/tmp/state"),
+            foreground: false,
         }
     }
 
@@ -398,6 +395,27 @@ mod tests {
     }
 
     #[test]
+    fn load_does_not_remove_orphan_tmp() {
+        // SR-2: an unlocked read (Registry::load) must NOT delete a writer's
+        // in-flight registry.json.tmp, or a concurrent reader could fail the
+        // writer's commit. Only acquire_lock (under the exclusive flock) cleans it.
+        use crate::state::StateDir;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::new_at(tmp.path().join("ft-state"));
+        state.ensure().expect("ensure");
+        Registry::default().save(&state).expect("seed");
+        // Simulate a writer's in-flight temp.
+        let tmp_path = state.registry_path().with_extension("json.tmp");
+        std::fs::write(&tmp_path, b"partial").expect("write tmp");
+        // A read-only load must leave the temp alone.
+        let _ = Registry::load(&state).expect("load");
+        assert!(
+            tmp_path.exists(),
+            "unlocked load must not delete an in-flight tmp"
+        );
+    }
+
+    #[test]
     fn validate_rejects_duplicate_ids_and_heals_next_id() {
         let mut reg = Registry {
             next_id: 1,
@@ -410,6 +428,9 @@ mod tests {
             services: vec![dummy_service(7, "a")],
         };
         assert!(reg.validate().is_ok());
-        assert_eq!(reg.next_id, 8, "next_id healed past the highest existing id");
+        assert_eq!(
+            reg.next_id, 8,
+            "next_id healed past the highest existing id"
+        );
     }
 }

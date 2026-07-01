@@ -91,10 +91,18 @@ pub fn print_detail(service: &Service) {
     println!("Name:         {}", service.name);
     println!("ID:           {}", service.id);
     println!("Status:       {}", service.status().as_str());
+    println!(
+        "Mode:         {}",
+        if service.foreground {
+            "foreground"
+        } else {
+            "background"
+        }
+    );
     println!("Directory:    {}", service.dir.display());
     println!("Port:         {}", service.port);
     println!("Worker PID:   {}", service.worker_pid);
-    println!("Tunnel PID:   {}", tunnel_pid);
+    println!("Tunnel PID:   {tunnel_pid}");
     println!("Started:      {}", fmt_started(service));
     println!("Local URL:    {}", service.local_url);
     println!("Public URL:   {}", url_or_pending(service));
@@ -107,10 +115,10 @@ pub fn print_detail(service: &Service) {
 
 /// Print the confirmation for an active service that was just stopped.
 pub fn print_stopped(name: &str) {
-    println!("Stopped {}.", name);
+    println!("Stopped {name}.");
 }
 
 /// Print the confirmation for removing a service that was already dead.
 pub fn print_removed_stale(name: &str) {
-    println!("Removed stale service {}.", name);
+    println!("Removed stale service {name}.");
 }

@@ -40,10 +40,7 @@ mod tests {
     #[test]
     fn is_port_free_is_false_while_a_port_is_held() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener
-            .local_addr()
-            .expect("local_addr")
-            .port();
+        let port = listener.local_addr().expect("local_addr").port();
         assert!(
             !is_port_free(port),
             "port should read as in-use while the listener is held"

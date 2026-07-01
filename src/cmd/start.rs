@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, bail, ensure};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -24,6 +24,7 @@ use crate::port;
 use crate::proc;
 use crate::spawn;
 use crate::state::StateDir;
+use std::time::Instant;
 
 /// Reload cadence while waiting for the worker to publish the public URL.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -94,18 +95,49 @@ fn confirm_sensitive(dir: &Path, yes: bool) -> Result<()> {
 }
 
 /// True for directories whose wholesale public exposure is almost certainly a
-/// mistake: the filesystem root and the user's home directory.
+/// mistake.
+///
+/// Flags:
+/// - the filesystem root and well-known system directories (`/etc`, `/root`,
+///   `/var`, `/home`, `/Users`, `/proc`, `/sys`, `/dev`);
+/// - any **ancestor** of `$HOME` (e.g. `ft ~..`, `ft /home`, `ft /Users`,
+///   `ft C:\Users`) — publishing it would expose every user's home non-dotfile
+///   contents;
+/// - `$HOME` itself.
 ///
 /// Both sides are canonicalised so a symlink alias of `$HOME` (e.g.
-/// `ft ~/house` where `house -> $HOME`) cannot slip past the prompt.
+/// `ft ~/house` where `house -> $HOME`) cannot slip past the prompt; if the
+/// directory cannot be canonicalised (a symlink loop, permission issue, etc.)
+/// we fail CLOSED (treat it as sensitive) rather than compare an un-resolved
+/// path. The dotfile confinement (C1) still denies `.env`/`.ssh`/`.git`/etc.
+/// regardless; this guard covers the bulk of a sensitive tree that is *not*
+/// dotfile-hidden.
 fn is_sensitive_dir(dir: &Path) -> bool {
-    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    if dir == Path::new("/") {
+    let Ok(dir) = std::fs::canonicalize(dir) else {
+        return true; // fail-closed: can't resolve it -> refuse to publish silently.
+    };
+
+    // System roots/directories whose wholesale exposure is a foot-gun. The
+    // Unix-specific entries are harmless no-ops on Windows (they never match).
+    // Each entry is canonicalised before comparing so platform symlinks resolve
+    // consistently: on macOS `/etc` -> `/private/etc` and `/var` -> `/private/var`,
+    // which a literal compare against `/etc` would miss. Entries that don't exist
+    // (e.g. `/proc` on macOS) are skipped via `filter_map`.
+    const DENYLIST: &[&str] = &[
+        "/", "/etc", "/root", "/var", "/home", "/Users", "/proc", "/sys", "/dev",
+    ];
+    if DENYLIST
+        .iter()
+        .filter_map(|d| std::fs::canonicalize(d).ok())
+        .any(|d| dir == d)
+    {
         return true;
     }
+
+    // Any ancestor of $HOME (inclusive) publishes every user's home contents.
     if let Some(home) = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()) {
         let home = std::fs::canonicalize(&home).unwrap_or(home);
-        return dir == home;
+        return home.starts_with(&dir);
     }
     false
 }
@@ -134,7 +166,16 @@ fn is_readable(dir: &Path) -> bool {
 
 /// Background flow: reserve the entry, spawn the detached worker, then poll for
 /// the public URL (failing fast if the worker dies first).
+///
+/// Cross-platform: on Unix the worker is detached via `setsid` and torn down by
+/// `kill(-pgid)`; on Windows it is detached via `CREATE_NEW_PROCESS_GROUP |
+/// DETACHED_PROCESS` and owns a `KILL_ON_JOB_CLOSE` Job Object. Both are hidden
+/// behind [`spawn::spawn_worker`] and [`proc::shutdown_process_group`].
 async fn run_background(dir: &Path, name: Option<String>, port: Option<u16>) -> Result<()> {
+    run_background_impl(dir, name, port).await
+}
+
+async fn run_background_impl(dir: &Path, name: Option<String>, port: Option<u16>) -> Result<()> {
     let state = StateDir::new()?;
 
     // --- Port -------------------------------------------------------------
@@ -182,8 +223,9 @@ async fn run_background(dir: &Path, name: Option<String>, port: Option<u16>) -> 
             public_url: None,
             worker_pid: 0,
             tunnel_pid: None,
-            created_at: chrono::Utc::now(),
+            created_at: crate::model::now_utc(),
             state_dir: service_dir,
+            foreground: false,
         });
         Ok((id, name))
     })??;
@@ -305,19 +347,51 @@ fn last_line(path: &Path) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// RAII guard that removes a reserved registry entry on drop.
+///
+/// Ensures EVERY exit path out of `run_foreground` — early `?` returns, the
+/// cloudflared-spawn-failure arm, a panic, and the normal return — cleans up the
+/// registry entry it reserved. Without this, a failure between the reserve and
+/// the final explicit removal (e.g. opening tunnel.log, installing the SIGTERM
+/// handler) would leak a stale entry.
+struct EntryGuard {
+    state: StateDir,
+    id: u64,
+}
+
+impl Drop for EntryGuard {
+    fn drop(&mut self) {
+        let _ = Registry::update(&self.state, |reg| {
+            reg.remove(self.id);
+        });
+    }
+}
+
 /// Foreground flow: run the server and tunnel in this process and block until
-/// cloudflared exits or Ctrl+C is received. No registry entry is written.
+/// cloudflared exits, Ctrl-C is received, or (Unix) SIGTERM arrives — SIGTERM
+/// is what `ft kill` uses to stop a foreground tunnel from another terminal.
+///
+/// Unlike the background flow, the server + cloudflared live in THIS process,
+/// so the registry entry records `worker_pid` as our own pid and is marked
+/// `foreground: true`. That flag makes `status()` use a plain liveness probe
+/// (our cmdline lacks the `run-worker` token) and makes `ft kill` signal this
+/// single pid rather than its whole process group (which would include the
+/// operator's shell). The entry is removed on every exit path; a hard kill
+/// (SIGKILL/crash) leaves it stale for `ft prune` to reap.
 async fn run_foreground(dir: &Path, name: Option<String>, port: Option<u16>) -> Result<()> {
     use crate::static_server;
     use std::time::Duration;
+    use tokio::sync::Mutex;
 
-    /// Grace window after SIGTERM before SIGKILL'ing cloudflared.
+    /// Grace window after SIGTERM before SIGKILL'ing cloudflared (Unix only).
+    #[cfg(unix)]
     const CLOUDFLARED_GRACE: Duration = Duration::from_secs(2);
     /// Upper bound on draining in-flight requests on Ctrl-C before we abort the
     /// server task, so a stuck request can't hang the foreground command.
     const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
-    let display_name = name.unwrap_or_else(|| name::generate_name(dir));
+    let state = StateDir::new()?;
+    state.ensure()?;
 
     let port = match port {
         Some(p) => {
@@ -333,6 +407,65 @@ async fn run_foreground(dir: &Path, name: Option<String>, port: Option<u16>) -> 
 
     cloudflared::ensure_installed()?;
 
+    // --- Reserve a registry entry (cross-platform) -------------------------
+    // Mirrors `run_background_impl`'s reservation, but marks this as a FOREGROUND
+    // service whose worker_pid is THIS process. That makes `ft ls/detail/logs/
+    // open` see the foreground tunnel on every platform — notably Windows, where
+    // foreground is the only mode.
+    let (id, name) = Registry::update(&state, |reg| -> Result<(u64, String)> {
+        let name = match &name {
+            Some(n) => {
+                name::validate_name(n)?;
+                ensure!(!reg.name_exists(n), "a service named '{n}' already exists");
+                n.clone()
+            }
+            None => name::unique_name(reg, &name::generate_name(dir)),
+        };
+        let service_dir = state.ensure_service_dir(&name)?;
+        let id = reg.allocate_id();
+        reg.services.push(Service {
+            id,
+            name: name.clone(),
+            kind: ServiceKind::Static,
+            dir: dir.to_path_buf(),
+            port,
+            local_url: format!("http://127.0.0.1:{port}"),
+            public_url: None,
+            worker_pid: std::process::id(),
+            tunnel_pid: None,
+            created_at: crate::model::now_utc(),
+            state_dir: service_dir,
+            foreground: true,
+        });
+        Ok((id, name))
+    })??;
+
+    // From here, every exit path must release the reserved entry. The guard's
+    // Drop removes it on early `?` returns, the spawn-failure arm, a panic, and
+    // the normal return alike — so a failure between reserve and the end of the
+    // function (opening tunnel.log, installing the SIGTERM handler, etc.) can no
+    // longer leak a stale entry.
+    let _entry = EntryGuard {
+        state: state.clone(),
+        id,
+    };
+
+    // Tee cloudflared output to tunnel.log so `ft logs <name>` works for
+    // foreground tunnels (which otherwise only print to the terminal).
+    let tunnel_log = state.tunnel_log(&name);
+    let log_writer = Arc::new(Mutex::new(
+        crate::fsutil::open_private_append_async(&tunnel_log)
+            .await
+            .with_context(|| format!("opening tunnel log {}", tunnel_log.display()))?,
+    ));
+
+    // Install the SIGTERM handler (Unix) BEFORE spawning the server + cloudflared:
+    // if it fails the `?` returns with only the (guard-protected) entry to clean
+    // up — no orphaned server task or cloudflared child is left behind.
+    #[cfg(unix)]
+    let mut sig_term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing SIGTERM handler")?;
+
     let router = static_server::router(dir.to_path_buf());
     // `serve` installs its own Ctrl-C handler for graceful shutdown: on Ctrl-C
     // it stops accepting and drains in-flight requests. We keep the JoinHandle
@@ -343,32 +476,69 @@ async fn run_foreground(dir: &Path, name: Option<String>, port: Option<u16>) -> 
         }
     });
 
-    let mut child = cloudflared::spawn(port, PathBuf::new())?;
+    let mut child = match cloudflared::spawn(port, PathBuf::new()) {
+        Ok(c) => c,
+        Err(e) => {
+            // Abort the just-spawned server task; the entry is released by the
+            // guard on return.
+            server_handle.abort();
+            return Err(e);
+        }
+    };
     let tunnel_pid = child.id();
 
-    // Mirror cloudflared's combined output to stdout and print the success
-    // banner on first URL discovery.
+    // Mirror cloudflared's combined output to stdout AND tunnel.log, and publish
+    // the public URL on first discovery (so `ft open`/`ft detail` work too).
     let found = Arc::new(AtomicBool::new(false));
-
     let mut tasks = Vec::new();
     if let Some(out) = child.stdout.take() {
-        let found = found.clone();
-        let display_name = display_name.clone();
-        tasks.push(tokio::spawn(async move {
-            drain_and_announce(BufReader::new(out).lines(), found, &display_name, port).await;
-        }));
+        tasks.push(tokio::spawn(drain_and_announce(
+            BufReader::new(out).lines(),
+            found.clone(),
+            name.clone(),
+            port,
+            state.clone(),
+            id,
+            tunnel_pid,
+            log_writer.clone(),
+        )));
     }
     if let Some(err) = child.stderr.take() {
-        let found = found.clone();
-        let display_name = display_name.clone();
-        tasks.push(tokio::spawn(async move {
-            drain_and_announce(BufReader::new(err).lines(), found, &display_name, port).await;
-        }));
+        tasks.push(tokio::spawn(drain_and_announce(
+            BufReader::new(err).lines(),
+            found.clone(),
+            name.clone(),
+            port,
+            state.clone(),
+            id,
+            tunnel_pid,
+            log_writer.clone(),
+        )));
     }
 
-    // Keep the foreground alive until cloudflared exits on its own OR Ctrl-C is
-    // received. Racing child.wait() ensures that if cloudflared dies before the
-    // URL is found (or any time later) we tear down instead of hanging forever.
+    // Keep the foreground alive until cloudflared exits, Ctrl-C is received, or
+    // (Unix) SIGTERM arrives. Racing child.wait() ensures that if cloudflared
+    // dies before the URL is found (or any time later) we tear down instead of
+    // hanging forever.
+    #[cfg(unix)]
+    let exit_reason = tokio::select! {
+        status = child.wait() => {
+            match status {
+                Ok(s) => tracing::info!(?s, "cloudflared exited"),
+                Err(e) => tracing::error!(%e, "waiting on cloudflared failed"),
+            }
+            ReaderExit::ChildExited
+        }
+        _ = sig_term.recv() => {
+            tracing::info!("received SIGTERM, shutting down foreground tunnel");
+            ReaderExit::Signal
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("received Ctrl-C, shutting down foreground tunnel");
+            ReaderExit::Signal
+        }
+    };
+    #[cfg(not(unix))]
     let exit_reason = tokio::select! {
         status = child.wait() => {
             match status {
@@ -386,21 +556,30 @@ async fn run_foreground(dir: &Path, name: Option<String>, port: Option<u16>) -> 
     // If cloudflared may still be alive, shut it down and reap it to avoid a
     // transient zombie. On ChildExited the select's wait() already reaped it.
     if matches!(exit_reason, ReaderExit::Signal) {
-        if let Some(pid) = tunnel_pid {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGTERM,
-            );
-        }
-        if tokio::time::timeout(CLOUDFLARED_GRACE, child.wait())
-            .await
-            .is_err()
-            && let Some(pid) = tunnel_pid
+        #[cfg(unix)]
         {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGKILL,
-            );
+            if let Some(pid) = tunnel_pid {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid as i32),
+                    nix::sys::signal::Signal::SIGTERM,
+                );
+            }
+            if tokio::time::timeout(CLOUDFLARED_GRACE, child.wait())
+                .await
+                .is_err()
+                && let Some(pid) = tunnel_pid
+            {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            // No graceful signal path on Windows; force-kill the owned child.
+            let _ = tunnel_pid;
+            let _ = child.start_kill();
         }
         let _ = child.wait().await; // ensure reaped
     }
@@ -424,6 +603,7 @@ async fn run_foreground(dir: &Path, name: Option<String>, port: Option<u16>) -> 
         }
     }
 
+    // The `_entry` guard removes our registry entry on return (every exit path).
     Ok(())
 }
 
@@ -433,28 +613,92 @@ enum ReaderExit {
     Signal,
 }
 
-/// Read `lines` to EOF, mirroring each to stdout, and print the foreground
-/// success banner on the first discovered Quick Tunnel URL.
+/// Read `lines` to EOF, mirror each line to stdout AND `tunnel.log`, and publish
+/// the first discovered Quick Tunnel URL onto the registry entry (printing the
+/// foreground success banner at the same time).
+#[allow(clippy::too_many_arguments)]
 async fn drain_and_announce<R>(
     mut lines: tokio::io::Lines<R>,
     found: Arc<AtomicBool>,
-    display_name: &str,
+    name: String,
     port: u16,
+    state: StateDir,
+    id: u64,
+    tunnel_pid: Option<u32>,
+    log_writer: Arc<tokio::sync::Mutex<tokio::fs::File>>,
 ) where
     R: tokio::io::AsyncBufRead + Unpin,
 {
+    use tokio::io::AsyncWriteExt;
     while let Ok(Some(line)) = lines.next_line().await {
         println!("{line}");
+        {
+            let mut f = log_writer.lock().await;
+            let _ = f.write_all(line.as_bytes()).await;
+            let _ = f.write_all(b"\n").await;
+            let _ = f.flush().await;
+        }
         if !found.load(Ordering::Acquire)
             && let Some(url) = cloudflared::extract_url(&line)
+            && !found.swap(true, Ordering::AcqRel)
         {
             println!();
-            println!("Started {display_name}");
+            println!("Started {name}");
             println!();
             println!("Local:   http://127.0.0.1:{port}");
             println!("Public:  {url}");
             println!();
-            found.store(true, Ordering::Release);
+            if let Err(e) = Registry::update(&state, |reg| {
+                if let Some(svc) = reg.find_mut(&id.to_string()) {
+                    svc.public_url = Some(url.clone());
+                    if svc.tunnel_pid.is_none() {
+                        svc.tunnel_pid = tunnel_pid;
+                    }
+                }
+            }) {
+                tracing::error!(%e, "failed to record foreground tunnel URL");
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_sensitive_dir;
+    #[cfg(unix)]
+    use std::path::Path;
+
+    #[test]
+    fn sensitive_home_and_its_ancestor() {
+        let home = directories::BaseDirs::new()
+            .expect("home dir")
+            .home_dir()
+            .to_path_buf();
+        assert!(is_sensitive_dir(&home), "$HOME itself must be sensitive");
+        // Any ancestor of $HOME (its parent) publishes every user's home, so it
+        // must be sensitive too (the CLI-1 fix — previously only exact $HOME).
+        if let Some(parent) = home.parent() {
+            assert!(
+                is_sensitive_dir(parent),
+                "{parent:?} should be sensitive (ancestor of $HOME)"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sensitive_system_dirs() {
+        // Existence-guarded so this passes in minimal containers too.
+        for d in ["/etc", "/var", "/dev", "/proc", "/sys"] {
+            if Path::new(d).exists() {
+                assert!(is_sensitive_dir(Path::new(d)), "{d} should be sensitive");
+            }
+        }
+    }
+
+    #[test]
+    fn normal_dir_not_sensitive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(!is_sensitive_dir(dir.path()));
     }
 }
