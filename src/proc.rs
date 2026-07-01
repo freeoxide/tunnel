@@ -371,7 +371,7 @@ fn cmdline_contains(_pid: u32, _needle: &str) -> bool {
     false
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

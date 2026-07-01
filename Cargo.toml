@@ -2,9 +2,11 @@
 name = "freeoxide-tunnel"
 version = "0.1.0"
 edition = "2024"
-# Edition 2024 requires Rust 1.85. Pin the MSRV so a future toolchain or a
-# dependency bump cannot silently raise the build floor without CI catching it.
-rust-version = "1.85"
+# Edition 2024 needs Rust 1.85, but the locked dependency tree needs >=1.88:
+# comfy-table 7.2.2 uses let-chains (stabilized in 1.88). Pin the MSRV so a
+# future toolchain or dependency bump cannot silently raise the build floor
+# without CI catching it.
+rust-version = "1.88"
 description = "Expose local and static services through temporary tunnels."
 repository = "https://github.com/freeoxide/tunnel"
 homepage = "https://tunnel.freeoxide.com"

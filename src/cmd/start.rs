@@ -119,10 +119,18 @@ fn is_sensitive_dir(dir: &Path) -> bool {
 
     // System roots/directories whose wholesale exposure is a foot-gun. The
     // Unix-specific entries are harmless no-ops on Windows (they never match).
+    // Each entry is canonicalised before comparing so platform symlinks resolve
+    // consistently: on macOS `/etc` -> `/private/etc` and `/var` -> `/private/var`,
+    // which a literal compare against `/etc` would miss. Entries that don't exist
+    // (e.g. `/proc` on macOS) are skipped via `filter_map`.
     const DENYLIST: &[&str] = &[
         "/", "/etc", "/root", "/var", "/home", "/Users", "/proc", "/sys", "/dev",
     ];
-    if DENYLIST.iter().any(|d| dir == Path::new(d)) {
+    if DENYLIST
+        .iter()
+        .filter_map(|d| std::fs::canonicalize(d).ok())
+        .any(|d| dir == d)
+    {
         return true;
     }
 
@@ -657,6 +665,7 @@ async fn drain_and_announce<R>(
 #[cfg(test)]
 mod tests {
     use super::is_sensitive_dir;
+    #[cfg(unix)]
     use std::path::Path;
 
     #[test]

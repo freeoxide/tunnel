@@ -29,11 +29,20 @@ jobs:
         # macOS builds the macOS sysctl PID-identity path in proc.rs and the
         # not(target_os = "linux") fallbacks; Windows builds the windows-sys
         # detached-worker (Job Object) + OpenProcess paths. Both now compile
-        # and run the target-gated tests. The MSRV pin (1.85, edition 2024
-        # floor) catches accidental toolchain raises.
+        # and run the target-gated tests. The MSRV pin (1.88 — the real floor
+        # of the locked dep tree, since comfy-table 7.2.2 uses let-chains
+        # stabilized in 1.88) catches accidental toolchain raises.
         os: [ubuntu-latest, macos-latest, windows-latest]
-        toolchain: [stable, "1.85"]
+        toolchain: [stable, "1.88"]
     runs-on: ${{ matrix.os }}
+    env:
+      # sccache (GitHub Actions cache backend) caches compiled crate artifacts
+      # across runs — complementary to rust-cache, which handles the coarse
+      # target/ restore. CARGO_INCREMENTAL=0 because incremental artifacts are
+      # not cacheable and pointless in CI.
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -41,12 +50,21 @@ jobs:
           toolchain: ${{ matrix.toolchain }}
           components: clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # Installs sccache and wires up the GHA cache backend (exports
+      # ACTIONS_CACHE_URL / ACTIONS_RUNTIME_TOKEN for later steps); saves the
+      # compiled-artifact cache in its post step.
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Clippy (--locked, --all-features, -D warnings)
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - name: Tests (--locked, --all-features)
         run: cargo test --all --all-features --locked
       - name: Release build (--locked)
         run: cargo build --release --locked
+      - name: sccache stats
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: sccache --show-stats
 
   supply-chain:
     name: cargo-deny + cargo-audit
