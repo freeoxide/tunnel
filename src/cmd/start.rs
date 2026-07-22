@@ -17,7 +17,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::cloudflared;
 use crate::error::Result;
-use crate::model::{Registry, Service, ServiceKind};
+use crate::model::{Registry, Service};
 use crate::name;
 use crate::output;
 use crate::port;
@@ -112,7 +112,7 @@ fn confirm_sensitive(dir: &Path, yes: bool) -> Result<()> {
 /// path. The dotfile confinement (C1) still denies `.env`/`.ssh`/`.git`/etc.
 /// regardless; this guard covers the bulk of a sensitive tree that is *not*
 /// dotfile-hidden.
-fn is_sensitive_dir(dir: &Path) -> bool {
+pub(crate) fn is_sensitive_dir(dir: &Path) -> bool {
     let Ok(dir) = std::fs::canonicalize(dir) else {
         return true; // fail-closed: can't resolve it -> refuse to publish silently.
     };
@@ -135,15 +135,21 @@ fn is_sensitive_dir(dir: &Path) -> bool {
     }
 
     // Any ancestor of $HOME (inclusive) publishes every user's home contents.
-    if let Some(home) = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()) {
-        let home = std::fs::canonicalize(&home).unwrap_or(home);
-        return home.starts_with(&dir);
+    // If $HOME cannot be resolved (broken environment — common in hardened
+    // containers or systemd units with no Environment=), fail CLOSED: treat
+    // the directory as sensitive so the user must pass --yes rather than us
+    // silently publishing something we couldn't reason about.
+    match directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()) {
+        Some(home) => {
+            let home = std::fs::canonicalize(&home).unwrap_or(home);
+            home.starts_with(&dir)
+        }
+        None => true,
     }
-    false
 }
 
 /// Resolve a directory to an absolute, existing, readable path.
-fn resolve_dir(dir: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve_dir(dir: &Path) -> Result<PathBuf> {
     let abs = std::path::absolute(dir)
         .with_context(|| format!("resolving directory {}", dir.display()))?;
 
@@ -172,10 +178,6 @@ fn is_readable(dir: &Path) -> bool {
 /// DETACHED_PROCESS` and owns a `KILL_ON_JOB_CLOSE` Job Object. Both are hidden
 /// behind [`spawn::spawn_worker`] and [`proc::shutdown_process_group`].
 async fn run_background(dir: &Path, name: Option<String>, port: Option<u16>) -> Result<()> {
-    run_background_impl(dir, name, port).await
-}
-
-async fn run_background_impl(dir: &Path, name: Option<String>, port: Option<u16>) -> Result<()> {
     let state = StateDir::new()?;
 
     // --- Port -------------------------------------------------------------
@@ -216,7 +218,6 @@ async fn run_background_impl(dir: &Path, name: Option<String>, port: Option<u16>
         reg.services.push(Service {
             id,
             name: name.clone(),
-            kind: ServiceKind::Static,
             dir: dir.to_path_buf(),
             port,
             local_url: format!("http://127.0.0.1:{port}"),
@@ -235,9 +236,11 @@ async fn run_background_impl(dir: &Path, name: Option<String>, port: Option<u16>
         Ok(pid) => pid,
         Err(e) => {
             // Release the reserved entry on spawn failure.
-            let _ = Registry::update(&state, |reg| {
+            if let Err(cleanup_err) = Registry::update(&state, |reg| {
                 reg.remove(id);
-            });
+            }) {
+                tracing::warn!(%cleanup_err, id, "failed to clean up registry entry after spawn failure");
+            }
             return Err(e);
         }
     };
@@ -253,40 +256,80 @@ async fn run_background_impl(dir: &Path, name: Option<String>, port: Option<u16>
     })?;
 
     // --- Poll for the tunnel URL (fail-fast on worker death) --------------
+    // The worker rewrites registry.json only when it discovers the URL or
+    // self-removes, so re-read+re-parse it only when its mtime changed — the
+    // worker-death probe below still runs every poll, so fail-fast latency is
+    // unchanged; this just avoids ~120 full reads+parses for a quiet registry.
+    let registry_path = state.registry_path();
+    let mut last_mtime = std::fs::metadata(&registry_path)
+        .and_then(|m| m.modified())
+        .ok();
     let deadline = Instant::now() + POLL_TIMEOUT;
     loop {
         if Instant::now() >= deadline {
             break;
         }
-        let snapshot = Registry::load(&state)?.find(&id.to_string()).cloned();
+
+        // Cheap stat first. Only re-read+parse when the file actually changed.
+        let new_mtime = std::fs::metadata(&registry_path)
+            .and_then(|m| m.modified())
+            .ok();
+        // `None` here means "we did NOT re-read this poll" (mtime unchanged);
+        // `Some(None)` means we re-read and our entry is gone (vanished).
+        let snapshot: Option<Option<Service>> = if new_mtime != last_mtime {
+            last_mtime = new_mtime;
+            Some(Registry::load(&state)?.find(&id.to_string()).cloned())
+        } else {
+            // Registry unchanged since last poll: there is no fresh entry to
+            // consult, but the worker may still have died silently between
+            // rewrites, so probe it directly to preserve fail-fast behaviour.
+            // (This uses the pid we already recorded, not the snapshot's.)
+            if !proc::pid_alive(worker_pid) {
+                proc::shutdown_process_group(worker_pid).await;
+                let reason = last_reason(&state, &name);
+                if let Err(cleanup_err) = Registry::update(&state, |reg| {
+                    reg.remove(id);
+                }) {
+                    tracing::warn!(%cleanup_err, id, "failed to clean up registry entry after worker death");
+                }
+                bail!("worker for '{name}' exited before the tunnel came up{reason}");
+            }
+            None
+        };
+
         match snapshot {
-            Some(svc) if svc.public_url.is_some() => {
+            Some(Some(svc)) if svc.public_url.is_some() => {
                 output::print_started(&svc);
                 return Ok(());
             }
-            Some(svc) if !proc::pid_alive(svc.worker_pid) => {
+            Some(Some(svc)) if !proc::pid_alive(svc.worker_pid) => {
                 // Worker died before publishing — reap any survivors, surface
                 // the reason inline (the entry is removed below, so we can't
                 // send the user to `ft logs` afterwards), then fail fast.
                 proc::shutdown_process_group(worker_pid).await;
                 let reason = last_reason(&state, &name);
-                let _ = Registry::update(&state, |reg| {
+                if let Err(cleanup_err) = Registry::update(&state, |reg| {
                     reg.remove(id);
-                });
+                }) {
+                    tracing::warn!(%cleanup_err, id, "failed to clean up registry entry after worker death");
+                }
                 bail!("worker for '{name}' exited before the tunnel came up{reason}");
             }
-            None => {
+            Some(None) => {
                 // Our entry vanished — a concurrent `ft kill` removed it, or the
                 // worker self-removed on its own failure. Tear the worker down
                 // and bail now instead of polling the full 30s with a live,
                 // orphaned worker that nothing in the registry points at.
                 proc::shutdown_process_group(worker_pid).await;
                 let reason = last_reason(&state, &name);
-                let _ = Registry::update(&state, |reg| {
+                if let Err(cleanup_err) = Registry::update(&state, |reg| {
                     reg.remove(id);
-                });
+                }) {
+                    tracing::warn!(%cleanup_err, id, "failed to clean up registry entry after worker death");
+                }
                 bail!("worker for '{name}' exited before the tunnel came up{reason}");
             }
+            // Some(Some(svc)) still starting, or None (unchanged registry): poll again.
             _ => {}
         }
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -294,9 +337,11 @@ async fn run_background_impl(dir: &Path, name: Option<String>, port: Option<u16>
     // Timed out: the worker + cloudflared may still be alive and the entry is
     // still active, so tear them down like the fail-fast path before bailing.
     proc::shutdown_process_group(worker_pid).await;
-    let _ = Registry::update(&state, |reg| {
+    if let Err(cleanup_err) = Registry::update(&state, |reg| {
         reg.remove(id);
-    });
+    }) {
+        tracing::warn!(%cleanup_err, id, "failed to clean up registry entry after URL timeout");
+    }
     let reason = last_reason(&state, &name);
     bail!("timed out waiting for the tunnel URL{reason}")
 }
@@ -361,9 +406,14 @@ struct EntryGuard {
 
 impl Drop for EntryGuard {
     fn drop(&mut self) {
-        let _ = Registry::update(&self.state, |reg| {
+        if let Err(e) = Registry::update(&self.state, |reg| {
             reg.remove(self.id);
-        });
+        }) {
+            // Runs on every foreground exit path including panics, so a failed
+            // cleanup must be visible (the entry would otherwise leak silently
+            // until a later `ft prune`). tracing is sync-safe inside Drop.
+            tracing::warn!(%e, id = self.id, "failed to clean up foreground registry entry on drop");
+        }
     }
 }
 
@@ -426,7 +476,6 @@ async fn run_foreground(dir: &Path, name: Option<String>, port: Option<u16>) -> 
         reg.services.push(Service {
             id,
             name: name.clone(),
-            kind: ServiceKind::Static,
             dir: dir.to_path_buf(),
             port,
             local_url: format!("http://127.0.0.1:{port}"),
@@ -664,9 +713,12 @@ async fn drain_and_announce<R>(
 
 #[cfg(test)]
 mod tests {
-    use super::is_sensitive_dir;
+    use super::{EntryGuard, is_sensitive_dir};
+    use crate::model::{Registry, Service};
+    use crate::state::StateDir;
     #[cfg(unix)]
     use std::path::Path;
+    use std::path::PathBuf;
 
     #[test]
     fn sensitive_home_and_its_ancestor() {
@@ -700,5 +752,88 @@ mod tests {
     fn normal_dir_not_sensitive() {
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(!is_sensitive_dir(dir.path()));
+    }
+
+    /// Build a `StateDir` rooted at a temp dir, ready for registry operations.
+    fn fresh_state() -> (tempfile::TempDir, StateDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::new_at(tmp.path().join("ft-state"));
+        state.ensure().expect("ensure state dir");
+        Registry::default()
+            .save(&state)
+            .expect("seed empty registry");
+        (tmp, state)
+    }
+
+    fn seed_entry(state: &StateDir, id: u64) {
+        Registry::update(state, |reg| {
+            reg.services.push(Service {
+                id,
+                name: format!("svc-{id}"),
+                dir: PathBuf::from("/tmp"),
+                port: 8000,
+                local_url: "http://127.0.0.1:8000".to_string(),
+                public_url: None,
+                worker_pid: 0,
+                tunnel_pid: None,
+                created_at: crate::model::now_utc(),
+                state_dir: PathBuf::from("/tmp"),
+                foreground: true,
+            });
+        })
+        .expect("seed entry");
+    }
+
+    fn entry_present(state: &StateDir, id: u64) -> bool {
+        Registry::load(state)
+            .map(|reg| reg.find(&id.to_string()).is_some())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn entry_guard_removes_entry_on_drop() {
+        let (_tmp, state) = fresh_state();
+        let id = 42;
+        seed_entry(&state, id);
+        assert!(entry_present(&state, id), "entry should exist before drop");
+
+        {
+            let _entry = EntryGuard {
+                state: state.clone(),
+                id,
+            };
+            // Guard dropped at end of this block.
+        }
+
+        assert!(
+            !entry_present(&state, id),
+            "EntryGuard must remove the registry entry on drop"
+        );
+    }
+
+    #[test]
+    fn entry_guard_removes_entry_on_panic() {
+        // The documented panic guarantee: EntryGuard's Drop must fire even when
+        // the owning scope unwinds. catch_unwind lets us trigger and observe
+        // that without aborting the test process. EntryGuard owns only a
+        // StateDir (PathBuf) and a u64, both UnwindSafe.
+        let (_tmp, state) = fresh_state();
+        let id = 7;
+        seed_entry(&state, id);
+
+        let guard_state = state.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _entry = EntryGuard {
+                state: guard_state,
+                id,
+            };
+            panic!("simulated failure between reserve and explicit removal");
+        }));
+        assert!(result.is_err(), "the closure should have panicked");
+
+        assert!(
+            !entry_present(&state, id),
+            "EntryGuard must remove the registry entry even on panic"
+        );
     }
 }

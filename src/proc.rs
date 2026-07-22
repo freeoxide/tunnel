@@ -68,17 +68,22 @@ pub fn process_exists(pid: u32) -> bool {
 #[allow(clippy::question_mark)] // these fns return bool, so `?` is not applicable
 mod windows_proc {
     //! Windows process primitives backed by `windows-sys`.
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_TIMEOUT};
     use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
-        QueryFullProcessImageNameW, TerminateProcess,
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
     };
 
     /// Rights we need on a target process: enough to query its image name /
-    /// exit code AND to terminate it.
-    const ACCESS: u32 = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE;
+    /// exit code, to wait on it (for liveness), AND to terminate it.
+    const ACCESS: u32 = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE;
 
     /// A process exit code meaning "still running" (Win32 `STILL_ACTIVE`).
+    /// Kept only for documentation — we no longer use it to decide liveness,
+    /// because a process that legitimately exits with code 259 would be
+    /// misreported as alive forever (WIN-1). Liveness is decided by
+    /// `WaitForSingleObject` instead.
+    #[allow(dead_code)]
     const STILL_ACTIVE: u32 = 259;
 
     /// Open `pid` for query+terminate, returning a handle the caller must
@@ -93,14 +98,19 @@ mod windows_proc {
     }
 
     pub fn process_exists(pid: u32) -> bool {
+        // Liveness via a non-blocking wait (WIN-1). `GetExitCodeProcess`
+        // returning 259 (STILL_ACTIVE) is a SENTINEL, not a guarantee: a
+        // process that really exits with code 259 keeps that code forever and
+        // would read as alive indefinitely. `WaitForSingleObject(h, 0)` returns
+        // WAIT_TIMEOUT while the process is running and WAIT_OBJECT_0 once it
+        // has exited, with no 259 ambiguity.
         unsafe {
             let Some(h) = open(pid) else {
                 return false;
             };
-            let mut code: u32 = 0;
-            let ok = GetExitCodeProcess(h, &mut code);
+            let r = WaitForSingleObject(h, 0);
             let _ = CloseHandle(h);
-            ok != 0 && code == STILL_ACTIVE
+            r == WAIT_TIMEOUT
         }
     }
 
@@ -128,7 +138,20 @@ mod windows_proc {
         let want = match needle {
             "run-worker" | "--foreground" => "ft.exe",
             "cloudflared" => "cloudflared.exe",
-            _ => return process_exists(pid),
+            // An unrecognized needle would previously degrade to a plain
+            // liveness probe (WIN-5), silently inheriting whatever
+            // process_exists does. Refuse instead, so a mis-typed needle
+            // surfaces during development rather than gating on the wrong
+            // signal. In debug builds this asserts; in release it returns
+            // false (never signals an unknown identity).
+            _ => {
+                debug_assert!(
+                    false,
+                    "pid_matches: unknown needle {:?}; refusing to gate on unknown identity",
+                    needle
+                );
+                return false;
+            }
         };
         image_path(pid).map(|p| p.ends_with(want)).unwrap_or(false)
     }
@@ -258,6 +281,21 @@ pub async fn shutdown_process_group(pgid: u32) {
     if pgid == 0 {
         return;
     }
+    // Identity gate (CR-1): mirror the Windows shutdown_process_group, which
+    // only terminates after `pid_matches(pgid, "run-worker")` confirms the
+    // process group leader is still one of our workers. The pgid is the worker
+    // pid; if the worker died and the kernel recycled that pid into an
+    // unrelated process group, kill(-pgid) would signal the wrong group. The
+    // group leader's identity is a strong proxy for "this is still our worker
+    // tree": a recycled leader will not have `run-worker` in its cmdline, so we
+    // refuse to signal it.
+    if !pid_matches(pgid, "run-worker") {
+        tracing::debug!(
+            "shutdown_process_group: pgid {} no longer matches run-worker; refusing to signal (recycled-pid guard)",
+            pgid
+        );
+        return;
+    }
     let raw = -(pgid as i32);
     let _ = kill(Pid::from_raw(raw), Signal::SIGTERM);
     // Poll group liveness (kill -pgid with signal 0 returns ESRCH once no
@@ -313,17 +351,21 @@ fn cmdline_contains(pid: u32, needle: &str) -> bool {
     })
 }
 
+/// Upper bound on the KERN_PROCARGS2 allocation. A blob this large is not one
+/// of our own processes; capping avoids a multi-MB allocation per probe if a
+/// probed process has a pathologically huge argv/env block (EH-2).
+#[cfg(target_os = "macos")]
+const MAX_PROCARGS_BYTES: usize = 1024 * 1024;
+
 /// Read another process's command line on macOS via `sysctl(KERN_PROCARGS2)`
-/// and report whether the blob contains `needle`.
+/// and report whether any *argv* entry contains `needle`.
 ///
-/// `KERN_PROCARGS2` returns `[argc: u32][exec path\0][padding][argv\0...]
-/// [envv\0...]`. Precise argv stepping past the variable padding is fiddly and
-/// error-prone, so we substring-search the whole blob after the argc word. For
-/// our needles (`run-worker`, `cloudflared`) a collision with a foreign
-/// process's *environment* would require a contrived match and is negligible —
-/// and this is strictly stronger than the prior signal-0-only fallback, which
-/// ignored the needle entirely. Works for same-uid processes without root,
-/// which is all we ever probe (our workers/cloudflared run as the same user).
+/// `KERN_PROCARGS2` layout is `[argc:u32][execpath\0][NUL padding][argv\0...]
+/// [envv\0...]`. We parse it into proper argv boundaries and search ONLY the
+/// argv region — never the environment — so the needle cannot collide with a
+/// foreign process's env vars (CR-2). Works for same-uid processes without
+/// root, which is all we ever probe (our workers/cloudflared run as the same
+/// user).
 #[cfg(target_os = "macos")]
 fn cmdline_contains(pid: u32, needle: &str) -> bool {
     let mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
@@ -342,6 +384,11 @@ fn cmdline_contains(pid: u32, needle: &str) -> bool {
     if rc != 0 || size == 0 {
         return false;
     }
+    // Cap the allocation (EH-2): a blob larger than 1 MiB cannot be one of our
+    // own worker/cloudflared processes, so refuse rather than over-allocate.
+    if size > MAX_PROCARGS_BYTES {
+        return false;
+    }
     // Second call: fetch the blob.
     let mut buf = vec![0u8; size];
     let rc = unsafe {
@@ -357,10 +404,76 @@ fn cmdline_contains(pid: u32, needle: &str) -> bool {
     if rc != 0 {
         return false;
     }
-    // Skip the leading argc word, then byte-substring-search the remainder.
-    // Needles are ASCII, so a byte-window comparison is correct.
-    let blob = if buf.len() > 4 { &buf[4..] } else { &buf[..] };
-    blob.windows(needle.len()).any(|w| w == needle.as_bytes())
+    argv_contains(&buf, needle)
+}
+
+/// Parse a `KERN_PROCARGS2` blob and report whether any argv entry contains
+/// `needle`. Extracted as a pure helper so it can be unit-tested without a
+/// real process.
+///
+/// Layout: `[argc:u32 LE][execpath\0][NUL padding][argv[0]\0 ... argv[argc-1]\0]
+/// [envv\0...]`. `argc` counts argv entries INCLUDING argv[0] (the exec path).
+/// We: read argc, skip the execpath string, skip trailing NUL padding, then
+/// walk exactly `argc` NUL-terminated entries. Anything past that is envv and
+/// is never searched.
+#[cfg(target_os = "macos")]
+fn argv_contains(blob: &[u8], needle: &str) -> bool {
+    // Leading 4-byte little-endian argc.
+    if blob.len() < 4 {
+        return false;
+    }
+    let argc = u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]) as usize;
+    if argc == 0 {
+        return false;
+    }
+    let mut pos = 4;
+
+    // Skip the exec path: the first NUL-terminated string after the argc word.
+    let Some(exec_end) = blob[pos..].iter().position(|&b| b == 0) else {
+        return false;
+    };
+    pos += exec_end + 1;
+
+    // Skip alignment padding: a run of NUL bytes between execpath and argv[0].
+    // The real argv entries are non-empty (at least the exec path), so any NUL
+    // here is padding.
+    while pos < blob.len() && blob[pos] == 0 {
+        pos += 1;
+    }
+
+    // Walk exactly `argc` NUL-terminated argv entries. Searching argv only (not
+    // envv) is the whole point — see CR-2.
+    let needle_bytes = needle.as_bytes();
+    for _ in 0..argc {
+        if pos >= blob.len() {
+            // Truncated blob: fewer entries than argc promised. We have already
+            // searched every argv entry that was present, so it is safe to stop.
+            return false;
+        }
+        let entry_end = blob[pos..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|e| pos + e)
+            .unwrap_or(blob.len());
+        if memmem(&blob[pos..entry_end], needle_bytes) {
+            return true;
+        }
+        if entry_end >= blob.len() {
+            return false;
+        }
+        pos = entry_end + 1;
+    }
+    false
+}
+
+/// Plain byte substring search (no allocation). `haystack` contains the entry,
+/// `needle` is ASCII.
+#[cfg(target_os = "macos")]
+fn memmem(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// Generic-Unix fallback with no portable cmdline reader (e.g. FreeBSD). Unused
@@ -400,5 +513,84 @@ mod tests {
         // The exec path is the first entry in the procargs blob, so the binary
         // name always appears.
         assert!(cmdline_contains(std::process::id(), needle));
+    }
+
+    /// CR-2 regression: the macOS argv parser must NOT match a needle that
+    /// appears only in the environment region of a KERN_PROCARGS2 blob.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_argv_contains_ignores_environment() {
+        // Build a synthetic blob: [argc=2][execpath\0][pad][argv[0]\0][argv[1]\0][envv\0...]
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&2u32.to_le_bytes()); // argc = 2
+        blob.extend_from_slice(b"/usr/local/bin/cloudflared\0"); // execpath
+        blob.push(0); // alignment padding NUL
+        blob.extend_from_slice(b"/usr/local/bin/cloudflared\0"); // argv[0]
+        blob.extend_from_slice(b"tunnel\0"); // argv[1]
+        // Environment: contains "run-worker" to prove the parser stops before it.
+        blob.extend_from_slice(b"FOO=run-worker\0");
+        blob.extend_from_slice(b"BAR=baz\0");
+
+        // A needle present in argv matches.
+        assert!(argv_contains(&blob, "tunnel"));
+        // A needle present ONLY in envv does NOT match.
+        assert!(!argv_contains(&blob, "run-worker"));
+        assert!(!argv_contains(&blob, "FOO"));
+    }
+
+    /// macOS argv parser matches the needle across an argv entry (substring).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_argv_contains_substring_in_argv() {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&1u32.to_le_bytes()); // argc = 1
+        blob.extend_from_slice(b"/ft\0"); // execpath
+        blob.extend_from_slice(b"ft run-worker --foreground\0"); // argv[0]
+        assert!(argv_contains(&blob, "run-worker"));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    //! Exercises the Windows FFI (TC-3): OpenProcess/WaitForSingleObject-based
+    //! liveness, the image-name identity check, and the Job Object
+    //! KILL_ON_JOB_CLOSE contract. These run on the windows-latest CI matrix.
+
+    use super::*;
+
+    #[test]
+    fn process_exists_for_self() {
+        assert!(process_exists(std::process::id()));
+    }
+
+    #[test]
+    fn process_exists_false_for_dead_pid() {
+        assert!(!process_exists(4_000_000));
+    }
+
+    /// The current process is the test binary; its image name ends in whatever
+    /// cargo built (e.g. `.exe`), so the unknown-needle arm's refusal is the
+    /// stable, assertion-free claim we can make without assuming the binary
+    /// name. We assert that a known needle is at least callable without panic
+    /// and that an unknown needle refuses (WIN-5).
+    #[test]
+    fn pid_matches_unknown_needle_refuses() {
+        // Unknown needles must NOT degrade to a plain liveness probe; they
+        // return false (refuse to gate on an unknown identity).
+        assert!(!pid_matches(std::process::id(), "totally-bogus-needle"));
+    }
+
+    /// KILL_ON_JOB_CLOSE contract (TC-3): creating a kill-on-close job and
+    /// dropping its guard must not crash and must close the underlying handle.
+    /// We cannot easily prove the whole-tree kill in-process (it would kill
+    /// this test process), so we verify setup succeeds and the guard drops
+    /// cleanly — the untested failure mode (null-handle deref in Drop) is
+    /// covered because create_kill_on_close_job returns Some only when the
+    /// handle is valid.
+    #[test]
+    fn create_kill_on_close_job_succeeds_and_drops() {
+        let guard = create_kill_on_close_job();
+        assert!(guard.is_some(), "kill-on-close job creation failed");
+        drop(guard); // must not panic / double-close
     }
 }

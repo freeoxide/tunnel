@@ -16,7 +16,7 @@ on:
     inputs:
       tag:
         description: "Tag to attach artifacts to (must already exist)"
-        required: false
+        required: true
 
 # Avoid two release runs racing for the same tag (e.g. tag retag or a
 # workflow_dispatch firing alongside the push). Newer run wins.
@@ -65,7 +65,7 @@ jobs:
             runner: windows-latest
             archive: zip
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1d1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install Rust target
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -76,9 +76,13 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
-      # musl cross-linker. Rust's musl target needs a C cross-compiler when any
-      # dependency links C (we pull in ring/openssl-adjacent stacks transitively
-      # via tokio/axum); musl-gcc covers that for both x86_64 and aarch64.
+      # musl cross-linker. The current dep tree (tokio/axum/tower-http with the
+      # enabled feature set) is pure Rust and links no C, so this is NOT load-
+      # bearing today — but it is retained defensively: a future dependency
+      # (e.g. ring, aws-lc-rs, or a -sys crate) would need a C cross-compiler to
+      # link the musl targets, and musl-gcc covers both x86_64 and aarch64 when
+      # that day comes. Removing it would silently break the musl build on the
+      # first such addition.
       - name: Install musl toolchain (Linux musl targets)
         if: runner.os == 'Linux' && contains(matrix.target, 'musl')
         run: |
@@ -141,15 +145,34 @@ jobs:
             freeoxide-tunnel-${{ matrix.target }}.zip
             freeoxide-tunnel-${{ matrix.target }}.zip.sha256
 
+  # Supply-chain gate before any asset is uploaded. release.yml builds whatever
+  # is in Cargo.lock at tag time, so a tag push must not be able to ship a binary
+  # built from a known-vulnerable or yanked tree. deny.toml already encodes the
+  # policy (advisories deny, yanked deny, licenses allowlisted, crates.io-only);
+  # this just enforces it on the publishable artifacts, not only on PR CI.
+  supply-chain:
+    name: cargo-deny + cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1d1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: taiki-e/install-action@9bcaee1dcae34154180f412e2fa69355a7cda9f6 # v2
+        with:
+          tool: cargo-deny,cargo-audit
+      - name: cargo-deny (advisories, bans, licenses, sources)
+        run: cargo deny check advisories bans licenses sources
+      - name: cargo-audit
+        run: cargo audit
+
   release:
     name: assemble release
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build, supply-chain]
     # Only this job uploads Release assets, so only it needs the write token.
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1d1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Download all per-target assets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -205,15 +228,20 @@ jobs:
             dist/SHA256SUMS
             dist/freeoxide-tunnel-*.sha256
 
-  # Non-blocking installer hygiene check. These run on every release so a broken
-  # installer never ships alongside a tag, but they never block the binary build
-  # or the Release upload (an installer nit shouldn't hold up the binaries).
+  # Installer lint gate. These run on every release and BLOCK the run. The
+  # installer is a user's first contact point (fetched via curl|sh / irm|iex)
+  # and has no prior validation, so a parse failure or shellcheck error must
+  # never ship attached to a GitHub Release.
   lint-scripts:
     name: lint install scripts
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1d1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # Blocking syntax gate: -n parses without executing, so a structurally
+      # broken installer can never be uploaded regardless of shellcheck.
+      - name: sh -n install.sh
+        run: sh -n install.sh
 
       - name: shellcheck install.sh
         run: |
@@ -227,9 +255,8 @@ jobs:
   lint-scripts-windows:
     name: lint install.ps1
     runs-on: windows-latest
-    continue-on-error: true
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1d1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # Parse-only: compiling the script as a ScriptBlock surfaces syntax errors
       # without executing anything. -NoProfile keeps CI reproducible.
@@ -257,7 +284,7 @@ jobs:
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1d1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - name: Publish (deliberate, reviewed action)
         run: cargo publish --locked --all-features

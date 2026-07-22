@@ -79,8 +79,13 @@ pub async fn run(target: String) -> Result<()> {
             if worker_ours {
                 proc::terminate_foreground(service.worker_pid);
             }
-            if tunnel_ours {
-                proc::terminate_orphan(service.tunnel_pid.unwrap());
+            // Make the data-flow invariant local and explicit: tunnel_ours can
+            // only be true when tunnel_pid is Some, but bind the pid directly so
+            // a future change to how tunnel_ours is computed can't panic here.
+            if let Some(p) = service.tunnel_pid
+                && tunnel_ours
+            {
+                proc::terminate_orphan(p);
             }
             if worker_ours {
                 output::print_stopped(&service.name);
@@ -131,14 +136,12 @@ pub async fn run(target: String) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ServiceKind;
     use std::path::PathBuf;
 
     fn svc(foreground: bool) -> Service {
         Service {
             id: 1,
             name: "x".to_string(),
-            kind: ServiceKind::Static,
             dir: PathBuf::from("/tmp"),
             port: 1,
             local_url: "http://127.0.0.1:1".to_string(),

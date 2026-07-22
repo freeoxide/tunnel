@@ -54,6 +54,22 @@ fn sync_parent_dir(path: &std::path::Path) {
     }
 }
 
+/// Best-effort re-seal of an existing file to owner-only (0600) on Unix, mirroring
+/// the directory re-seal in `StateDir::ensure`. No-op on Windows (file privacy
+/// comes from the profile-dir ACL). Used by `load`/`load_backup` so a registry
+/// created by an older build or hand-edited under a loose umask is healed on read.
+fn seal_private_file(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
 impl Registry {
     /// Load the registry, returning an empty one if it does not yet exist.
     ///
@@ -71,7 +87,13 @@ impl Registry {
         if let Some(bytes) = std::fs::read(&path).ok()
             && !bytes.iter().all(u8::is_ascii_whitespace)
         {
-            return match Registry::parse(&bytes) {
+            let parsed = Registry::parse(&bytes);
+            // Whether or not it parsed, the live file exists and is readable:
+            // best-effort re-seal it to 0600 so a registry created by an older
+            // build (pre-0600) or hand-edited under a loose umask (0644) is
+            // healed on read, mirroring the directory re-seal in StateDir::ensure.
+            seal_private_file(&path);
+            return match parsed {
                 Ok(reg) => Ok(reg),
                 Err(e) => match Self::load_backup(state) {
                     Some(reg) => Ok(reg),
@@ -100,19 +122,27 @@ impl Registry {
         if bytes.iter().all(u8::is_ascii_whitespace) {
             return None;
         }
-        Registry::parse(&bytes).ok()
+        let parsed = Registry::parse(&bytes).ok()?;
+        // Heal perms on the backup too, so the same recovery point never stays
+        // world-readable after a one-time loose-umask write.
+        seal_private_file(&bak);
+        Some(parsed)
     }
 
     /// Atomically and durably persist the registry:
     ///
     /// 1. write a mode-0600 temp file and `fsync` it;
-    /// 2. best-effort copy the previous registry to `registry.json.bak`;
+    /// 2. best-effort promote the *previous* registry to `registry.json.bak` —
+    ///    but only if the on-disk bytes still parse+validate, so the backup is a
+    ///    known-good recovery point rather than a byte copy of tampered content;
     /// 3. atomically rename temp → `registry.json`;
     /// 4. `fsync` the parent directory so the rename survives power loss.
     pub fn save(&self, state: &StateDir) -> Result<()> {
         let path = state.registry_path();
         let tmp = path.with_extension("json.tmp");
-        let data = serde_json::to_vec_pretty(self).context("encoding registry")?;
+        // Compact encoding: registry.json is operator-readable via `ft detail`/`ft ls`,
+        // not by eye, so the 2-3x size/encode overhead of pretty-print is waste.
+        let data = serde_json::to_vec(self).context("encoding registry")?;
         {
             let mut opts = OpenOptions::new();
             opts.write(true).create(true).truncate(true);
@@ -126,8 +156,16 @@ impl Registry {
                 .with_context(|| format!("fsyncing registry temp file {}", tmp.display()))?;
         }
         // Recovery snapshot of the previous registry (copy, not rename, so the
-        // live file stays in place right up to the atomic replace below).
-        let _ = std::fs::copy(&path, path.with_extension("json.bak"));
+        // live file stays in place right up to the atomic replace below). Only
+        // promote it to `.bak` if it parses+validates: if a previous save or a
+        // hand-edit left semantically broken content on disk, keep the existing
+        // good backup instead of overwriting it with garbage.
+        if let Ok(prev) = std::fs::read(&path)
+            && !prev.iter().all(u8::is_ascii_whitespace)
+            && Registry::parse(&prev).is_ok()
+        {
+            let _ = std::fs::write(path.with_extension("json.bak"), prev);
+        }
         std::fs::rename(&tmp, &path)
             .with_context(|| format!("committing registry {}", path.display()))?;
         // Make the rename durable too.
@@ -223,14 +261,13 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
-    use crate::model::{Registry, Service, ServiceKind};
+    use crate::model::{Registry, Service};
     use std::path::PathBuf;
 
     fn dummy_service(id: u64, name: &str) -> Service {
         Service {
             id,
             name: name.to_string(),
-            kind: ServiceKind::Static,
             dir: PathBuf::from("/tmp/dir"),
             port: 1234,
             local_url: "http://127.0.0.1:1234".to_string(),
@@ -431,6 +468,104 @@ mod tests {
         assert_eq!(
             reg.next_id, 8,
             "next_id healed past the highest existing id"
+        );
+    }
+
+    // --- TC-8: save→load data-integrity round-trip + corrupt recovery ---------
+
+    /// Build a fully-populated Service with every field set to a non-default
+    /// value, so a round-trip can prove each one survives serde + the atomic
+    /// temp-write + .bak-copy + rename in `save`.
+    fn fully_populated_service() -> Service {
+        Service {
+            id: 42,
+            name: "blog".to_string(),
+            dir: PathBuf::from("/srv/blog"),
+            port: 8080,
+            local_url: "http://127.0.0.1:8080".to_string(),
+            public_url: Some("https://blog.trycloudflare.com".to_string()),
+            worker_pid: 4242,
+            tunnel_pid: Some(5353),
+            // Pinned instant (SystemTime epoch) so created_at is deterministic.
+            created_at: std::time::SystemTime::UNIX_EPOCH.into(),
+            state_dir: PathBuf::from("/srv/ft-state/services/blog"),
+            foreground: true,
+        }
+    }
+
+    #[test]
+    fn save_load_preserves_all_fields() {
+        // Exercises every serialization-relevant field of Service/Registry
+        // through save()'s full path (temp fsync + .bak promotion + rename +
+        // parent-dir fsync). A field made non-serializable by a refactor, or a
+        // .bak copy that interfered with the commit, would fail here.
+        use crate::state::StateDir;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::new_at(tmp.path().join("ft-state"));
+        state.ensure().expect("ensure");
+
+        let original = Registry {
+            next_id: 43,
+            services: vec![fully_populated_service()],
+        };
+        original.save(&state).expect("save");
+
+        let reloaded = Registry::load(&state).expect("load");
+        assert_eq!(
+            reloaded, original,
+            "registry must round-trip field-for-field"
+        );
+    }
+
+    #[test]
+    fn load_falls_back_to_backup_when_live_corrupt() {
+        // A corrupted (unparseable) live registry.json must fall back to a valid
+        // registry.json.bak — load() recovers rather than erroring the whole CLI.
+        use crate::state::StateDir;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::new_at(tmp.path().join("ft-state"));
+        state.ensure().expect("ensure");
+
+        // Seed a known-good registry, then snapshot it as the backup. next_id must
+        // be consistent with the service id (>= max+1) or validate() heals it on
+        // load, which would make this a test of healing, not of backup fallback.
+        let good = Registry {
+            next_id: 43,
+            services: vec![fully_populated_service()],
+        };
+        good.save(&state).expect("seed save");
+        let live = state.registry_path();
+        let bak = live.with_extension("json.bak");
+        std::fs::copy(&live, &bak).expect("seed backup");
+
+        // Corrupt the live file in place.
+        std::fs::write(&live, b"{ this is not json").expect("corrupt live");
+
+        let loaded = Registry::load(&state).expect("must recover from backup");
+        assert_eq!(loaded, good, "load must serve the backup's contents");
+    }
+
+    #[test]
+    fn load_returns_err_when_both_live_and_backup_corrupt() {
+        // When neither the live file nor the backup parses, load() must surface
+        // an error (not panic, and not silently yield a fresh empty registry —
+        // the corruption is real and the operator should be told).
+        use crate::state::StateDir;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::new_at(tmp.path().join("ft-state"));
+        state.ensure().expect("ensure");
+
+        let live = state.registry_path();
+        let bak = live.with_extension("json.bak");
+        // Both present but unparseable — not empty/whitespace, so load() treats
+        // them as "present and corrupt" rather than "missing".
+        std::fs::write(&live, b"@@garbage@@").expect("corrupt live");
+        std::fs::write(&bak, b"@@garbage@@").expect("corrupt backup");
+
+        let res = Registry::load(&state);
+        assert!(
+            res.is_err(),
+            "both-corrupt must error, not silently default"
         );
     }
 }

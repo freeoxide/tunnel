@@ -197,6 +197,44 @@ mod tests {
     }
 
     #[test]
+    fn keeps_path_and_query_in_returned_url() {
+        // The host is what confine/is_tunnel_url validate, but extract_url must
+        // return the full URL (path + query intact), not a trimmed host-only
+        // value, since `ft open` hands it verbatim to the browser.
+        let line = "your tunnel: https://x.trycloudflare.com/foo?bar=1";
+        assert_eq!(
+            extract_url(line),
+            Some("https://x.trycloudflare.com/foo?bar=1".to_string())
+        );
+    }
+
+    #[test]
+    fn uppercase_https_is_rejected() {
+        // Documents the case-sensitivity of the `https://` scan: cloudflared
+        // always emits lowercase, so an uppercase `HTTPS://` is deliberately
+        // not recognized (avoids accidentally matching prose like "HTTPS://").
+        assert_eq!(extract_url("HTTPS://x.trycloudflare.com"), None);
+    }
+
+    #[test]
+    fn empty_input_returns_none() {
+        // Guards the `?` early-return on a whitespace split of empty input.
+        assert_eq!(extract_url(""), None);
+    }
+
+    #[test]
+    fn picks_tunnel_when_non_tunnel_url_comes_after() {
+        // Complements `picks_trycloudflare_among_two_urls` (tunnel first) by
+        // exercising the same scan with the non-tunnel URL *after* the tunnel
+        // URL — the loop must not get distracted by the trailing candidate.
+        let line = "tunnel: https://real-tunnel.trycloudflare.com  docs: https://developers.cloudflare.com/";
+        assert_eq!(
+            extract_url(line),
+            Some("https://real-tunnel.trycloudflare.com".to_string())
+        );
+    }
+
+    #[test]
     fn is_tunnel_url_accepts_valid() {
         assert!(is_tunnel_url("https://foo-bar.trycloudflare.com"));
         assert!(is_tunnel_url(
@@ -221,7 +259,8 @@ mod tests {
 
     proptest! {
         /// Anything extract_url returns is always a well-formed Quick Tunnel URL:
-        /// `https://` + a host ending in `.trycloudflare.com`.
+        /// `https://` + a host ending in `.trycloudflare.com`, and it round-trips
+        /// through `is_tunnel_url`.
         #[test]
         fn extract_url_only_yields_tunnel_urls(
             prefix in "[a-zA-Z0-9 .,|:!?/<>\"'-]{0,40}",
@@ -233,7 +272,26 @@ mod tests {
                 let rest = url.strip_prefix("https://").unwrap_or("");
                 let host = rest.split(['/', '?']).next().unwrap_or("");
                 prop_assert!(!host.is_empty() && host.ends_with(".trycloudflare.com"), "bad url: {url}");
+                // The returned URL must re-validate through is_tunnel_url, so a
+                // stored public_url always round-trips through both checks.
+                prop_assert!(is_tunnel_url(&url), "returned url failed is_tunnel_url: {url}");
             }
+        }
+
+        /// With a non-tunnel `https://host` placed AFTER the tunnel URL, the
+        /// tunnel URL is still the one returned (exercises the scan-past loop
+        /// from the right side).
+        #[test]
+        fn picks_tunnel_when_non_tunnel_follows(
+            prefix in "[a-zA-Z0-9 .,|:!?/<>\"'-]{0,20}",
+            slug in "[a-z0-9-]{1,30}",
+        ) {
+            let line = format!(
+                "{prefix}https://{slug}.trycloudflare.com see https://developers.cloudflare.com/"
+            );
+            let expected = format!("https://{slug}.trycloudflare.com");
+            let got = extract_url(&line);
+            prop_assert_eq!(got.as_deref(), Some(expected.as_str()));
         }
     }
 }

@@ -95,6 +95,10 @@ async fn follow_logs(tunnel_path: &PathBuf, worker_path: &PathBuf) -> Result<()>
     // that by opening each file best-effort and skipping any that are absent.
     let mut tunnel = open_at_end(tunnel_path).await?;
     let mut worker = open_at_end(worker_path).await?;
+    // Per-file leftover buffers carried across reads so a line or multi-byte
+    // UTF-8 code point that straddles a read boundary is never split.
+    let mut tunnel_leftover = Vec::new();
+    let mut worker_leftover = Vec::new();
 
     loop {
         tokio::select! {
@@ -104,10 +108,10 @@ async fn follow_logs(tunnel_path: &PathBuf, worker_path: &PathBuf) -> Result<()>
         }
 
         if let Some(f) = tunnel.as_mut() {
-            drain_appended(f).await;
+            drain_appended(f, &mut tunnel_leftover).await;
         }
         if let Some(f) = worker.as_mut() {
-            drain_appended(f).await;
+            drain_appended(f, &mut worker_leftover).await;
         }
     }
     Ok(())
@@ -131,23 +135,73 @@ async fn open_at_end(path: &PathBuf) -> Result<Option<tokio::fs::File>> {
 ///
 /// Reads at most `READ_CAP` bytes per poll so a runaway writer cannot exhaust
 /// memory between polls; any backlog is picked up on subsequent iterations.
-async fn drain_appended(file: &mut tokio::fs::File) {
+///
+/// Trailing bytes after the last newline are carried into `leftover` and
+/// prepended to the next read, so a multi-byte UTF-8 code point or a logical
+/// line that straddles a read boundary is never split (the prior version
+/// replaced an incomplete trailing sequence with U+FFFD and printed half-lines).
+async fn drain_appended(file: &mut tokio::fs::File, leftover: &mut Vec<u8>) {
     let mut buf = vec![0u8; READ_CAP as usize];
     loop {
-        match file.read(&mut buf).await {
-            Ok(0) => return,
-            Ok(n) => {
-                let text = String::from_utf8_lossy(&buf[..n]);
-                for line in text.lines() {
-                    println!("{line}");
-                }
-                if n < buf.len() {
-                    // Short read means we've caught up to EOF.
-                    return;
-                }
-                // Filled the buffer — more may be waiting; loop to drain it.
-            }
-            Err(_) => return,
+        // Read into the back of whatever partial bytes we carried over, so the
+        // carried prefix is contiguous with the newly-read bytes.
+        let read_start = leftover.len();
+        if read_start >= buf.len() {
+            // Pathological: a single line longer than READ_CAP with no newline.
+            // Flush it as-is rather than growing unbounded, then start fresh.
+            flush_text(leftover);
+            leftover.clear();
+            continue;
         }
+        let n = match file.read(&mut buf[read_start..]).await {
+            Ok(0) => return,
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        // Combine carried bytes + fresh bytes.
+        let chunk_end = read_start + n;
+        let combined: Vec<u8> = leftover
+            .iter()
+            .copied()
+            .chain(buf[read_start..chunk_end].iter().copied())
+            .collect();
+
+        // Print every whole line in the combined buffer; carry whatever comes
+        // after the last newline into the next iteration. If there is no newline
+        // at all, carry the whole thing (a partial line still being written).
+        match combined.iter().rposition(|&b| b == b'\n') {
+            Some(last_nl) => {
+                let (complete, rest) = combined.split_at(last_nl + 1);
+                flush_text(complete);
+                leftover.clear();
+                leftover.extend_from_slice(rest);
+            }
+            None => {
+                leftover.clear();
+                leftover.extend_from_slice(&combined);
+            }
+        }
+
+        if n < buf.len() - read_start {
+            // Short read means we've caught up to EOF.
+            return;
+        }
+        // Filled the read window — more may be waiting; loop to drain it.
+    }
+}
+
+/// Decode `bytes` as UTF-8 (lossily) and print each line.
+///
+/// Lines are split on `\n`; a trailing `\r` (CRLF) is trimmed per line. Because
+/// `bytes` always ends at a `\n` boundary (the caller carries partial tails),
+/// no multi-byte sequence is split across calls, so `from_utf8_lossy` cannot
+/// corrupt a trailing code point here.
+fn flush_text(bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    let text = String::from_utf8_lossy(bytes);
+    for line in text.lines() {
+        println!("{line}");
     }
 }

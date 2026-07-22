@@ -19,6 +19,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 use crate::cloudflared;
+use crate::cmd::start::{is_sensitive_dir, resolve_dir};
 use crate::error::Result;
 use crate::model::Registry;
 use crate::state::StateDir;
@@ -38,10 +39,12 @@ const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Run the worker to completion.
 pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
-    // Refuse direct invocation: `run-worker` is an internal command that
-    // bypasses the START flow's input validation and the sensitive-directory
-    // confirmation. It is only ever launched by `spawn::spawn_worker`, which
-    // sets `FT_WORKER_TOKEN`; reject anything without a non-empty value.
+    // Defense in depth against direct invocation: `run-worker` is an internal
+    // command only ever launched by `spawn::spawn_worker`, which sets
+    // `FT_WORKER_TOKEN`; reject anything without a non-empty value. This is a
+    // presence check only — the load-bearing safety checks (resolve_dir /
+    // is_sensitive_dir / port) are re-run below, inside this non-interactive
+    // worker, so neither direct invocation NOR any future caller can bypass them.
     if std::env::var_os("FT_WORKER_TOKEN")
         .map(|v| v.is_empty())
         .unwrap_or(true)
@@ -71,27 +74,53 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
         dir.display()
     );
 
+    // SEC-1 / ARCH-05 / CLI-1: re-run the START flow's directory safety checks
+    // here, inside the detached worker, *before* we bind a public tunnel to the
+    // directory. `FT_WORKER_TOKEN` above is only a presence check (defense in
+    // depth against direct `run-worker` invocation); it does not by itself
+    // enforce anything. A worker is non-interactive, so a sensitive directory
+    // is refused UNCONDITIONALLY — `--yes` cannot apply, and there is no way to
+    // confirm. This closes the foot-gun where `FT_WORKER_TOKEN=x ft run-worker
+    // --dir /etc` would publish `/etc` with zero confirmation. We also reject
+    // port 0 (a no-op listener / kernel-assigned port would mismatch the one
+    // the parent reserved and advertised).
+    let dir = match resolve_dir(&dir) {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = Registry::update(&state, |reg| {
+                reg.remove(id);
+            });
+            return Err(e);
+        }
+    };
+    if is_sensitive_dir(&dir) {
+        let _ = Registry::update(&state, |reg| {
+            reg.remove(id);
+        });
+        anyhow::bail!(
+            "refusing to publish sensitive directory {} from a detached worker",
+            dir.display()
+        );
+    }
+    if port == 0 {
+        let _ = Registry::update(&state, |reg| {
+            reg.remove(id);
+        });
+        anyhow::bail!("port 0 is reserved; the worker needs an explicit port");
+    }
+
+    // Recover our registry entry (parent race). The parent reserves the entry
+    // before spawning us, but there is a window before the atomic save lands.
+    // Look up by id, not name: if a stale worker is still draining while the
+    // parent reuses this name for a new service, a name lookup would bind us to
+    // the wrong entry. The id is unique and stable.
     // Recover our registry entry (parent race). The parent reserves the entry
     // before spawning us, but there is a window before the atomic save lands.
     // Look up by id, not name: if a stale worker is still draining while the
     // parent reuses this name for a new service, a name lookup would bind us to
     // the wrong entry. The id is unique and stable.
     let deadline = std::time::Instant::now() + REGISTRY_LOOKUP_TIMEOUT;
-    let mut found_entry = false;
-    while std::time::Instant::now() < deadline {
-        // Read-only probe: the parent reserves our entry before spawning us, so
-        // we just wait for it to land. A plain `load` takes NO advisory lock and
-        // does NOT rewrite the registry — an earlier revision used
-        // `Registry::update` here, which contended with the parent's pid-record
-        // and every concurrent `ft` command by rewriting all of registry.json
-        // every 100ms.
-        if Registry::load(&state)?.find(&id.to_string()).is_some() {
-            found_entry = true;
-            break;
-        }
-        tokio::time::sleep(REGISTRY_LOOKUP_INTERVAL).await;
-    }
-    if !found_entry {
+    if !await_entry(&state, id, deadline).await? {
         // Dying worker mustn't leave a permanent stale entry; clear ours by id.
         let _ = Registry::update(&state, |reg| {
             reg.remove(id);
@@ -263,8 +292,16 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
         teardown_on_exit(exit_reason, tunnel_pid, &mut child).await;
     }
 
+    // Abort the reader tasks AND await them. Aborting alone only schedules
+    // cancellation at the next `.await`; if a reader is mid-way through the
+    // synchronous `publish_url` -> `Registry::update` (fs2 lock_exclusive wait)
+    // it keeps running until that call returns, so a late publish_url could
+    // race the registry entry being removed by teardown. Awaiting the handle
+    // guarantees the task is actually gone (and surfaces any panic) before we
+    // proceed to drain the server.
     for task in reader_tasks {
         task.abort();
+        let _ = task.await;
     }
 
     // Drain in-flight requests: fire the shutdown signal and let axum finish
@@ -289,10 +326,35 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
 }
 
 /// Why the keep-alive loop ended — drives cloudflared teardown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReaderExit {
     ChildExited,
     ServerEnded,
     Signal,
+}
+
+/// Pure decision: should teardown actively signal/reap cloudflared for this
+/// exit reason? On `ChildExited` the select's `wait()` already reaped the child,
+/// so there is nothing to do. On `Signal`/`ServerEnded` cloudflared may still be
+/// alive and must be torn down. Extracted so the branching is unit-testable
+/// without a real child process.
+fn teardown_should_signal(exit_reason: &ReaderExit) -> bool {
+    matches!(exit_reason, ReaderExit::Signal | ReaderExit::ServerEnded)
+}
+
+/// Poll the registry read-only until our entry (by id) appears, or `deadline`
+/// passes. Takes NO advisory lock and does NOT rewrite the registry — an earlier
+/// revision used `Registry::update` here, which contended with the parent's
+/// pid-record and every concurrent `ft` command by rewriting all of
+/// registry.json every 100ms. Returns `false` if the entry never landed.
+async fn await_entry(state: &StateDir, id: u64, deadline: std::time::Instant) -> Result<bool> {
+    while std::time::Instant::now() < deadline {
+        if Registry::load(state)?.find(&id.to_string()).is_some() {
+            return Ok(true);
+        }
+        tokio::time::sleep(REGISTRY_LOOKUP_INTERVAL).await;
+    }
+    Ok(false)
 }
 
 /// If cloudflared may still be alive, shut it down and reap it to avoid a
@@ -306,7 +368,7 @@ async fn teardown_on_exit(
     tunnel_pid: Option<u32>,
     child: &mut tokio::process::Child,
 ) {
-    if !matches!(exit_reason, ReaderExit::Signal | ReaderExit::ServerEnded) {
+    if !teardown_should_signal(&exit_reason) {
         return;
     }
 
@@ -364,11 +426,18 @@ where
     loop {
         match lines.next_line().await {
             Ok(Some(line)) => {
+                // Coalesce the line + newline into one buffer and take the lock
+                // once for a single write_all. Append mode already makes each
+                // write_all atomic, so the per-line `flush().await` is dropped
+                // from the hot path (the OS flushes on close; tokio::fs also
+                // buffers). This cuts three awaits-under-lock down to one and
+                // removes the per-line fsync-flush that contended the two
+                // reader tasks (stdout + stderr).
+                let mut buf = line.as_bytes().to_vec();
+                buf.push(b'\n');
                 {
                     let mut f = ctx.log_writer.lock().await;
-                    let _ = f.write_all(line.as_bytes()).await;
-                    let _ = f.write_all(b"\n").await;
-                    let _ = f.flush().await;
+                    let _ = f.write_all(&buf).await;
                 }
 
                 if !ctx.url_found.load(Ordering::Acquire)
@@ -397,9 +466,9 @@ fn publish_url(ctx: &ReaderCtx, url: String) -> Result<()> {
     let id = ctx.id;
     let name = &ctx.name;
     let tunnel_pid = ctx.tunnel_pid;
-    Registry::update(&ctx.state, |reg| {
+    Registry::update(&ctx.state, move |reg| {
         if let Some(svc) = reg.find_mut(&id.to_string()) {
-            svc.public_url = Some(url.clone());
+            svc.public_url = Some(url);
             if svc.tunnel_pid.is_none() {
                 svc.tunnel_pid = tunnel_pid;
             }
@@ -421,13 +490,20 @@ fn init_tracing(worker_log: &Path, server_log: &Path) {
     // that sink rather than aborting tracing setup. Mode 0600 on Unix (server.log
     // can carry request URIs); plain create on Windows via the cross-platform
     // helper.
+    //
+    // PERF-3: gate the request layer at `info` (request span open/close) rather
+    // than `trace` (one event per proxied request body chunk). server.log is
+    // opened once in append mode and never rotated, so a `trace` filter would
+    // grow it without bound on a busy tunnel. `info` keeps the per-request span
+    // without the per-event flood; raise the level via `RUST_LOG=tower_http=trace`
+    // when debugging a specific request.
     let server_layer = crate::fsutil::open_private_append(server_log)
         .ok()
         .map(|f| {
             fmt::layer()
                 .with_writer(Mutex::new(f))
                 .with_ansi(false)
-                .with_filter(EnvFilter::new("tower_http=trace"))
+                .with_filter(EnvFilter::new("tower_http=info"))
         });
 
     let worker_layer = crate::fsutil::open_private_append(worker_log)
@@ -443,4 +519,188 @@ fn init_tracing(worker_log: &Path, server_log: &Path) {
         .with(server_layer)
         .with(worker_layer)
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Registry, Service};
+    use std::path::PathBuf;
+    use tempfile::tempdir;
+
+    /// A minimal service for seeding a registry. Mirrors `dummy_service` in
+    /// registry.rs.
+    fn seed_service(id: u64, name: &str) -> Service {
+        Service {
+            id,
+            name: name.to_string(),
+            dir: PathBuf::from("/tmp/dir"),
+            port: 1234,
+            local_url: "http://127.0.0.1:1234".to_string(),
+            public_url: None,
+            worker_pid: 0,
+            tunnel_pid: None,
+            created_at: crate::model::now_utc(),
+            state_dir: PathBuf::from("/tmp/state"),
+            foreground: false,
+        }
+    }
+
+    /// A throwaway reader context: `publish_url` only reads `id`, `name`,
+    /// `state`, and `tunnel_pid`, so `log_writer`/`url_found` are best-effort.
+    /// The log file is opened from a std handle (we never write to it in these
+    /// tests) so construction is synchronous and non-flaky.
+    async fn reader_ctx(state: StateDir, id: u64, tunnel_pid: Option<u32>) -> ReaderCtx {
+        // ensure_service_dir creates the parent of tunnel.log so the open below
+        // succeeds; publish_url never writes to it.
+        state
+            .ensure_service_dir("test-svc")
+            .expect("ensure service dir");
+        let log_path = state.tunnel_log("test-svc");
+        let log = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .await
+            .expect("open tunnel.log");
+        ReaderCtx {
+            id,
+            name: "svc".to_string(),
+            state,
+            tunnel_pid,
+            url_found: Arc::new(AtomicBool::new(false)),
+            log_writer: Arc::new(Mutex::new(log)),
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_url_records_url_and_pid_on_existing_entry() {
+        let tmp = tempdir().expect("state dir");
+        let state = StateDir::new_at(tmp.path().to_path_buf());
+        state.ensure().expect("ensure state dir");
+
+        // Seed an entry for id=7 with no public_url and no tunnel_pid.
+        Registry::update(&state, |reg| {
+            reg.services.push(seed_service(7, "svc"));
+        })
+        .expect("seed");
+
+        let ctx = reader_ctx(state.clone(), 7, Some(4242)).await;
+        publish_url(&ctx, "https://abc.trycloudflare.com".to_string())
+            .expect("publish_url succeeds");
+
+        let reg = Registry::load(&state).expect("load");
+        let svc = reg.find("7").expect("entry present");
+        assert_eq!(
+            svc.public_url.as_deref(),
+            Some("https://abc.trycloudflare.com")
+        );
+        assert_eq!(svc.tunnel_pid, Some(4242));
+    }
+
+    #[tokio::test]
+    async fn publish_url_does_not_clobber_existing_tunnel_pid() {
+        let tmp = tempdir().expect("state dir");
+        let state = StateDir::new_at(tmp.path().to_path_buf());
+        state.ensure().expect("ensure state dir");
+
+        // Pre-existing tunnel_pid must NOT be overwritten (race between two
+        // readers: only the first wins).
+        Registry::update(&state, |reg| {
+            let mut svc = seed_service(9, "svc");
+            svc.tunnel_pid = Some(1111);
+            reg.services.push(svc);
+        })
+        .expect("seed");
+
+        let ctx = reader_ctx(state.clone(), 9, Some(2222)).await;
+        publish_url(&ctx, "https://xyz.trycloudflare.com".to_string())
+            .expect("publish_url succeeds");
+
+        let reg = Registry::load(&state).expect("load");
+        let svc = reg.find("9").expect("entry present");
+        assert_eq!(svc.tunnel_pid, Some(1111)); // unchanged
+        assert_eq!(
+            svc.public_url.as_deref(),
+            Some("https://xyz.trycloudflare.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_url_is_a_noop_for_a_vanished_id() {
+        // A vanished id (e.g. parent already removed our entry) must NOT panic
+        // and must NOT create a stray entry — publish_url only mutates in the
+        // Some(svc) branch.
+        let tmp = tempdir().expect("state dir");
+        let state = StateDir::new_at(tmp.path().to_path_buf());
+        state.ensure().expect("ensure state dir");
+
+        let ctx = reader_ctx(state.clone(), 404, Some(99)).await;
+        publish_url(&ctx, "https://ghost.trycloudflare.com".to_string())
+            .expect("publish_url still succeeds (no error)");
+
+        let reg = Registry::load(&state).expect("load");
+        assert!(reg.find("404").is_none(), "no stray entry created");
+        assert!(reg.services.is_empty());
+    }
+
+    #[tokio::test]
+    async fn await_entry_returns_true_when_entry_present() {
+        let tmp = tempdir().expect("state dir");
+        let state = StateDir::new_at(tmp.path().to_path_buf());
+        state.ensure().expect("ensure state dir");
+
+        Registry::update(&state, |reg| {
+            reg.services.push(seed_service(5, "svc"));
+        })
+        .expect("seed");
+
+        let deadline = std::time::Instant::now() + REGISTRY_LOOKUP_TIMEOUT;
+        let found = await_entry(&state, 5, deadline).await.expect("no io error");
+        assert!(found);
+    }
+
+    #[tokio::test]
+    async fn await_entry_returns_false_on_timeout_when_absent() {
+        let tmp = tempdir().expect("state dir");
+        let state = StateDir::new_at(tmp.path().to_path_buf());
+        state.ensure().expect("ensure state dir");
+
+        // A deadline already in the past must return immediately with false
+        // (no busy-wait, no entry found).
+        let deadline = std::time::Instant::now();
+        let found = await_entry(&state, 5, deadline).await.expect("no io error");
+        assert!(!found);
+    }
+
+    #[tokio::test]
+    async fn await_entry_finds_by_id_not_name() {
+        // If a name is reused for a fresh service while a stale worker drains,
+        // the id lookup must bind to OUR entry, not a name collision.
+        let tmp = tempdir().expect("state dir");
+        let state = StateDir::new_at(tmp.path().to_path_buf());
+        state.ensure().expect("ensure state dir");
+
+        Registry::update(&state, |reg| {
+            reg.services.push(seed_service(11, "alpha"));
+        })
+        .expect("seed");
+
+        let deadline = std::time::Instant::now() + REGISTRY_LOOKUP_TIMEOUT;
+        // Looking up the right id finds it; a different id with the same name
+        // must NOT be found.
+        assert!(await_entry(&state, 11, deadline).await.expect("io"));
+        let past = std::time::Instant::now();
+        assert!(!await_entry(&state, 99, past).await.expect("io"));
+    }
+
+    #[test]
+    fn teardown_should_signal_only_on_signal_or_server_ended() {
+        // ChildExited: the select already reaped cloudflared, so teardown is a
+        // no-op.
+        assert!(!teardown_should_signal(&ReaderExit::ChildExited));
+        // Signal / ServerEnded: cloudflared may still be alive -> must signal.
+        assert!(teardown_should_signal(&ReaderExit::Signal));
+        assert!(teardown_should_signal(&ReaderExit::ServerEnded));
+    }
 }
