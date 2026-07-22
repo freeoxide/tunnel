@@ -147,8 +147,7 @@ mod windows_proc {
             _ => {
                 debug_assert!(
                     false,
-                    "pid_matches: unknown needle {:?}; refusing to gate on unknown identity",
-                    needle
+                    "pid_matches: unknown needle {needle:?}; refusing to gate on unknown identity"
                 );
                 return false;
             }
