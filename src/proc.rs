@@ -139,18 +139,12 @@ mod windows_proc {
             "run-worker" | "--foreground" => "ft.exe",
             "cloudflared" => "cloudflared.exe",
             // An unrecognized needle would previously degrade to a plain
-            // liveness probe (WIN-5), silently inheriting whatever
-            // process_exists does. Refuse instead, so a mis-typed needle
-            // surfaces during development rather than gating on the wrong
-            // signal. In debug builds this asserts; in release it returns
-            // false (never signals an unknown identity).
-            _ => {
-                debug_assert!(
-                    false,
-                    "pid_matches: unknown needle {needle:?}; refusing to gate on unknown identity"
-                );
-                return false;
-            }
+            // liveness probe (WIN-5). Refuse instead (return false) so a
+            // mis-typed needle never gates on the wrong identity. NOTE: no
+            // debug_assert!(false) here — it would panic under `cargo test`
+            // (debug_assertions are on in the dev profile), and the unit test
+            // in `windows_tests` exercises exactly this refusal path.
+            _ => return false,
         };
         image_path(pid).map(|p| p.ends_with(want)).unwrap_or(false)
     }

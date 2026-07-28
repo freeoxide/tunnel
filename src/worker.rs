@@ -666,9 +666,19 @@ mod tests {
         let state = StateDir::new_at(tmp.path().to_path_buf());
         state.ensure().expect("ensure state dir");
 
-        // A deadline already in the past must return immediately with false
-        // (no busy-wait, no entry found).
-        let deadline = std::time::Instant::now();
+        // Seed a *different* id so the loop actually loads the registry and
+        // searches — an empty registry would make "not found" trivially true
+        // without ever exercising the poll path.
+        Registry::update(&state, |reg| {
+            reg.services.push(seed_service(11, "alpha"));
+        })
+        .expect("seed");
+
+        // A deadline one poll-interval in the future: the loop runs its body
+        // once (load -> search -> sleep), finds id 5 absent, then times out
+        // and returns false. (A past deadline would skip the body entirely,
+        // making the test vacuous.)
+        let deadline = std::time::Instant::now() + REGISTRY_LOOKUP_INTERVAL;
         let found = await_entry(&state, 5, deadline).await.expect("no io error");
         assert!(!found);
     }

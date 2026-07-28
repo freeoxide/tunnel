@@ -162,7 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn background_with_orphan_cloudflared_is_returned_for_reap() {
+    fn background_with_foreign_tunnel_pid_is_not_reaped() {
         let mut reg = Registry::default();
         let mut s = dummy_service(1, "bg-orphan");
         s.worker_pid = live_self_pid(); // stale -> triggers orphan check
@@ -176,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn foreground_self_pid_is_alive_and_kept() {
+    fn foreground_self_pid_without_flag_is_stale() {
         // Our own process's cmdline contains `--foreground`? No — the test
         // binary's cmdline is `ft-<hash>` (deps), so it does NOT contain the
         // flag. That means pid_matches(self, "--foreground") is false here,
