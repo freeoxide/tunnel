@@ -1,0 +1,285 @@
+name: latest
+
+# Rolling "latest" build. On every push to `main` this rebuilds all release
+# targets and OVERRIDES the assets of the fixed `latest` GitHub Release, so a
+# fetch from /releases/download/latest/... always returns the newest `main`.
+#
+# Branch note: the repo's default branch is `main` (freeoxide/tunnel is not a
+# fork; no `master` branch exists), so this triggers on `main`. Versioned `v*`
+# releases are produced by release.yml and are untouched here.
+#
+# The release is a snapshot — prerelease + make_latest:false — so stable `v*`
+# releases keep the green "Latest" badge. The `latest` git tag is force-moved
+# to the triggering commit on every run (see the publish job), so both the tag
+# and the assets track HEAD rather than drifting to the first commit that
+# created the tag.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Only the newest push's build should win and become "latest". An older
+# in-flight run is cancelled when a newer push lands.
+concurrency:
+  group: latest-release
+  cancel-in-progress: true
+
+# Default (read-only) token for every job; the `publish` job escalates to
+# `contents: write` only where it moves the tag and uploads release assets.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Same MVP cross-compile matrix as release.yml. Asset names match the
+        # binstall metadata: freeoxide-tunnel-<target>.tgz on unix,
+        # freeoxide-tunnel-<target>.zip on windows, with ft / ft.exe at the
+        # archive root.
+        include:
+          # --- Linux / musl: static binaries, glibc-independent. ---
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            archive: tgz
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+            archive: tgz
+          # --- macOS: universal binaries via separate targets. arm64 builds
+          # natively on the Apple Silicon runner; x86_64 cross-compiles. ---
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            archive: tgz
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            archive: tgz
+          # --- Windows / MSVC: native and cross-arch via the x64/arm64
+          # MSVC toolchains on windows runners. ---
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+          - target: aarch64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust target
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Separate cache namespace from release.yml's `release-` key so a
+          # corrupted rolling-build cache can never affect a tagged release.
+          key: latest-${{ matrix.target }}
+
+      # musl cross-linker. The current dep tree (tokio/axum/tower-http with the
+      # enabled feature set) is pure Rust and links no C, so this is NOT load-
+      # bearing today — but it is retained defensively: a future dependency
+      # (e.g. ring, aws-lc-rs, or a -sys crate) would need a C cross-compiler
+      # to link the musl targets, and musl-gcc covers both x86_64 and aarch64
+      # when that day comes. Removing it would silently break the musl build.
+      - name: Install musl toolchain (Linux musl targets)
+        if: runner.os == 'Linux' && contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          # musl-tools only ships a 64-bit musl-gcc; for aarch64 we need the
+          # dedicated cross toolchain.
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            sudo apt-get install -y gcc-aarch64-linux-musl
+          fi
+
+      - name: Configure musl cross-linker
+        if: runner.os == 'Linux' && contains(matrix.target, 'musl')
+        run: |
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-musl)
+              echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+              echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" >> "$GITHUB_ENV"
+              ;;
+            aarch64-unknown-linux-musl)
+              echo "CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc" >> "$GITHUB_ENV"
+              echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc" >> "$GITHUB_ENV"
+              ;;
+          esac
+
+      - name: Build (release, locked, target)
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Package the binary ALONE at the archive root so installers can extract
+      # straight into ~/.local/bin or $InstallDir. No README, no Cargo.lock —
+      # exactly what the binstall metadata promises.
+      - name: Stage & archive (unix)
+        if: matrix.archive == 'tgz'
+        run: |
+          mkdir -p staging
+          cp "target/${{ matrix.target }}/release/ft" staging/ft
+          tar -czf "freeoxide-tunnel-${{ matrix.target }}.tgz" -C staging ft
+          sha256sum "freeoxide-tunnel-${{ matrix.target }}.tgz" \
+            | awk '{print $1}' > "freeoxide-tunnel-${{ matrix.target }}.tgz.sha256"
+
+      - name: Stage & archive (windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/ft.exe" "staging/ft.exe"
+          Compress-Archive -Path staging/ft.exe -DestinationPath "freeoxide-tunnel-${{ matrix.target }}.zip" -Force
+          $hash = (Get-FileHash "freeoxide-tunnel-${{ matrix.target }}.zip" -Algorithm SHA256).Hash.ToLower()
+          Set-Content -NoNewline -Path "freeoxide-tunnel-${{ matrix.target }}.zip.sha256" -Value $hash
+
+      - name: Upload archive + sidecar
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: asset-${{ matrix.target }}
+          if-no-files-found: error
+          # Both the archive and its .sha256 sidecar ride this artifact.
+          path: |
+            freeoxide-tunnel-${{ matrix.target }}.tgz
+            freeoxide-tunnel-${{ matrix.target }}.tgz.sha256
+            freeoxide-tunnel-${{ matrix.target }}.zip
+            freeoxide-tunnel-${{ matrix.target }}.zip.sha256
+
+  # Supply-chain gate before any asset is uploaded. Whatever is in Cargo.lock
+  # at push time must not ship as a downloadable "latest" binary if it is
+  # known-vulnerable or yanked. deny.toml encodes the policy (advisories deny,
+  # yanked deny, licenses allowlisted, crates.io-only); this enforces it on the
+  # publishable artifacts, not only on PR CI.
+  supply-chain:
+    name: cargo-deny + cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: taiki-e/install-action@9bcaee1dcae34154180f412e2fa69355a7cda9f6 # v2
+        with:
+          tool: cargo-deny,cargo-audit
+      - name: cargo-deny (advisories, bans, licenses, sources)
+        run: cargo deny check advisories bans licenses sources
+      - name: cargo-audit
+        run: cargo audit
+
+  # Installer lint gate — the same gate release.yml runs before a tagged
+  # release. install.sh / install.ps1 are a user's first contact point (fetched
+  # via curl|sh / irm|iex) and get no syntax check in ci.yml, so a parse failure
+  # or shellcheck error must never ship attached to the `latest` Release either.
+  # Blocks publish via the publish job's needs:.
+  lint-scripts:
+    name: lint install scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # Blocking syntax gate: -n parses without executing, so a structurally
+      # broken installer can never be uploaded regardless of shellcheck.
+      - name: sh -n install.sh
+        run: sh -n install.sh
+
+      - name: shellcheck install.sh
+        run: |
+          # shellcheck is in apt; fall back to taiki-e/install-action if the
+          # distro package is unavailable.
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y shellcheck
+          fi
+          shellcheck install.sh
+
+  lint-scripts-windows:
+    name: lint install.ps1
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # Parse-only: compiling the script as a ScriptBlock surfaces syntax errors
+      # without executing anything. -NoProfile keeps CI reproducible.
+      - name: Parse-check install.ps1
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $content = Get-Content -Raw -Path install.ps1
+          [void][ScriptBlock]::Create($content)
+          Write-Output "install.ps1 parses cleanly"
+
+  publish:
+    name: override latest release
+    runs-on: ubuntu-latest
+    needs: [build, supply-chain, lint-scripts, lint-scripts-windows]
+    # Only this job moves the tag and uploads Release assets, so only it needs
+    # the write token.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Download all per-target assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: asset-*
+          merge-multiple: true
+          path: dist
+
+      # install.sh / install.ps1 live at the repo root (committed by the
+      # installer slice); copy them into dist/ so the checksum assembly and
+      # the Release upload glob a single directory.
+      - name: Stage installers
+        run: |
+          cp install.sh dist/install.sh
+          cp install.ps1 dist/install.ps1
+
+      # Combined checksum file in the format install.sh / install.ps1 parse:
+      # one line per asset: "<hash>  <filename>" (two spaces, basename only).
+      # Rebuilt from the per-asset .sha256 sidecars so the list and the
+      # sidecars can never disagree.
+      - name: Assemble SHA256SUMS
+        working-directory: dist
+        run: |
+          : > SHA256SUMS
+          for sidecar in *.sha256; do
+            asset="${sidecar%.sha256}"
+            hash="$(cat "$sidecar" | awk '{print $1}')"
+            printf '%s  %s\n' "$hash" "$asset" >> SHA256SUMS
+          done
+          # Stable ordering independent of glob iteration order.
+          sort -k2 SHA256SUMS -o SHA256SUMS
+          echo "=== SHA256SUMS ==="
+          cat SHA256SUMS
+
+      - name: Verify SHA256SUMS against archives
+        working-directory: dist
+        run: sha256sum -c SHA256SUMS
+
+      # Attach to the rolling `latest` pre-release. softprops/action-gh-release
+      # resolves the release by tag_name and, on every push, refreshes its
+      # assets (same-named files are replaced — the "overwrite") on the single
+      # `latest` release. This is the flutter-starter `latest` pattern: tag_name
+      # latest, prerelease true, make_latest false. Stable v* releases keep the
+      # "Latest" badge; this snapshot lives at /releases/download/latest/...
+      - name: Overwrite latest release assets
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: latest
+          name: Latest build
+          body: |
+            Rolling build from `main`, rebuilt and overwritten on every push.
+            Commit: ${{ github.sha }}
+
+            This is **not** a stable release — for versioned releases see
+            https://github.com/freeoxide/tunnel/releases
+          prerelease: true
+          # String, not bool: "false" so stable v* releases keep "Latest".
+          make_latest: "false"
+          generate_release_notes: false
+          fail_on_unmatched_files: true
+          files: |
+            dist/freeoxide-tunnel-*.tgz
+            dist/freeoxide-tunnel-*.zip
+            dist/install.sh
+            dist/install.ps1
+            dist/SHA256SUMS
+            dist/freeoxide-tunnel-*.sha256
