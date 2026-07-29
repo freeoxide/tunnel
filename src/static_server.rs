@@ -97,6 +97,13 @@ pub fn router(dir: PathBuf) -> Router {
 /// longer `starts_with(root)` and is refused with 404. Non-existent paths also
 /// fail canonicalize and fall to 404 (ServeDir would 404 them too).
 ///
+/// All filesystem syscalls (`canonicalize`, `exists`, `is_dir`) are run inside
+/// [`tokio::task::spawn_blocking`]: `confine` is on the hot path proxied from
+/// the public internet, and those are blocking realpath/stat calls that would
+/// otherwise stall the tokio worker thread (the documented std::fs-in-async
+/// anti-pattern), serialising request handling and making a slow/NFS-backed
+/// served tree worse.
+///
 /// Note: there is a TOCTOU window between this canonicalise and ServeDir's own
 /// open. Closing it fully requires replacing ServeDir with a hand-written
 /// handler; for a dev tunneling tool the guard defeats the realistic threat
@@ -124,22 +131,40 @@ async fn confine(State(root): State<PathBuf>, request: Request, next: Next) -> R
     }
     // Symlink confinement: resolve the candidate for real and require it to
     // stay beneath the canonical root. Escaping symlinks resolve outside `root`
-    // and are refused; missing paths fail canonicalize and 404.
-    let resolved = match std::fs::canonicalize(&candidate) {
-        Ok(r) => r,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
-    };
-    if !resolved.starts_with(&root) {
+    // and are refused; missing paths fail canonicalize and 404. Run all of the
+    // blocking fs work (candidate canonicalize, is_dir, and the index.html
+    // confinement check) in one spawn_blocking so no realpath/stat touches the
+    // runtime worker thread.
+    let confined = tokio::task::spawn_blocking(move || confine_blocking(&candidate, &root))
+        .await
+        .unwrap_or(false);
+    if !confined {
         return StatusCode::NOT_FOUND.into_response();
+    }
+    next.run(request).await
+}
+
+/// Blocking half of [`confine`]: resolves `candidate`, requires it to stay
+/// under `root`, and — when it is a directory — confines the `index.html`
+/// ServeDir resolves on its own. Returns `true` if the request is safe to
+/// forward to ServeDir, `false` to 404. Designed to run inside
+/// `spawn_blocking`; performs the realpath/stat syscalls the guard needs.
+fn confine_blocking(candidate: &Path, root: &Path) -> bool {
+    let resolved = match std::fs::canonicalize(candidate) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    if !resolved.starts_with(root) {
+        return false;
     }
     // ServeDir serves `<dir>/index.html` for directory requests (its directory-
     // index feature), and that index.html may itself be a symlink escaping the
     // root — a vector confine must close, not just the directory itself. So when
     // the candidate is a directory, also confine its index.html.
-    if resolved.is_dir() && escapes_root(&resolved.join("index.html"), &root) {
-        return StatusCode::NOT_FOUND.into_response();
+    if resolved.is_dir() && escapes_root(&resolved.join("index.html"), root) {
+        return false;
     }
-    next.run(request).await
+    true
 }
 
 /// True if `path` exists and canonicalises to a target outside `root`. Used to

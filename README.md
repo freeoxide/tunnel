@@ -99,12 +99,14 @@ or the service name.
 | `ft logs <id\|name>` | Print the logs for a service. |
 | `ft logs <id\|name> --follow` | Tail the log output (`tail -f` style). |
 | `ft open <id\|name>` | Open the public URL of a service in your default browser. |
+| `ft prune` | Remove stale services whose worker is no longer running. (alias: `gc`) |
 
 ### Flags for START
 
 - `--name <name>` — explicit service name; defaults to a generated, unique name.
 - `--port <port>` — local port to bind on; defaults to a free, allocated port.
 - `--foreground` / `-f` — run in the foreground instead of spawning a detached worker.
+- `--yes` / `-y` — answer "yes" to the sensitive-directory confirmation prompt (e.g. when publishing `$HOME` or `/`); non-interactive runs against a sensitive directory must pass this or they refuse to start.
 
 ### Examples
 

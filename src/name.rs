@@ -54,32 +54,42 @@ pub fn generate_name(dir: &Path) -> String {
 }
 
 /// Produce a name unique within the registry: `base`, `base-2`, `base-3`, ...
+///
+/// The scan is capped so a registry pre-filled with `base-2`..`base-N` (e.g. a
+/// hand-edited or scripted `registry.json`) cannot make name allocation spin
+/// unboundedly. If the cap is exhausted, the final candidate is returned anyway
+/// rather than panicking — collision with a pathological registry is the lesser
+/// evil versus dropping the user's start request.
 pub fn unique_name(registry: &Registry, base: &str) -> String {
+    const LIMIT: u64 = 100_000;
     let taken: HashSet<&str> = registry.services.iter().map(|s| s.name.as_str()).collect();
     if !taken.contains(base) {
         return base.to_string();
     }
-    let mut n = 2;
-    loop {
+    // Search `base-2`..`base-{LIMIT}`. The bound keeps the worst case finite
+    // even for a crafted registry; `LIMIT` is well within a typical registry's
+    // practical size, so normal use never hits it.
+    for n in 2..=LIMIT {
         let candidate = format!("{base}-{n}");
         if !taken.contains(candidate.as_str()) {
             return candidate;
         }
-        n += 1;
     }
+    // Pathological registry: every slot up to the cap is taken. Fall back to the
+    // last candidate so the caller still gets a name (best effort).
+    format!("{base}-{LIMIT}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Registry, Service, ServiceKind};
+    use crate::model::{Registry, Service};
     use std::path::PathBuf;
 
     fn service_named(name: &str) -> Service {
         Service {
             id: 1,
             name: name.to_string(),
-            kind: ServiceKind::Static,
             dir: PathBuf::from("/tmp"),
             port: 8000,
             local_url: "http://127.0.0.1:8000".to_string(),

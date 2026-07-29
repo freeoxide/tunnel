@@ -22,11 +22,12 @@ fn fmt_started(service: &Service) -> String {
 }
 
 /// The public URL, or `(pending)` while the worker has not discovered one yet.
-fn url_or_pending(service: &Service) -> String {
-    service
-        .public_url
-        .clone()
-        .unwrap_or_else(|| "(pending)".into())
+///
+/// Returns a borrowed slice to avoid cloning the (potentially long) public URL
+/// on every call. Callers that feed a `comfy_table` cell can convert with
+/// `.into()` / `.to_string()`; the `println!` paths use the borrow for free.
+fn url_or_pending(service: &Service) -> &str {
+    service.public_url.as_deref().unwrap_or("(pending)")
 }
 
 /// Print the success block emitted by the START command.
@@ -73,7 +74,7 @@ pub fn print_list(services: &[Service]) {
             s.name.clone(),
             s.status().as_str().to_string(),
             s.port.to_string(),
-            url_or_pending(s),
+            url_or_pending(s).to_string(),
         ]);
     }
 

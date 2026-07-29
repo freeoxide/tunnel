@@ -26,21 +26,14 @@ impl ServiceStatus {
     }
 }
 
-/// What the service exposes. The MVP only supports static directories.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ServiceKind {
-    Static,
-}
-
 /// A single managed tunnel service.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct Service {
     /// Stable numeric ID, shown in `ft ls` and usable as a target.
     pub id: u64,
     /// Human-friendly name, usable as a target.
     pub name: String,
-    pub kind: ServiceKind,
     /// Absolute path to the directory being served.
     pub dir: PathBuf,
     /// Local port the static server binds on.
@@ -105,6 +98,7 @@ impl Service {
 
 /// On-disk registry of all known services.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct Registry {
     #[serde(default)]
     pub next_id: u64,
@@ -143,7 +137,6 @@ mod tests {
         Service {
             id: 1,
             name: "alpha".to_string(),
-            kind: ServiceKind::Static,
             dir: PathBuf::from("/tmp/dir"),
             port: 1234,
             local_url: "http://127.0.0.1:1234".to_string(),
