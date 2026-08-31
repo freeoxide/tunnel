@@ -7,7 +7,7 @@
 
 use crate::error::Result;
 use crate::fsutil;
-use crate::model::{Registry, Service};
+use crate::model::{Registry, Service, ServiceKind};
 use crate::state::StateDir;
 use anyhow::Context;
 use fs2::FileExt;
@@ -177,6 +177,12 @@ impl Registry {
     /// stay monotonic. Rejects clearly-broken state (reserved id 0, duplicate
     /// ids/names, empty names, reserved port 0) that would otherwise cause
     /// confusing behavior downstream.
+    ///
+    /// Kind/dir consistency is enforced strictly: a `Static` service is
+    /// defined by the directory it serves, and a `Proxy` service by the
+    /// upstream port it fronts — a `dir` on a proxy entry (or its absence on
+    /// a static entry) means the file was hand-edited into a shape no code
+    /// path would ever produce, so reject rather than guess.
     pub fn validate(&mut self) -> Result<()> {
         let mut ids = std::collections::HashSet::new();
         let mut names = std::collections::HashSet::new();
@@ -193,8 +199,24 @@ impl Registry {
             if !names.insert(s.name.as_str()) {
                 anyhow::bail!("duplicate service name {:?}", s.name);
             }
+            // Applies to both kinds: a Static service binds this port with
+            // its own server, a Proxy service fronts the operator's server
+            // on it — either way 0 means the entry is unusable.
             if s.port == 0 {
-                anyhow::bail!("service {:?} binds reserved port 0", s.name);
+                anyhow::bail!("service {:?} has reserved port 0", s.name);
+            }
+            match (s.kind, s.dir.as_ref()) {
+                (ServiceKind::Static, None) => {
+                    anyhow::bail!("{} service {:?} has no directory", s.kind.as_str(), s.name);
+                }
+                (ServiceKind::Proxy, Some(_)) => {
+                    anyhow::bail!(
+                        "{} service {:?} must not carry a directory",
+                        s.kind.as_str(),
+                        s.name
+                    );
+                }
+                _ => {}
             }
         }
         // Keep the id counter strictly ahead of every existing id so a hand-
@@ -261,14 +283,15 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
-    use crate::model::{Registry, Service};
+    use crate::model::{Registry, Service, ServiceKind};
     use std::path::PathBuf;
 
     fn dummy_service(id: u64, name: &str) -> Service {
         Service {
             id,
             name: name.to_string(),
-            dir: PathBuf::from("/tmp/dir"),
+            kind: ServiceKind::Static,
+            dir: Some(PathBuf::from("/tmp/dir")),
             port: 1234,
             local_url: "http://127.0.0.1:1234".to_string(),
             public_url: None,
@@ -277,6 +300,16 @@ mod tests {
             created_at: crate::model::now_utc(),
             state_dir: PathBuf::from("/tmp/state"),
             foreground: false,
+        }
+    }
+
+    /// A `Proxy` counterpart of `dummy_service`: fronts an upstream port,
+    /// no directory.
+    fn dummy_proxy_service(id: u64, name: &str) -> Service {
+        Service {
+            kind: ServiceKind::Proxy,
+            dir: None,
+            ..dummy_service(id, name)
         }
     }
 
@@ -471,6 +504,110 @@ mod tests {
         );
     }
 
+    // --- kind/dir consistency of validate ------------------------------------
+
+    #[test]
+    fn validate_rejects_static_without_dir() {
+        let mut s = dummy_service(1, "a");
+        s.dir = None;
+        let mut reg = Registry {
+            next_id: 2,
+            services: vec![s],
+        };
+        assert!(
+            reg.validate().is_err(),
+            "static without dir must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_proxy_with_dir() {
+        let mut s = dummy_proxy_service(1, "a");
+        s.dir = Some(PathBuf::from("/tmp/dir"));
+        let mut reg = Registry {
+            next_id: 2,
+            services: vec![s],
+        };
+        assert!(reg.validate().is_err(), "proxy with dir must be rejected");
+    }
+
+    #[test]
+    fn validate_accepts_proxy_without_dir() {
+        let mut reg = Registry {
+            next_id: 2,
+            services: vec![dummy_proxy_service(1, "a")],
+        };
+        assert!(reg.validate().is_ok(), "proxy without dir is consistent");
+    }
+
+    #[test]
+    fn validate_rejects_proxy_on_reserved_port() {
+        // port != 0 applies to both kinds: for a proxy, `port` IS the
+        // operator's upstream port, and 0 is just as unusable there.
+        let mut s = dummy_proxy_service(1, "a");
+        s.port = 0;
+        let mut reg = Registry {
+            next_id: 2,
+            services: vec![s],
+        };
+        assert!(reg.validate().is_err(), "proxy on port 0 must be rejected");
+    }
+
+    #[test]
+    fn parse_accepts_legacy_registry_without_kind() {
+        // A pre-proxy registry.json (no `kind` keys anywhere) must load: each
+        // entry defaults to Static with the directory it already carried.
+        let json = r#"{
+                "next_id": 2,
+                "services": [
+                    {
+                        "id": 1,
+                        "name": "legacy",
+                        "dir": "/tmp/legacy",
+                        "port": 8080,
+                        "local_url": "http://127.0.0.1:8080",
+                        "public_url": null,
+                        "worker_pid": 0,
+                        "tunnel_pid": null,
+                        "created_at": "2026-07-21T00:00:00Z",
+                        "state_dir": "/tmp/legacy-state",
+                        "foreground": false
+                    }
+                ]
+            }"#;
+        let reg = Registry::parse(json.as_bytes()).expect("legacy registry must parse");
+        assert_eq!(reg.services.len(), 1);
+        assert_eq!(reg.services[0].kind, ServiceKind::Static);
+        assert_eq!(reg.services[0].dir, Some(PathBuf::from("/tmp/legacy")));
+    }
+
+    #[test]
+    fn parse_rejects_proxy_entry_with_dir() {
+        // Back-compat must not become a silent pass-through for nonsense:
+        // validate runs inside parse, so a tagged-proxy entry carrying a
+        // directory is rejected at load time, not mid-command later.
+        let json = r#"{
+                "next_id": 2,
+                "services": [
+                    {
+                        "id": 1,
+                        "name": "broken",
+                        "kind": "proxy",
+                        "dir": "/tmp/leftover",
+                        "port": 3000,
+                        "local_url": "http://127.0.0.1:3000",
+                        "public_url": null,
+                        "worker_pid": 0,
+                        "tunnel_pid": null,
+                        "created_at": "2026-07-21T00:00:00Z",
+                        "state_dir": "/tmp/state",
+                        "foreground": false
+                    }
+                ]
+            }"#;
+        assert!(Registry::parse(json.as_bytes()).is_err());
+    }
+
     // --- TC-8: save→load data-integrity round-trip + corrupt recovery ---------
 
     /// Build a fully-populated Service with every field set to a non-default
@@ -480,7 +617,8 @@ mod tests {
         Service {
             id: 42,
             name: "blog".to_string(),
-            dir: PathBuf::from("/srv/blog"),
+            kind: ServiceKind::Static,
+            dir: Some(PathBuf::from("/srv/blog")),
             port: 8080,
             local_url: "http://127.0.0.1:8080".to_string(),
             public_url: Some("https://blog.trycloudflare.com".to_string()),
@@ -514,6 +652,42 @@ mod tests {
         assert_eq!(
             reloaded, original,
             "registry must round-trip field-for-field"
+        );
+    }
+
+    #[test]
+    fn save_load_preserves_proxy_service() {
+        // A proxy entry (kind: "proxy", dir: null) must survive the same
+        // atomic save path — proving the null dir and the kind tag both
+        // persist and re-validate on load.
+        use crate::state::StateDir;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::new_at(tmp.path().join("ft-state"));
+        state.ensure().expect("ensure");
+
+        let original = Registry {
+            next_id: 43,
+            services: vec![Service {
+                id: 42,
+                name: "dev".to_string(),
+                kind: ServiceKind::Proxy,
+                dir: None,
+                port: 3000,
+                local_url: "http://127.0.0.1:3000".to_string(),
+                public_url: Some("https://dev.trycloudflare.com".to_string()),
+                worker_pid: 4242,
+                tunnel_pid: Some(5353),
+                created_at: std::time::SystemTime::UNIX_EPOCH.into(),
+                state_dir: PathBuf::from("/srv/ft-state/services/dev"),
+                foreground: false,
+            }],
+        };
+        original.save(&state).expect("save");
+
+        let reloaded = Registry::load(&state).expect("load");
+        assert_eq!(
+            reloaded, original,
+            "proxy registry must round-trip field-for-field"
         );
     }
 

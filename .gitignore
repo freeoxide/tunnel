@@ -27,3 +27,6 @@ target
 
 # Claude Code harness state (local worktrees, session data, etc.)
 .claude/
+
+# ZCode workflow orchestration state (session scratch, never committed)
+.z-workflow/

@@ -100,7 +100,17 @@ pub fn print_detail(service: &Service) {
             "background"
         }
     );
-    println!("Directory:    {}", service.dir.display());
+    // Cross-area touch (area 2, minimal): `Service::dir` became
+    // `Option<PathBuf>` in area 1; proxy services carry `None`. Placeholder
+    // rendering only — area 3 owns the real proxy detail shape (kind row +
+    // upstream instead of a directory).
+    println!(
+        "Directory:    {}",
+        service
+            .dir
+            .as_deref()
+            .map_or_else(|| "-".to_string(), |d| d.display().to_string())
+    );
     println!("Port:         {}", service.port);
     println!("Worker PID:   {}", service.worker_pid);
     println!("Tunnel PID:   {tunnel_pid}");

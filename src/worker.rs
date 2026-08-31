@@ -1,10 +1,19 @@
 //! The detached worker process.
 //!
-//! Invoked as `ft run-worker --id --name --dir --port`, this binds the static
-//! server on `127.0.0.1` (fail-fast if the port cannot be bound), spawns the
-//! `cloudflared` Quick Tunnel child, discovers the tunnel URL from cloudflared's
-//! output, records it on the registry entry, and stays alive until cloudflared
-//! exits, the server task ends, or a terminating signal arrives.
+//! Invoked as `ft run-worker --id --name --dir --port`, this fronts the
+//! service's local origin with a `cloudflared` Quick Tunnel child, discovers
+//! the tunnel URL from cloudflared's output, records it on the registry entry,
+//! and stays alive until cloudflared exits, a terminating signal arrives, or
+//! (static services only) the server task ends.
+//!
+//! What to front is decided by the reserved registry entry's `kind`, not by
+//! the CLI args: a `Static` worker re-runs the START flow's directory safety
+//! checks, binds ft's own static server on `127.0.0.1` (fail-fast if the port
+//! cannot be bound), and tunnels it; a `Proxy` worker runs no server of its
+//! own — it points cloudflared straight at the operator's existing upstream
+//! on `http://127.0.0.1:<port>`. cloudflared connects lazily, so a dead
+//! upstream is deliberately NOT a start-time failure here (a friendly
+//! pre-flight, if any, belongs to the CLI layer).
 //!
 //! All registry writes go through [`Registry::update`] (an exclusive flock), so
 //! the parent's writes and ours never clobber each other.
@@ -21,23 +30,24 @@ use tokio::sync::Mutex;
 use crate::cloudflared;
 use crate::cmd::start::{is_sensitive_dir, resolve_dir};
 use crate::error::Result;
-use crate::model::Registry;
+use crate::model::{Registry, ServiceKind};
 use crate::state::StateDir;
 use crate::static_server;
 
 /// How long to keep retrying the registry load looking for our entry.
 const REGISTRY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 const REGISTRY_LOOKUP_INTERVAL: Duration = Duration::from_millis(100);
-/// Grace window after SIGTERM before SIGKILL'ing cloudflared (Unix only; the
-/// Windows teardown force-kills the owned child).
-#[cfg(unix)]
-const CLOUDFLARED_GRACE: Duration = Duration::from_secs(2);
 /// Upper bound on how long we wait for in-flight requests to drain after
 /// signalling graceful shutdown. If a request is stuck, we abort the server
 /// task as a fallback so it can't hang the worker indefinitely.
 const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Run the worker to completion.
+///
+/// `dir` is the `--dir` CLI value: the directory for `Static` services, and
+/// the empty sentinel for `Proxy` services (which have no directory — see the
+/// module docs for why the kind comes from the reserved registry entry rather
+/// than the CLI).
 pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
     // Defense in depth against direct invocation: `run-worker` is an internal
     // command only ever launched by `spawn::spawn_worker`, which sets
@@ -50,7 +60,7 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
         .unwrap_or(true)
     {
         anyhow::bail!(
-            "run-worker is an internal command spawned by `ft <dir>`; invoke that instead"
+            "run-worker is an internal command spawned by `ft`'s start/proxy flows; invoke those instead"
         );
     }
 
@@ -69,39 +79,12 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
 
     init_tracing(&worker_log, &server_log);
 
-    tracing::info!(
-        "worker starting: id={id} name={name:?} dir={} port={port}",
-        dir.display()
-    );
+    tracing::info!("worker starting: id={id} name={name:?} port={port}");
 
-    // SEC-1 / ARCH-05 / CLI-1: re-run the START flow's directory safety checks
-    // here, inside the detached worker, *before* we bind a public tunnel to the
-    // directory. `FT_WORKER_TOKEN` above is only a presence check (defense in
-    // depth against direct `run-worker` invocation); it does not by itself
-    // enforce anything. A worker is non-interactive, so a sensitive directory
-    // is refused UNCONDITIONALLY — `--yes` cannot apply, and there is no way to
-    // confirm. This closes the foot-gun where `FT_WORKER_TOKEN=x ft run-worker
-    // --dir /etc` would publish `/etc` with zero confirmation. We also reject
-    // port 0 (a no-op listener / kernel-assigned port would mismatch the one
-    // the parent reserved and advertised).
-    let dir = match resolve_dir(&dir) {
-        Ok(d) => d,
-        Err(e) => {
-            let _ = Registry::update(&state, |reg| {
-                reg.remove(id);
-            });
-            return Err(e);
-        }
-    };
-    if is_sensitive_dir(&dir) {
-        let _ = Registry::update(&state, |reg| {
-            reg.remove(id);
-        });
-        anyhow::bail!(
-            "refusing to publish sensitive directory {} from a detached worker",
-            dir.display()
-        );
-    }
+    // Kind-agnostic port guard. A `Static` worker would otherwise bind a
+    // kernel-assigned port that mismatches the one the parent reserved and
+    // advertised; a `Proxy` worker's port IS the operator's upstream, where 0
+    // is never valid either.
     if port == 0 {
         let _ = Registry::update(&state, |reg| {
             reg.remove(id);
@@ -109,11 +92,6 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
         anyhow::bail!("port 0 is reserved; the worker needs an explicit port");
     }
 
-    // Recover our registry entry (parent race). The parent reserves the entry
-    // before spawning us, but there is a window before the atomic save lands.
-    // Look up by id, not name: if a stale worker is still draining while the
-    // parent reuses this name for a new service, a name lookup would bind us to
-    // the wrong entry. The id is unique and stable.
     // Recover our registry entry (parent race). The parent reserves the entry
     // before spawning us, but there is a window before the atomic save lands.
     // Look up by id, not name: if a stale worker is still draining while the
@@ -127,6 +105,61 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
         });
         anyhow::bail!("registry entry for service id={id} never appeared");
     }
+
+    // What this worker fronts comes from the reserved entry — the parent wrote
+    // the kind (and, for Static, the directory) before spawning us. A miss here
+    // means the entry vanished between the probe and this load (a concurrent
+    // `ft kill`): exit rather than serve an untracked tunnel.
+    let Some(kind) = Registry::load(&state)?
+        .find(&id.to_string())
+        .map(|s| s.kind)
+    else {
+        let _ = Registry::update(&state, |reg| {
+            reg.remove(id);
+        });
+        anyhow::bail!("registry entry for service id={id} vanished before start");
+    };
+
+    // SEC-1 / ARCH-05 / CLI-1 (Static only): re-run the START flow's directory
+    // safety checks here, inside the detached worker, *before* we bind a public
+    // tunnel to the directory. `FT_WORKER_TOKEN` above is only a presence check
+    // (defense in depth against direct `run-worker` invocation); it does not by
+    // itself enforce anything. A worker is non-interactive, so a sensitive
+    // directory is refused UNCONDITIONALLY — `--yes` cannot apply, and there is
+    // no way to confirm. This closes the foot-gun where `FT_WORKER_TOKEN=x ft
+    // run-worker --dir /etc` would publish `/etc` with zero confirmation.
+    //
+    // Proxy services skip these checks by construction: they publish no
+    // directory at all — the tunnel fronts a port the operator chose to run.
+    let dir = match kind {
+        ServiceKind::Proxy => {
+            tracing::info!("proxy worker: fronting existing upstream http://127.0.0.1:{port}");
+            None
+        }
+        ServiceKind::Static => {
+            let dir = match resolve_dir(&dir) {
+                Ok(d) => d,
+                Err(e) => {
+                    let _ = Registry::update(&state, |reg| {
+                        reg.remove(id);
+                    });
+                    return Err(e);
+                }
+            };
+            if is_sensitive_dir(&dir) {
+                let _ = Registry::update(&state, |reg| {
+                    reg.remove(id);
+                });
+                anyhow::bail!(
+                    "refusing to publish sensitive directory {} from a detached worker",
+                    dir.display()
+                );
+            }
+            tracing::info!(dir = %dir.display(), "static worker: serving directory");
+            Some(dir)
+        }
+    };
+
     // Self-register our pid once (the parent records it normally, but if it died
     // between spawn and recording this keeps `ft kill` able to reach us). A
     // single locked write — the probe loop above was read-only.
@@ -138,41 +171,48 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
         }
     })?;
 
-    // Bind the listener now (fail-fast): if the port is taken, the worker exits
-    // immediately and the parent's poll detects the dead worker instead of
-    // waiting out the full timeout with a dead tunnel returning 502s.
-    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
-        Ok(l) => l,
-        Err(e) => {
-            // Dying worker mustn't leave a permanent stale entry.
-            let _ = Registry::update(&state, |reg| {
-                reg.remove(id);
+    // Local origin. Static: bind the listener now (fail-fast) — if the port is
+    // taken, the worker exits immediately and the parent's poll detects the
+    // dead worker instead of waiting out the full timeout with a dead tunnel
+    // returning 502s. Proxy: no server of our own to bind or run.
+    let (shutdown_tx, mut server_handle) = match dir.as_deref() {
+        Some(dir) => {
+            let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                Ok(l) => l,
+                Err(e) => {
+                    // Dying worker mustn't leave a permanent stale entry.
+                    let _ = Registry::update(&state, |reg| {
+                        reg.remove(id);
+                    });
+                    return Err(e).with_context(|| format!("failed to bind 127.0.0.1:{port}"));
+                }
+            };
+            tracing::info!("static server bound on 127.0.0.1:{port}");
+
+            let router = static_server::router(dir.to_path_buf());
+
+            // Graceful shutdown channel: on the teardown path we fire
+            // `shutdown_tx`, which lets axum stop accepting and drain in-flight
+            // requests instead of aborting the server task (and dropping the
+            // requests) mid-flight.
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            let server_handle = tokio::spawn(async move {
+                static_server::serve_on(router, listener, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
             });
-            return Err(e).with_context(|| format!("failed to bind 127.0.0.1:{port}"));
+            (shutdown_tx, server_handle)
         }
+        None => no_server(),
     };
-    tracing::info!("static server bound on 127.0.0.1:{port}");
-
-    let router = static_server::router(dir.clone());
-
-    // Graceful shutdown channel: on the teardown path we fire `shutdown_tx`,
-    // which lets axum stop accepting and drain in-flight requests instead of
-    // aborting the server task (and dropping the requests) mid-flight.
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let mut server_handle = tokio::spawn(async move {
-        static_server::serve_on(router, listener, async {
-            let _ = shutdown_rx.await;
-        })
-        .await
-    });
 
     // cloudflared
     if let Err(e) = cloudflared::ensure_installed() {
         tracing::error!(%e, "cloudflared unavailable");
-        // Nothing is serving the tunnel yet; tear the static server down
+        // Nothing is serving the tunnel yet; tear the local origin down
         // gracefully (it may already have accepted connections).
-        let _ = shutdown_tx.send(());
-        let _ = tokio::time::timeout(SERVER_SHUTDOWN_TIMEOUT, &mut server_handle).await;
+        stop_server(kind, shutdown_tx, &mut server_handle).await;
         // Dying worker mustn't leave a permanent stale entry.
         let _ = Registry::update(&state, |reg| {
             reg.remove(id);
@@ -183,8 +223,7 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(%e, "failed to spawn cloudflared");
-            let _ = shutdown_tx.send(());
-            let _ = tokio::time::timeout(SERVER_SHUTDOWN_TIMEOUT, &mut server_handle).await;
+            stop_server(kind, shutdown_tx, &mut server_handle).await;
             // Dying worker mustn't leave a permanent stale entry.
             let _ = Registry::update(&state, |reg| {
                 reg.remove(id);
@@ -225,7 +264,10 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
 
     // Keep alive until cloudflared exits, the server task ends, or we're
     // signalled. Polling server_handle ensures a serve failure (post-bind) is
-    // observed rather than silently lost.
+    // observed rather than silently lost. For a proxy worker the server slot
+    // holds [`no_server`]'s never-completing placeholder, so the server arm
+    // below can never fire — exactly the intent: the only local origin is the
+    // operator's, which this worker does not own and cannot observe.
     //
     // The signal arms are platform-split: on Unix we install explicit
     // SIGTERM/SIGINT handlers (tokio::signal::unix); on Windows we fall back to
@@ -304,22 +346,12 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
         let _ = task.await;
     }
 
-    // Drain in-flight requests: fire the shutdown signal and let axum finish
-    // what it's serving, with a bounded timeout so a stuck request can't hang
-    // the worker. If the drain doesn't complete in time, abort as a fallback.
-    let _ = shutdown_tx.send(());
-    match tokio::time::timeout(SERVER_SHUTDOWN_TIMEOUT, &mut server_handle).await {
-        Ok(Ok(Ok(()))) => tracing::info!("static server drained and exited"),
-        Ok(Ok(Err(e))) => tracing::error!(%e, "static server task failed during shutdown"),
-        Ok(Err(e)) => tracing::error!(%e, "static server task panicked during shutdown"),
-        Err(_) => {
-            tracing::warn!(
-                "static server did not drain within {:?}, aborting",
-                SERVER_SHUTDOWN_TIMEOUT
-            );
-            server_handle.abort();
-        }
-    }
+    // Drain in-flight requests (Static only — a proxy worker's server slot is
+    // the [`no_server`] placeholder, which `stop_server` aborts outright): fire
+    // the shutdown signal and let axum finish what it's serving, with a bounded
+    // timeout so a stuck request can't hang the worker. If the drain doesn't
+    // complete in time, abort as a fallback.
+    stop_server(kind, shutdown_tx, &mut server_handle).await;
 
     tracing::info!("worker exiting");
     Ok(())
@@ -342,6 +374,57 @@ fn teardown_should_signal(exit_reason: &ReaderExit) -> bool {
     matches!(exit_reason, ReaderExit::Signal | ReaderExit::ServerEnded)
 }
 
+/// The local-origin stand-in for proxy services, which run no static server of
+/// their own — the worker fronts the operator's existing upstream directly.
+///
+/// The keep-alive `select!` in [`run`] is written against a server task handle,
+/// so a proxy worker parks a never-completing task in that slot (the server arm
+/// can then never fire) together with a shutdown sender whose receiver is
+/// dropped, which makes sending on it a harmless no-op. [`stop_server`] aborts
+/// the placeholder instead of waiting out [`SERVER_SHUTDOWN_TIMEOUT`] on
+/// nothing.
+fn no_server() -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<crate::error::Result<()>>,
+) {
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    (
+        shutdown_tx,
+        tokio::spawn(std::future::pending::<crate::error::Result<()>>()),
+    )
+}
+
+/// Stop the worker's local origin, if it runs one.
+///
+/// `Static`: fire the graceful-shutdown signal and let axum finish what it's
+/// serving, bounded by [`SERVER_SHUTDOWN_TIMEOUT`] so a stuck request cannot
+/// hang the worker; on overrun the task is aborted as a fallback. `Proxy`:
+/// there is no server — the handle is [`no_server`]'s placeholder, which never
+/// completes — so it is aborted outright rather than burning the timeout.
+async fn stop_server(
+    kind: ServiceKind,
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    server_handle: &mut tokio::task::JoinHandle<crate::error::Result<()>>,
+) {
+    if kind == ServiceKind::Proxy {
+        server_handle.abort();
+        return;
+    }
+    let _ = shutdown_tx.send(());
+    match tokio::time::timeout(SERVER_SHUTDOWN_TIMEOUT, &mut *server_handle).await {
+        Ok(Ok(Ok(()))) => tracing::info!("static server drained and exited"),
+        Ok(Ok(Err(e))) => tracing::error!(%e, "static server task failed during shutdown"),
+        Ok(Err(e)) => tracing::error!(%e, "static server task panicked during shutdown"),
+        Err(_) => {
+            tracing::warn!(
+                "static server did not drain within {:?}, aborting",
+                SERVER_SHUTDOWN_TIMEOUT
+            );
+            server_handle.abort();
+        }
+    }
+}
+
 /// Poll the registry read-only until our entry (by id) appears, or `deadline`
 /// passes. Takes NO advisory lock and does NOT rewrite the registry — an earlier
 /// revision used `Registry::update` here, which contended with the parent's
@@ -357,12 +440,10 @@ async fn await_entry(state: &StateDir, id: u64, deadline: std::time::Instant) ->
     Ok(false)
 }
 
-/// If cloudflared may still be alive, shut it down and reap it to avoid a
-/// transient zombie. On `ChildExited` the select's `wait()` already reaped it,
-/// so nothing to do. On Unix we send a graceful SIGTERM and escalate to SIGKILL
-/// after the grace window; on Windows there is no signal/group teardown, so we
-/// force-kill the owned tokio child directly (the worker's Job Object would
-/// also reap it on the worker's own exit).
+/// If cloudflared may still be alive, shut it down and reap it — the actual
+/// signal/escalation/reap sequence lives in [`cloudflared::shutdown`], shared
+/// with the foreground flow. On `ChildExited` the select's `wait()` already
+/// reaped it, so nothing to do.
 async fn teardown_on_exit(
     exit_reason: ReaderExit,
     tunnel_pid: Option<u32>,
@@ -371,35 +452,7 @@ async fn teardown_on_exit(
     if !teardown_should_signal(&exit_reason) {
         return;
     }
-
-    #[cfg(unix)]
-    {
-        if let Some(pid) = tunnel_pid {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGTERM,
-            );
-        }
-        if tokio::time::timeout(CLOUDFLARED_GRACE, child.wait())
-            .await
-            .is_err()
-            && let Some(pid) = tunnel_pid
-        {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        // No graceful signal path on Windows; force-kill the owned child. The
-        // pid is irrelevant here because the owned handle is the kill vector.
-        let _ = tunnel_pid;
-        let _ = child.start_kill();
-    }
-
-    let _ = child.wait().await; // ensure reaped
+    cloudflared::shutdown(tunnel_pid, child).await;
 }
 
 /// Shared context handed to each output-reader task.
@@ -534,7 +587,8 @@ mod tests {
         Service {
             id,
             name: name.to_string(),
-            dir: PathBuf::from("/tmp/dir"),
+            kind: ServiceKind::Static,
+            dir: Some(PathBuf::from("/tmp/dir")),
             port: 1234,
             local_url: "http://127.0.0.1:1234".to_string(),
             public_url: None,
@@ -712,5 +766,24 @@ mod tests {
         // Signal / ServerEnded: cloudflared may still be alive -> must signal.
         assert!(teardown_should_signal(&ReaderExit::Signal));
         assert!(teardown_should_signal(&ReaderExit::ServerEnded));
+    }
+
+    #[tokio::test]
+    async fn stop_server_aborts_proxy_placeholder_without_waiting_out_the_timeout() {
+        // A proxy worker owns no server: stop_server must abort the parked
+        // placeholder immediately. Waiting out SERVER_SHUTDOWN_TIMEOUT here
+        // would hang every proxy worker teardown by that much.
+        let (shutdown_tx, mut server_handle) = no_server();
+        let started = std::time::Instant::now();
+        stop_server(ServiceKind::Proxy, shutdown_tx, &mut server_handle).await;
+
+        // The placeholder is gone: awaiting it resolves right away as
+        // cancelled (it would otherwise stay pending forever), and the whole
+        // call stayed well under the drain bound.
+        let err = server_handle
+            .await
+            .expect_err("proxy placeholder must be aborted, still pending");
+        assert!(err.is_cancelled());
+        assert!(started.elapsed() < SERVER_SHUTDOWN_TIMEOUT);
     }
 }

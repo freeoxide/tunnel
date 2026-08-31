@@ -26,6 +26,28 @@ impl ServiceStatus {
     }
 }
 
+/// How a tunnel service sources its local HTTP origin.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceKind {
+    /// `ft` runs its own static file server for [`Service::dir`] and the
+    /// tunnel fronts that server.
+    #[default]
+    Static,
+    /// The operator already runs a server on [`Service::port`]; the tunnel
+    /// fronts it directly and `ft` starts no server of its own.
+    Proxy,
+}
+
+impl ServiceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ServiceKind::Static => "static",
+            ServiceKind::Proxy => "proxy",
+        }
+    }
+}
+
 /// A single managed tunnel service.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(PartialEq))]
@@ -34,16 +56,31 @@ pub struct Service {
     pub id: u64,
     /// Human-friendly name, usable as a target.
     pub name: String,
-    /// Absolute path to the directory being served.
-    pub dir: PathBuf,
-    /// Local port the static server binds on.
+    /// How this service sources its local origin: ft's own static server
+    /// ([`ServiceKind::Static`]) or the operator's existing upstream
+    /// ([`ServiceKind::Proxy`]).
+    ///
+    /// Defaults to `Static` on deserialize so pre-proxy `registry.json`
+    /// files — which carry no `kind` — keep their existing meaning.
+    #[serde(default)]
+    pub kind: ServiceKind,
+    /// Absolute path to the directory being served. `None` for `Proxy`
+    /// services, which front an existing port instead of a directory.
+    /// Nullable and defaulted so proxy entries may omit it on disk.
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+    /// Local port. For `Static` services this is the port ft's own server
+    /// binds; for `Proxy` services it IS the operator's upstream port
+    /// (there is no separate local server port).
     pub port: u16,
-    /// e.g. `http://127.0.0.1:PORT`.
+    /// e.g. `http://127.0.0.1:PORT` — ft's server for `Static`, the
+    /// operator's upstream for `Proxy`.
     pub local_url: String,
     /// Public trycloudflare URL. `None` until the worker discovers it.
     pub public_url: Option<String>,
-    /// PID of the detached worker process (it hosts the static server
-    /// in-process and owns the `cloudflared` child).
+    /// PID of the detached worker process. For `Static` services it hosts
+    /// the static server in-process; for `Proxy` services it only owns the
+    /// `cloudflared` child. Either way it owns that child.
     pub worker_pid: u32,
     /// PID of the `cloudflared` child, once spawned.
     pub tunnel_pid: Option<u32>,
@@ -67,8 +104,10 @@ pub struct Service {
 impl Service {
     /// Compute the current status by probing the worker PID.
     ///
-    /// The static server runs in-process inside the worker, so worker liveness
-    /// implies server liveness.
+    /// This is kind-agnostic: for `Static` services the server runs
+    /// in-process inside the worker (worker liveness implies server
+    /// liveness), and for `Proxy` services the worker's only job is owning
+    /// the `cloudflared` child.
     pub fn status(&self) -> ServiceStatus {
         // A worker_pid of 0 means the parent reserved the entry but has not yet
         // recorded the spawned worker's pid. Treat that as Starting rather than
@@ -137,7 +176,8 @@ mod tests {
         Service {
             id: 1,
             name: "alpha".to_string(),
-            dir: PathBuf::from("/tmp/dir"),
+            kind: ServiceKind::Static,
+            dir: Some(PathBuf::from("/tmp/dir")),
             port: 1234,
             local_url: "http://127.0.0.1:1234".to_string(),
             public_url: public_url.map(str::to_string),
@@ -147,6 +187,85 @@ mod tests {
             state_dir: PathBuf::from("/tmp/state"),
             foreground,
         }
+    }
+
+    /// A minimal JSON service body covering every non-defaulted field, used
+    /// to pin the serde contract (`kind` tag names, `dir` nullability).
+    fn service_json(extra: &str) -> String {
+        format!(
+            r#"{{
+            "id": 1,
+            "name": "alpha",
+            {extra}
+            "port": 1234,
+            "local_url": "http://127.0.0.1:1234",
+            "public_url": null,
+            "worker_pid": 0,
+            "tunnel_pid": null,
+            "created_at": "2026-07-21T00:00:00Z",
+            "state_dir": "/tmp/state"
+        }}"#
+        )
+    }
+
+    #[test]
+    fn legacy_entry_without_kind_deserializes_as_static() {
+        // A pre-proxy registry entry carries no `kind` and a plain `dir`;
+        // it must keep deserializing as a Static service, unchanged.
+        let json = service_json(r#""dir": "/tmp/dir","#);
+        let s: Service = serde_json::from_str(&json).expect("legacy entry must parse");
+        assert_eq!(s.kind, ServiceKind::Static);
+        assert_eq!(s.dir, Some(PathBuf::from("/tmp/dir")));
+    }
+
+    #[test]
+    fn explicit_kind_tags_deserialize() {
+        // tests/integration.rs fixtures seed `"kind": "static"` explicitly;
+        // proxy entries tag `"proxy"` and may carry `"dir": null`.
+        let json = service_json(r#""kind": "static", "dir": "/tmp/dir","#);
+        let s: Service = serde_json::from_str(&json).expect("explicit static must parse");
+        assert_eq!(s.kind, ServiceKind::Static);
+
+        let json = service_json(r#""kind": "proxy", "dir": null,"#);
+        let s: Service = serde_json::from_str(&json).expect("proxy must parse");
+        assert_eq!(s.kind, ServiceKind::Proxy);
+        assert_eq!(s.dir, None);
+    }
+
+    #[test]
+    fn proxy_entry_may_omit_dir_entirely() {
+        // `dir` is serde-defaulted, so a hand-written proxy entry without a
+        // `dir` key is accepted (and reads back as None).
+        let json = service_json(r#""kind": "proxy","#);
+        let s: Service = serde_json::from_str(&json).expect("dir-less proxy must parse");
+        assert_eq!(s.kind, ServiceKind::Proxy);
+        assert_eq!(s.dir, None);
+    }
+
+    #[test]
+    fn proxy_service_round_trips_through_json() {
+        // A proxy service (dir: None) must survive a serialize → deserialize
+        // cycle field-for-field, including the `kind` tag and null `dir`.
+        let s = Service {
+            kind: ServiceKind::Proxy,
+            dir: None,
+            ..service(7, Some("https://example.trycloudflare.com"), false)
+        };
+        let encoded = serde_json::to_string(&s).expect("encode");
+        let decoded: Service = serde_json::from_str(&encoded).expect("decode");
+        assert_eq!(decoded, s);
+    }
+
+    #[test]
+    fn kind_as_str_matches_serde_tags() {
+        // `as_str` is the human/CLI rendering and must agree with the on-disk
+        // serde tag for each variant.
+        assert_eq!(ServiceKind::Static.as_str(), "static");
+        assert_eq!(ServiceKind::Proxy.as_str(), "proxy");
+        assert_eq!(
+            serde_json::to_value(ServiceKind::Proxy).expect("encode"),
+            serde_json::json!("proxy")
+        );
     }
 
     #[test]

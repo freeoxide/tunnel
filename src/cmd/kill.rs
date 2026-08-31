@@ -142,7 +142,8 @@ mod tests {
         Service {
             id: 1,
             name: "x".to_string(),
-            dir: PathBuf::from("/tmp"),
+            kind: crate::model::ServiceKind::Static,
+            dir: Some(PathBuf::from("/tmp")),
             port: 1,
             local_url: "http://127.0.0.1:1".to_string(),
             public_url: None,
