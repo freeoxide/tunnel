@@ -78,22 +78,21 @@ jobs:
           # corrupted rolling-build cache can never affect a tagged release.
           key: latest-${{ matrix.target }}
 
-      # musl cross-linker. The current dep tree (tokio/axum/tower-http with the
-      # enabled feature set) is pure Rust and links no C, so this is NOT load-
-      # bearing today — but it is retained defensively: a future dependency
-      # (e.g. ring, aws-lc-rs, or a -sys crate) would need a C cross-compiler
-      # to link the musl targets, and musl-gcc covers both x86_64 and aarch64
-      # when that day comes. Removing it would silently break the musl build.
-      - name: Install musl toolchain (Linux musl targets)
-        if: runner.os == 'Linux' && contains(matrix.target, 'musl')
+      # musl cross-linker. The dep tree (tokio/axum/tower-http with the enabled
+      # feature set) is pure Rust and links no C. x86_64 keeps musl-gcc from
+      # musl-tools (also C-capable if a future -sys dep lands). aarch64 has NO
+      # musl cross gcc in Ubuntu repos — `gcc-aarch64-linux-musl` does not
+      # exist, so that apt install always failed — and instead links with
+      # rust-lld shipped inside the Rust toolchain, which produces a fully
+      # static aarch64 musl binary for a pure-Rust dep tree (verified:
+      # ELF e_machine AArch64, no PT_INTERP/NEEDED entries). If a future
+      # dependency adds C, the aarch64 job needs a real C cross toolchain
+      # (cross or zig); rust-lld cannot compile C.
+      - name: Install musl toolchain (x86_64 musl only)
+        if: runner.os == 'Linux' && matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-          # musl-tools only ships a 64-bit musl-gcc; for aarch64 we need the
-          # dedicated cross toolchain.
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
-            sudo apt-get install -y gcc-aarch64-linux-musl
-          fi
 
       - name: Configure musl cross-linker
         if: runner.os == 'Linux' && contains(matrix.target, 'musl')
@@ -104,8 +103,7 @@ jobs:
               echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" >> "$GITHUB_ENV"
               ;;
             aarch64-unknown-linux-musl)
-              echo "CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc" >> "$GITHUB_ENV"
-              echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc" >> "$GITHUB_ENV"
+              echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld" >> "$GITHUB_ENV"
               ;;
           esac
 
