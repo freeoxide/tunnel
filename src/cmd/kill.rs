@@ -28,6 +28,40 @@ fn teardown_kind(service: &Service) -> TeardownKind {
     }
 }
 
+/// What the locked lookup in [`run`] decided to do with the target entry.
+///
+/// Extracted (like [`teardown_kind`]) so the decision can be unit-tested
+/// without signalling anything.
+enum KillPlan {
+    /// Remove the entry now and tear its process tree down (the normal path).
+    Remove(Service),
+    /// Leave the entry in place: its worker pid has not been recorded yet and
+    /// the [`crate::model::START_GRACE`] window is still open. `run` reports
+    /// a friendly "still starting" error instead of reaping.
+    Starting(String),
+}
+
+/// Decide — atomically with the removal itself — whether `target` may be
+/// reaped right now. `None` means no service matches.
+///
+/// The M1 rule: a background start reserves the entry with `worker_pid == 0`,
+/// spawns the worker, and records the real pid in a second locked write.
+/// Reaping the entry inside that window would orphan the just-spawned worker:
+/// pid 0 never passes an identity probe, so nothing would be signalled, and
+/// the worker would keep serving a tunnel no registry entry tracks. While
+/// [`Service::start_in_progress`] holds, the entry is left untouched; once
+/// the grace expires the reservation is abandoned (the parent died mid-start)
+/// and is removed like any other entry — with nothing to signal, which is
+/// correct, since no worker ever landed.
+fn plan_kill(reg: &mut Registry, target: &str) -> Option<KillPlan> {
+    let svc = reg.find(target)?.clone();
+    if svc.start_in_progress() {
+        return Some(KillPlan::Starting(svc.name));
+    }
+    reg.remove(svc.id);
+    Some(KillPlan::Remove(svc))
+}
+
 /// Stop the service matching `target` and remove its registry entry.
 ///
 /// - **Background** services are torn down by signalling the worker's whole
@@ -42,6 +76,11 @@ fn teardown_kind(service: &Service) -> TeardownKind {
 ///
 /// In both cases the registry entry is removed atomically under the lock before
 /// any signalling, so even a failed signal leaves no stale entry.
+///
+/// Exception: an entry whose worker pid has not been recorded yet
+/// (`worker_pid == 0`, inside [`crate::model::START_GRACE`]) is left in place
+/// with a friendly "still starting" error — removing it mid-window would
+/// orphan the just-spawned worker (M1).
 pub async fn run(target: String) -> Result<()> {
     let state = StateDir::new()?;
 
@@ -56,15 +95,18 @@ pub async fn run(target: String) -> Result<()> {
 
     // Remove the entry atomically under the registry lock so a concurrent
     // writer cannot resurrect or duplicate it. `find` is re-checked under the
-    // lock in case it vanished between the unlocked read and here; `update`
-    // returns the removed service (cloned) or an error if the dir disappeared.
-    let Some(service) = Registry::update(&state, |reg| {
-        reg.find(&target).cloned().inspect(|svc| {
-            reg.remove(svc.id);
-        })
-    })?
-    else {
-        bail!("no service matches '{target}'");
+    // lock (inside `plan_kill`) in case it vanished between the unlocked read
+    // and here; the M1 guard there may instead leave the entry in place, in
+    // which case the caller gets the "still starting" error rather than a
+    // reaped reservation.
+    let service = match Registry::update(&state, |reg| plan_kill(reg, &target))? {
+        Some(KillPlan::Remove(service)) => service,
+        Some(KillPlan::Starting(name)) => {
+            bail!(
+                "service '{name}' is still starting; try again in a few seconds once its worker pid is recorded"
+            );
+        }
+        None => bail!("no service matches '{target}'"),
     };
 
     match teardown_kind(&service) {
@@ -136,6 +178,8 @@ pub async fn run(target: String) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::START_GRACE;
+    use chrono::TimeDelta;
     use std::path::PathBuf;
 
     fn svc(foreground: bool) -> Service {
@@ -155,6 +199,12 @@ mod tests {
         }
     }
 
+    fn reg_with(svc: Service) -> Registry {
+        let mut reg = Registry::default();
+        reg.services.push(svc);
+        reg
+    }
+
     #[test]
     fn foreground_service_is_never_group_signalled() {
         // The shell-safety guarantee: a foreground service must select the
@@ -171,5 +221,56 @@ mod tests {
             teardown_kind(&svc(false)),
             TeardownKind::BackgroundGroup
         ));
+    }
+
+    // --- the M1 reserve→spawn→record guard -----------------------------------
+
+    #[test]
+    fn starting_entry_is_left_in_place_inside_the_grace_window() {
+        // Killing a reserved-but-unrecorded entry mid-window would orphan the
+        // just-spawned worker (pid 0 cannot be signalled), so the entry is
+        // kept and the caller reports a friendly error instead.
+        let mut s = svc(false);
+        s.worker_pid = 0;
+        let mut reg = reg_with(s);
+        assert!(matches!(
+            plan_kill(&mut reg, "x"),
+            Some(KillPlan::Starting(_))
+        ));
+        assert_eq!(reg.services.len(), 1, "the reserved entry must survive");
+    }
+
+    #[test]
+    fn abandoned_reservation_is_removed_once_grace_expires() {
+        // Past the grace the pid is never landing (the parent died mid-start);
+        // the entry is removed like any other, with nothing to signal.
+        let mut s = svc(false);
+        s.worker_pid = 0;
+        s.created_at = crate::model::now_utc()
+            - (TimeDelta::from_std(START_GRACE).expect("grace fits") + TimeDelta::seconds(1));
+        let mut reg = reg_with(s);
+        assert!(matches!(
+            plan_kill(&mut reg, "x"),
+            Some(KillPlan::Remove(_))
+        ));
+        assert!(reg.services.is_empty());
+    }
+
+    #[test]
+    fn recorded_entry_is_removed_immediately() {
+        // The pid already landed, so the M1 window is over — no grace applies
+        // and kill proceeds regardless of the entry's age.
+        let mut reg = reg_with(svc(false)); // worker_pid = 12345, created now
+        assert!(matches!(
+            plan_kill(&mut reg, "x"),
+            Some(KillPlan::Remove(_))
+        ));
+        assert!(reg.services.is_empty());
+    }
+
+    #[test]
+    fn unknown_target_reports_not_found() {
+        let mut reg = reg_with(svc(false));
+        assert!(plan_kill(&mut reg, "nope").is_none());
     }
 }

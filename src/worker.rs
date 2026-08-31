@@ -44,10 +44,12 @@ const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Run the worker to completion.
 ///
-/// `dir` is the `--dir` CLI value: the directory for `Static` services, and
-/// the empty sentinel for `Proxy` services (which have no directory — see the
-/// module docs for why the kind comes from the reserved registry entry rather
-/// than the CLI).
+/// `dir` is the `--dir` CLI value: the served directory for `Static` services,
+/// and [`crate::spawn::PROXY_DIR_SENTINEL`] for `Proxy` services (which have
+/// no directory — clap rejects an empty `--dir` value, so the spawn path
+/// passes that deliberately non-existent stand-in path; see the module docs
+/// for why the kind comes from the reserved registry entry rather than the
+/// CLI).
 pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
     // Defense in depth against direct invocation: `run-worker` is an internal
     // command only ever launched by `spawn::spawn_worker`, which sets

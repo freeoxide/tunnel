@@ -3,6 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Lifecycle state of a tunnel service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +102,24 @@ pub struct Service {
     pub foreground: bool,
 }
 
+/// How long a freshly reserved entry whose worker pid has not been recorded
+/// yet (`worker_pid == 0`) is protected from `ft kill` / `ft prune` — see
+/// [`Service::start_in_progress`].
+///
+/// The background start flow reserves the entry with `worker_pid: 0` in one
+/// locked write, spawns the worker, and records the real pid in a second
+/// write. During that window there is nothing safe to signal: pid 0 never
+/// passes an identity probe, so reaping the entry would orphan the
+/// just-spawned worker (it would keep serving a tunnel no registry entry
+/// tracks). Every live start resolves the window almost immediately — the pid
+/// lands within milliseconds, or the parent removes the entry on spawn
+/// failure, on worker death, or on URL timeout (bounded by the 30 s poll in
+/// `cmd::start`) — so this grace is set well above all of those paths: once
+/// it expires, an entry whose pid is still 0 is an abandoned reservation
+/// (the parent died mid-start), never a start in progress, and may be
+/// cleaned up like any other stale entry.
+pub const START_GRACE: Duration = Duration::from_secs(60);
+
 impl Service {
     /// Compute the current status by probing the worker PID.
     ///
@@ -132,6 +151,27 @@ impl Service {
             (true, Some(_)) => ServiceStatus::Running,
             (true, None) => ServiceStatus::Starting,
         }
+    }
+
+    /// True while this entry sits in the reserve→spawn→record window that
+    /// `ft kill` / `ft prune` must leave alone (the M1 race).
+    ///
+    /// Complements [`status`]'s `worker_pid == 0` special case: `status`
+    /// renders such an entry as `Starting` for display, while this decides
+    /// whether it may be *reaped* yet — fresh reservations are protected for
+    /// [`START_GRACE`], expired ones are abandoned and fair game.
+    pub fn start_in_progress(&self) -> bool {
+        if self.worker_pid != 0 {
+            return false;
+        }
+        // A negative age (clock skew between the reserving parent and now)
+        // still means "freshly reserved": clamp it to zero so the entry stays
+        // protected instead of instantly losing the grace.
+        let age = now_utc()
+            .signed_duration_since(self.created_at)
+            .to_std()
+            .unwrap_or(Duration::ZERO);
+        age < START_GRACE
     }
 }
 
@@ -170,6 +210,7 @@ pub fn now_utc() -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeDelta;
     use std::path::PathBuf;
 
     fn service(worker_pid: u32, public_url: Option<&str>, foreground: bool) -> Service {
@@ -315,5 +356,31 @@ mod tests {
             service(4_000_000, None, true).status(),
             ServiceStatus::Stale
         );
+    }
+
+    // --- the reserve→spawn→record protection window (M1) ---------------------
+
+    #[test]
+    fn start_in_progress_true_for_fresh_reservation() {
+        // A just-reserved entry (pid not yet recorded) is inside the protected
+        // window: reaping it now would orphan the just-spawned worker.
+        assert!(service(0, None, false).start_in_progress());
+    }
+
+    #[test]
+    fn start_in_progress_false_once_grace_expires() {
+        // An unrecorded pid past START_GRACE is an abandoned reservation (the
+        // parent died mid-start) — no longer protected.
+        let mut s = service(0, None, false);
+        s.created_at = now_utc()
+            - (TimeDelta::from_std(START_GRACE).expect("grace fits") + TimeDelta::seconds(1));
+        assert!(!s.start_in_progress());
+    }
+
+    #[test]
+    fn start_in_progress_false_once_pid_recorded() {
+        // The window ends the moment the real pid lands, regardless of age —
+        // a recorded pid gets the normal liveness semantics instead.
+        assert!(!service(123_456, None, false).start_in_progress());
     }
 }

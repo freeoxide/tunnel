@@ -207,8 +207,15 @@ async fn run_background(dir: &Path, name: Option<String>, port: Option<u16>) -> 
 
     // --- Reserve name + id + entry atomically -----------------------------
     // All under the registry lock: no duplicate names, no duplicate ids, and
-    // the entry exists before the worker is spawned. worker_pid is 0 until the
-    // worker is spawned below.
+    // the entry exists before the worker is spawned. worker_pid is 0 until
+    // the worker is spawned below and its pid recorded in a second locked
+    // write. That reserve→spawn→record window (M1) is why `ft kill` and
+    // `ft prune` refuse to reap a pid-0 entry younger than
+    // `model::START_GRACE`: deleting it mid-window would orphan the
+    // just-spawned worker (pid 0 cannot be signalled, so nothing would tear
+    // it down). Every exit of ours resolves the window quickly — spawn
+    // failure, worker death, and the URL timeout below all remove the entry,
+    // and the worker self-registers its pid if we die first.
     let (id, name) = Registry::update(&state, |reg| -> Result<(u64, String)> {
         let name = match &name {
             Some(n) => {
