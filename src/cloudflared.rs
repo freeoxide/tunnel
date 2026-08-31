@@ -8,11 +8,13 @@
 use crate::error::Result;
 use anyhow::{Context, bail};
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::time::Duration;
 use tokio::process::{Child, Command};
 
 /// Grace window after SIGTERM before SIGKILL'ing cloudflared (Unix only; the
 /// Windows teardown force-kills the owned child).
+#[cfg(unix)]
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 /// The exact message shown when `cloudflared` cannot be found on `PATH`.
