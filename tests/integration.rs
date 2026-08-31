@@ -159,12 +159,16 @@ fn dead_loopback_port() -> u16 {
     port
 }
 
-/// Every file under `root`, recursively; empty when `root` does not exist yet.
+/// Every file AND directory under `root`, recursively; empty when `root` does
+/// not exist yet.
 ///
 /// Pins the proxy pre-flight's "zero state" guarantee precisely: not just "no
 /// registry entry" but also no `services/` dir and no `registry.lock`.
-fn tree_files(root: &std::path::Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
+/// Directories are collected too — `StateDir::ensure` creates an empty root +
+/// `services/` with zero files, so a files-only walk would let exactly that
+/// regression pass the emptiness assertion.
+fn tree_paths(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         // A missing dir simply contributes nothing (its children cannot exist).
@@ -172,14 +176,13 @@ fn tree_files(root: &std::path::Path) -> Vec<PathBuf> {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
-                    stack.push(path);
-                } else {
-                    files.push(path);
+                    stack.push(path.clone());
                 }
+                paths.push(path);
             }
         }
     }
-    files
+    paths
 }
 
 /// The current UTC time as an RFC 3339 `YYYY-MM-DDTHH:MM:SSZ` timestamp.
@@ -416,9 +419,9 @@ fn proxy_dead_upstream_fails_friendly_and_leaves_no_state() {
 
     // Zero state: no registry entry, no services/ dir, no lock file.
     assert!(
-        tree_files(dir.path()).is_empty(),
+        tree_paths(dir.path()).is_empty(),
         "a failed proxy start must leave no state, found: {:?}",
-        tree_files(dir.path())
+        tree_paths(dir.path())
     );
 
     // And the registry still reads as empty afterwards.
@@ -475,9 +478,9 @@ fn proxy_rejects_missing_and_invalid_ports_with_usage_errors() {
         );
     }
     assert!(
-        tree_files(dir.path()).is_empty(),
+        tree_paths(dir.path()).is_empty(),
         "usage errors must leave no state, found: {:?}",
-        tree_files(dir.path())
+        tree_paths(dir.path())
     );
 }
 
