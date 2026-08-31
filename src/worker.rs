@@ -79,10 +79,6 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
     let server_log = state.server_log(&name);
     let tunnel_log = state.tunnel_log(&name);
 
-    init_tracing(&worker_log, &server_log);
-
-    tracing::info!("worker starting: id={id} name={name:?} port={port}");
-
     // Kind-agnostic port guard. A `Static` worker would otherwise bind a
     // kernel-assigned port that mismatches the one the parent reserved and
     // advertised; a `Proxy` worker's port IS the operator's upstream, where 0
@@ -121,6 +117,20 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
         });
         anyhow::bail!("registry entry for service id={id} vanished before start");
     };
+
+    // Tracing setup sits AFTER the kind read rather than at the top of `run`:
+    // the server.log sink exists to receive tower_http request traces, which
+    // only a Static worker (the one that runs the static server) can ever
+    // emit — opening it for a Proxy worker would create a permanently empty
+    // file. Nothing is lost by the later init: the only pre-kind exits (the
+    // port guard and the entry wait) fail via `?`/bail to stderr, which the
+    // spawning parent already redirects into worker.log.
+    init_tracing(
+        &worker_log,
+        (kind == ServiceKind::Static).then_some(server_log.as_path()),
+    );
+
+    tracing::info!("worker starting: id={id} name={name:?} port={port}");
 
     // SEC-1 / ARCH-05 / CLI-1 (Static only): re-run the START flow's directory
     // safety checks here, inside the detached worker, *before* we bind a public
@@ -533,10 +543,11 @@ fn publish_url(ctx: &ReaderCtx, url: String) -> Result<()> {
     })
 }
 
-/// Initialise `tracing`: tower_http request traces go to `server.log`, while
-/// worker/ft traces go to `worker.log`. Fire-once; a no-op if a subscriber is
-/// already installed.
-fn init_tracing(worker_log: &Path, server_log: &Path) {
+/// Initialise `tracing`: tower_http request traces go to `server.log` — when
+/// the caller passes one; only a Static worker has a server to trace, so a
+/// Proxy worker passes `None` and no file is created — while worker/ft traces
+/// go to `worker.log`. Fire-once; a no-op if a subscriber is already installed.
+fn init_tracing(worker_log: &Path, server_log: Option<&Path>) {
     use std::sync::Mutex;
     use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -552,8 +563,8 @@ fn init_tracing(worker_log: &Path, server_log: &Path) {
     // grow it without bound on a busy tunnel. `info` keeps the per-request span
     // without the per-event flood; raise the level via `RUST_LOG=tower_http=trace`
     // when debugging a specific request.
-    let server_layer = crate::fsutil::open_private_append(server_log)
-        .ok()
+    let server_layer = server_log
+        .and_then(|path| crate::fsutil::open_private_append(path).ok())
         .map(|f| {
             fmt::layer()
                 .with_writer(Mutex::new(f))
