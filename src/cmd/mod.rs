@@ -10,6 +10,7 @@ pub mod kill;
 pub mod list;
 pub mod logs;
 pub mod open;
+pub mod proxy;
 pub mod prune;
 pub mod start;
 
@@ -31,6 +32,11 @@ pub async fn run(cli: Cli) -> Result<()> {
         Some(Command::Logs { target, follow }) => logs::run(target, follow).await,
         Some(Command::Open { target }) => open::run(target).await,
         Some(Command::Prune) => prune::run().await,
+        Some(Command::Proxy {
+            port,
+            name,
+            foreground,
+        }) => proxy::run(port, name, foreground).await,
         Some(Command::RunWorker {
             id,
             name,

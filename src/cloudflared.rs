@@ -8,7 +8,14 @@
 use crate::error::Result;
 use anyhow::{Context, bail};
 use std::path::PathBuf;
+#[cfg(unix)]
+use std::time::Duration;
 use tokio::process::{Child, Command};
+
+/// Grace window after SIGTERM before SIGKILL'ing cloudflared (Unix only; the
+/// Windows teardown force-kills the owned child).
+#[cfg(unix)]
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 /// The exact message shown when `cloudflared` cannot be found on `PATH`.
 const MISSING_MESSAGE: &str = "\
@@ -128,6 +135,49 @@ pub fn spawn(port: u16, _tunnel_log: PathBuf) -> Result<Child> {
         .spawn()
         .context("failed to spawn cloudflared tunnel process")?;
     Ok(child)
+}
+
+/// Shut down a `cloudflared` child this process owns, then reap it to avoid a
+/// transient zombie.
+///
+/// Shared by the detached worker ([`crate::worker`]) and the foreground flow
+/// ([`crate::cmd::start`]), which previously duplicated this sequence. On Unix
+/// we send a graceful SIGTERM (by pid, so it reaches the child even if the
+/// owned handle is not the kill vector on this platform) and escalate to
+/// SIGKILL after [`SHUTDOWN_GRACE`]; on Windows there is no signal/group
+/// teardown, so the owned tokio child is force-killed directly (the worker's
+/// Job Object would also reap it on the worker's own exit). Callers use this
+/// only on paths where cloudflared may still be alive — after `child.wait()`
+/// has already reaped it, there is nothing to do.
+pub async fn shutdown(tunnel_pid: Option<u32>, child: &mut Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = tunnel_pid {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+        }
+        if tokio::time::timeout(SHUTDOWN_GRACE, child.wait())
+            .await
+            .is_err()
+            && let Some(pid) = tunnel_pid
+        {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // No graceful signal path on Windows; force-kill the owned child. The
+        // pid is irrelevant here because the owned handle is the kill vector.
+        let _ = tunnel_pid;
+        let _ = child.start_kill();
+    }
+
+    let _ = child.wait().await; // ensure reaped
 }
 
 #[cfg(test)]

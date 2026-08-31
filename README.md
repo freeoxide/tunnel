@@ -1,10 +1,12 @@
 # Freeoxide Tunnel
 
-Expose a local static directory to the internet through a Cloudflare Quick Tunnel.
+Expose a local static directory — or a local server you already run — to the internet
+through a Cloudflare Quick Tunnel.
 
 Freeoxide Tunnel is a small Rust CLI, shipped as the `ft` binary, that runs a localhost static
 file server and fronts it with an ephemeral `cloudflared` Quick Tunnel — giving you a public
-`*.trycloudflare.com` URL in seconds, with no Cloudflare account or DNS setup required.
+`*.trycloudflare.com` URL in seconds, with no Cloudflare account or DNS setup required. It can
+also skip the static server entirely and front a local port you already serve (`ft proxy`).
 
 ---
 
@@ -80,11 +82,15 @@ ft ./dist
 
 `ft` prints the Quick Tunnel URL and keeps the tunnel running as a detached background worker.
 
+Already running your own server on a port? Skip the static server and attach a tunnel to it
+directly with `ft proxy 3000`.
+
 ## Commands
 
 The default action is START: `ft <dir>` with no subcommand spawns a tunnel for that directory.
 Everything else is an explicit subcommand. `<id|name>` accepts either the numeric registry ID
-or the service name.
+or the service name. If a directory's name collides with a subcommand (e.g. a directory
+literally named `proxy`), prefix it with `./` — `ft ./proxy` — to reach the directory.
 
 | Command | Description |
 | --- | --- |
@@ -100,6 +106,7 @@ or the service name.
 | `ft logs <id\|name> --follow` | Tail the log output (`tail -f` style). |
 | `ft open <id\|name>` | Open the public URL of a service in your default browser. |
 | `ft prune` | Remove stale services whose worker is no longer running. (alias: `gc`) |
+| `ft proxy <port>` | Attach a tunnel to a local server that is already running on `port`. |
 
 ### Flags for START
 
@@ -108,12 +115,24 @@ or the service name.
 - `--foreground` / `-f` — run in the foreground instead of spawning a detached worker.
 - `--yes` / `-y` — answer "yes" to the sensitive-directory confirmation prompt (e.g. when publishing `$HOME` or `/`); non-interactive runs against a sensitive directory must pass this or they refuse to start.
 
+### Flags for PROXY
+
+- `--name <name>` — explicit service name; defaults to `proxy-<port>` (made unique).
+- `--foreground` / `-f` — run in the foreground instead of spawning a detached worker.
+
+These flags belong after the subcommand (`ft proxy 3000 --name api`). A `--name` or
+`-f` placed before it is parsed as the implicit START's top-level flags, which `proxy`
+ignores. There is no `--yes` — no directory is published, so there is nothing to confirm.
+
 ### Examples
 
 ```sh
 ft ./dist                                 # start with an auto-generated name and port
 ft ./dist --name blog --port 3009         # start with a fixed name and port
 ft ./dist --foreground                    # run attached to the current shell
+ft proxy 3000                             # tunnel a local server already running on port 3000
+ft proxy 3000 --name api                  # same, with an explicit service name
+ft proxy 3000 --foreground                # run the proxy tunnel attached to the current shell
 ft ls                                     # list services
 ft ps                                     # same as `ft ls`
 ft detail blog                            # inspect by name
@@ -137,6 +156,16 @@ The worker survives shell exit and runs until you stop it with `ft kill`, which 
 worker's process group so the local server and `cloudflared` are torn down together. Use
 `--foreground` to run the worker attached to your terminal instead.
 
+`ft proxy <port>` is the complementary flow for a server you already run (a dev server on
+3000, an API on 8080): no static file server is started — `cloudflared` points straight at
+`http://127.0.0.1:<port>` — and the service is registered and managed like any other. Before
+anything is created, `ft` checks that something is listening on the port and exits with a
+friendly error if not, since a tunnel fronting a dead port would only serve 502s. If a
+background start is interrupted during the brief window before its worker pid is recorded,
+`ft kill` and `ft prune` leave the fresh entry alone ("still starting") for 60 seconds
+rather than orphan the just-spawned worker; after that the reservation counts as abandoned
+and is cleaned up like any stale entry.
+
 ## State location
 
 All state lives under:
@@ -153,7 +182,8 @@ All state lives under:
 
 The root honors `$XDG_STATE_HOME` (defaulting to `~/.local/state`). Service names are reduced to
 a single safe path segment, so a registry-controlled name can never escape `services/` via `..`
-or separators.
+or separators. A proxy service runs no server of its own, so its directory only ever holds
+`worker.log` and `tunnel.log` — there is no `server.log`.
 
 ## Platform support
 
@@ -173,8 +203,8 @@ or separators.
 
 ## Project status
 
-**MVP** — complete and usable. Functional start/stop/list/logs flow for static directories over
-Cloudflare Quick Tunnels.
+**MVP** — complete and usable. Functional start/stop/list/logs flow for static directories
+and already-running local servers (`ft proxy`) over Cloudflare Quick Tunnels.
 
 > Branded as **Freeoxide Tunnel** · binary `ft` · repo [freeoxide/tunnel](https://github.com/freeoxide/tunnel) · [tunnel.freeoxide.com](https://tunnel.freeoxide.com)
 

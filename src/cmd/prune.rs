@@ -6,9 +6,12 @@
 //! whose recorded worker is gone (it normally dies on its own via
 //! `PR_SET_PDEATHSIG`, but that does not survive a host reboot).
 //!
-//! Entries that are still starting (`worker_pid == 0`) are left alone — we
-//! cannot distinguish "just spawned" from "orphaned mid-start", and the
-//! parent's own fail-fast/timeout already cleans the latter.
+//! Entries that are still starting (`worker_pid == 0` and inside
+//! `model::START_GRACE`) are left alone — the parent may be mid
+//! reserve→spawn→record, and reaping the entry then would orphan the
+//! just-spawned worker. A reservation whose grace has expired (the parent
+//! died mid-start, so the pid will never land) is pruned like any other
+//! stale entry.
 
 use crate::error::Result;
 use crate::model::Registry;
@@ -37,19 +40,28 @@ struct Reconciliation {
 ///   (their `ft` cmdline lacks the `run-worker` token) so a recycled pid
 ///   never reads as a live foreground service (mirrors `kill.rs`).
 ///
-/// `worker_pid == 0` entries are kept (still starting — see module docs). The
+/// An unrecorded `worker_pid == 0` reservation is kept while its
+/// [`crate::model::START_GRACE`] window is open (still starting — see module
+/// docs) and treated as stale once it expires (abandoned mid-start). The
 /// kept set is written back onto `reg.services`; the stale set is dropped.
 fn classify(reg: &mut Registry) -> Reconciliation {
     let mut keep = Vec::new();
     let mut stale_names = Vec::new();
     let mut orphans_to_reap = Vec::new();
     for s in std::mem::take(&mut reg.services) {
-        let is_stale = s.worker_pid != 0
-            && if s.foreground {
+        let is_stale = if s.worker_pid != 0 {
+            if s.foreground {
                 !proc::pid_matches(s.worker_pid, "--foreground")
             } else {
                 !proc::pid_alive(s.worker_pid)
-            };
+            }
+        } else {
+            // Reserved but never recorded. Inside the start grace the parent
+            // may be mid reserve→spawn→record, and pruning the entry then
+            // would orphan the just-spawned worker (M1); once the grace
+            // expires the reservation is abandoned and is pruned.
+            !s.start_in_progress()
+        };
         if is_stale {
             // Best-effort reap of an orphaned cloudflared, gated on a cmdline
             // identity check so a recycled PID is never signalled (mirrors
@@ -104,19 +116,21 @@ mod tests {
     //! Unit tests for the staleness decision logic.
     //!
     //! [`classify`] is pure with respect to signalling, so the per-service
-    //! rules (worker_pid==0 keep, background/cmdline-aware stale, foreground
-    //! identity-checked stale, orphan reap list) can be asserted directly
-    //! against a seeded registry without sending signals.
+    //! rules (pid-0 reservation keep/prune by grace, background/cmdline-aware
+    //! stale, foreground identity-checked stale, orphan reap list) can be
+    //! asserted directly against a seeded registry without sending signals.
 
     use super::*;
     use crate::model::Service;
+    use chrono::TimeDelta;
     use std::path::PathBuf;
 
     fn dummy_service(id: u64, name: &str) -> Service {
         Service {
             id,
             name: name.to_string(),
-            dir: PathBuf::from("/tmp/dir"),
+            kind: crate::model::ServiceKind::Static,
+            dir: Some(PathBuf::from("/tmp/dir")),
             port: 1234,
             local_url: "http://127.0.0.1:1234".to_string(),
             public_url: None,
@@ -138,6 +152,9 @@ mod tests {
 
     #[test]
     fn starting_entry_worker_pid_zero_is_kept() {
+        // A fresh pid-0 reservation (created_at = now) is inside the grace
+        // window: the parent may be mid reserve→spawn→record, so the entry
+        // must survive a prune.
         let mut reg = Registry::default();
         reg.services.push(dummy_service(1, "starting"));
         let rec = classify(&mut reg);
@@ -146,6 +163,23 @@ mod tests {
         // classify writes the kept set back onto reg.services.
         assert_eq!(reg.services.len(), 1);
         assert_eq!(reg.services[0].name, "starting");
+    }
+
+    #[test]
+    fn abandoned_reservation_past_grace_is_pruned() {
+        // A pid-0 entry whose START_GRACE has expired is an abandoned
+        // reservation (the parent died mid-start, so the pid will never
+        // land) — prune it, or it would sit in `ft ls` as "starting" forever.
+        let mut reg = Registry::default();
+        let mut s = dummy_service(1, "leftover");
+        s.created_at = crate::model::now_utc()
+            - (TimeDelta::from_std(crate::model::START_GRACE).expect("grace fits")
+                + TimeDelta::seconds(1));
+        reg.services.push(s);
+        let rec = classify(&mut reg);
+        assert_eq!(rec.stale_names, vec!["leftover".to_string()]);
+        assert!(rec.orphans_to_reap.is_empty());
+        assert!(reg.services.is_empty());
     }
 
     #[test]

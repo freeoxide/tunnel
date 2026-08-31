@@ -6,6 +6,11 @@
 //! registry for the discovered public URL — failing fast if the worker dies
 //! before publishing. With `--foreground` the server and tunnel run in-process
 //! and the command blocks until cloudflared exits or Ctrl+C is received.
+//!
+//! The foreground machinery here is shared with the proxy flow
+//! (`ft proxy <port> --foreground`, see `cmd/proxy.rs`): a `dir` of `None`
+//! selects proxy semantics — no static server, cloudflared points straight at
+//! the operator's upstream port.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,7 +22,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::cloudflared;
 use crate::error::Result;
-use crate::model::{Registry, Service};
+use crate::model::{Registry, Service, ServiceKind};
 use crate::name;
 use crate::output;
 use crate::port;
@@ -53,7 +58,7 @@ pub async fn run(
     confirm_sensitive(&dir, yes)?;
 
     if foreground {
-        run_foreground(&dir, name, port).await
+        run_foreground(Some(dir.as_path()), name, port).await
     } else {
         run_background(&dir, name, port).await
     }
@@ -202,8 +207,15 @@ async fn run_background(dir: &Path, name: Option<String>, port: Option<u16>) -> 
 
     // --- Reserve name + id + entry atomically -----------------------------
     // All under the registry lock: no duplicate names, no duplicate ids, and
-    // the entry exists before the worker is spawned. worker_pid is 0 until the
-    // worker is spawned below.
+    // the entry exists before the worker is spawned. worker_pid is 0 until
+    // the worker is spawned below and its pid recorded in a second locked
+    // write. That reserve→spawn→record window (M1) is why `ft kill` and
+    // `ft prune` refuse to reap a pid-0 entry younger than
+    // `model::START_GRACE`: deleting it mid-window would orphan the
+    // just-spawned worker (pid 0 cannot be signalled, so nothing would tear
+    // it down). Every exit of ours resolves the window quickly — spawn
+    // failure, worker death, and the URL timeout below all remove the entry,
+    // and the worker self-registers its pid if we die first.
     let (id, name) = Registry::update(&state, |reg| -> Result<(u64, String)> {
         let name = match &name {
             Some(n) => {
@@ -218,7 +230,8 @@ async fn run_background(dir: &Path, name: Option<String>, port: Option<u16>) -> 
         reg.services.push(Service {
             id,
             name: name.clone(),
-            dir: dir.to_path_buf(),
+            kind: ServiceKind::Static,
+            dir: Some(dir.to_path_buf()),
             port,
             local_url: format!("http://127.0.0.1:{port}"),
             public_url: None,
@@ -232,7 +245,7 @@ async fn run_background(dir: &Path, name: Option<String>, port: Option<u16>) -> 
     })??;
 
     // --- Spawn worker -----------------------------------------------------
-    let worker_pid = match spawn::spawn_worker(id, &name, dir, port) {
+    let worker_pid = match spawn::spawn_worker(id, &name, Some(dir), port) {
         Ok(pid) => pid,
         Err(e) => {
             // Release the reserved entry on spawn failure.
@@ -417,25 +430,32 @@ impl Drop for EntryGuard {
     }
 }
 
-/// Foreground flow: run the server and tunnel in this process and block until
-/// cloudflared exits, Ctrl-C is received, or (Unix) SIGTERM arrives — SIGTERM
-/// is what `ft kill` uses to stop a foreground tunnel from another terminal.
+/// Foreground flow: run the local origin and tunnel in this process and block
+/// until cloudflared exits, Ctrl-C is received, or (Unix) SIGTERM arrives —
+/// SIGTERM is what `ft kill` uses to stop a foreground tunnel from another
+/// terminal.
 ///
-/// Unlike the background flow, the server + cloudflared live in THIS process,
-/// so the registry entry records `worker_pid` as our own pid and is marked
-/// `foreground: true`. That flag makes `status()` use a plain liveness probe
-/// (our cmdline lacks the `run-worker` token) and makes `ft kill` signal this
-/// single pid rather than its whole process group (which would include the
-/// operator's shell). The entry is removed on every exit path; a hard kill
+/// `dir` selects the origin kind, mirroring the registry invariant (`Static`
+/// services carry a directory, `Proxy` services do not): `Some(dir)` runs ft's
+/// own static server for `dir` (the implicit `ft <dir> --foreground` flow);
+/// `None` runs NO server of our own — cloudflared points straight at the
+/// operator's existing upstream on `port` (the `ft proxy <port> --foreground`
+/// flow). Unlike the background worker, the server + cloudflared live in THIS
+/// process, so the registry entry records `worker_pid` as our own pid and is
+/// marked `foreground: true`. That flag makes `status()` use a plain liveness
+/// probe (our cmdline lacks the `run-worker` token) and makes `ft kill` signal
+/// this single pid rather than its whole process group (which would include
+/// the operator's shell). The entry is removed on every exit path; a hard kill
 /// (SIGKILL/crash) leaves it stale for `ft prune` to reap.
-async fn run_foreground(dir: &Path, name: Option<String>, port: Option<u16>) -> Result<()> {
+pub(crate) async fn run_foreground(
+    dir: Option<&Path>,
+    name: Option<String>,
+    port: Option<u16>,
+) -> Result<()> {
     use crate::static_server;
     use std::time::Duration;
     use tokio::sync::Mutex;
 
-    /// Grace window after SIGTERM before SIGKILL'ing cloudflared (Unix only).
-    #[cfg(unix)]
-    const CLOUDFLARED_GRACE: Duration = Duration::from_secs(2);
     /// Upper bound on draining in-flight requests on Ctrl-C before we abort the
     /// server task, so a stuck request can't hang the foreground command.
     const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -443,22 +463,40 @@ async fn run_foreground(dir: &Path, name: Option<String>, port: Option<u16>) -> 
     let state = StateDir::new()?;
     state.ensure()?;
 
-    let port = match port {
-        Some(p) => {
-            ensure!(
-                p != 0,
-                "port 0 is reserved; pass an explicit port (1-65535) or omit --port"
-            );
-            ensure!(port::is_port_free(p), "port {p} is already in use");
-            p
-        }
-        None => port::allocate_free_port()?,
+    // Port policy is kind-dependent. Static: ft binds its own server, so an
+    // omitted port is allocated and an explicit one must be free. Proxy: the
+    // port is the operator's upstream — required, never probed for freeness
+    // (it is *supposed* to be in use), and deliberately not probed for
+    // liveness either: cloudflared connects lazily, and a friendly upstream
+    // pre-flight belongs to the CLI layer, not the run path.
+    let port = match dir {
+        Some(_) => match port {
+            Some(p) => {
+                ensure!(
+                    p != 0,
+                    "port 0 is reserved; pass an explicit port (1-65535) or omit --port"
+                );
+                ensure!(port::is_port_free(p), "port {p} is already in use");
+                p
+            }
+            None => port::allocate_free_port()?,
+        },
+        None => match port {
+            Some(p) => {
+                ensure!(
+                    p != 0,
+                    "port 0 is reserved; pass the upstream port (1-65535)"
+                );
+                p
+            }
+            None => bail!("a proxy service needs the upstream port to front"),
+        },
     };
 
     cloudflared::ensure_installed()?;
 
     // --- Reserve a registry entry (cross-platform) -------------------------
-    // Mirrors `run_background_impl`'s reservation, but marks this as a FOREGROUND
+    // Mirrors `run_background`'s reservation, but marks this as a FOREGROUND
     // service whose worker_pid is THIS process. That makes `ft ls/detail/logs/
     // open` see the foreground tunnel on every platform — notably Windows, where
     // foreground is the only mode.
@@ -469,14 +507,28 @@ async fn run_foreground(dir: &Path, name: Option<String>, port: Option<u16>) -> 
                 ensure!(!reg.name_exists(n), "a service named '{n}' already exists");
                 n.clone()
             }
-            None => name::unique_name(reg, &name::generate_name(dir)),
+            None => {
+                // Static services derive the name from the directory's
+                // basename; a proxy has no directory, so derive it from the
+                // upstream port it fronts.
+                let base = match dir {
+                    Some(d) => name::generate_name(d),
+                    None => format!("proxy-{port}"),
+                };
+                name::unique_name(reg, &base)
+            }
         };
         let service_dir = state.ensure_service_dir(&name)?;
         let id = reg.allocate_id();
         reg.services.push(Service {
             id,
             name: name.clone(),
-            dir: dir.to_path_buf(),
+            kind: if dir.is_some() {
+                ServiceKind::Static
+            } else {
+                ServiceKind::Proxy
+            },
+            dir: dir.map(|d| d.to_path_buf()),
             port,
             local_url: format!("http://127.0.0.1:{port}"),
             public_url: None,
@@ -515,22 +567,29 @@ async fn run_foreground(dir: &Path, name: Option<String>, port: Option<u16>) -> 
     let mut sig_term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("installing SIGTERM handler")?;
 
-    let router = static_server::router(dir.to_path_buf());
-    // `serve` installs its own Ctrl-C handler for graceful shutdown: on Ctrl-C
-    // it stops accepting and drains in-flight requests. We keep the JoinHandle
-    // so we can bound that drain below.
-    let mut server_handle = tokio::spawn(async move {
-        if let Err(e) = static_server::serve(router, port).await {
-            tracing::error!(%e, "static server exited with error");
-        }
+    // Static only: build and run ft's own server. A proxy foreground runs no
+    // server at all — `server_handle` stays `None` below and the drain at the
+    // end is skipped.
+    let mut server_handle = dir.map(|dir| {
+        let router = static_server::router(dir.to_path_buf());
+        // `serve` installs its own Ctrl-C handler for graceful shutdown: on
+        // Ctrl-C it stops accepting and drains in-flight requests. We keep the
+        // JoinHandle so we can bound that drain below.
+        tokio::spawn(async move {
+            if let Err(e) = static_server::serve(router, port).await {
+                tracing::error!(%e, "static server exited with error");
+            }
+        })
     });
 
     let mut child = match cloudflared::spawn(port, PathBuf::new()) {
         Ok(c) => c,
         Err(e) => {
-            // Abort the just-spawned server task; the entry is released by the
-            // guard on return.
-            server_handle.abort();
+            // Abort the just-spawned server task (if any); the entry is
+            // released by the guard on return.
+            if let Some(server) = server_handle.as_mut() {
+                server.abort();
+            }
             return Err(e);
         }
     };
@@ -604,33 +663,10 @@ async fn run_foreground(dir: &Path, name: Option<String>, port: Option<u16>) -> 
 
     // If cloudflared may still be alive, shut it down and reap it to avoid a
     // transient zombie. On ChildExited the select's wait() already reaped it.
+    // The signal/escalation/reap sequence is shared with the detached worker
+    // via [`cloudflared::shutdown`].
     if matches!(exit_reason, ReaderExit::Signal) {
-        #[cfg(unix)]
-        {
-            if let Some(pid) = tunnel_pid {
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(pid as i32),
-                    nix::sys::signal::Signal::SIGTERM,
-                );
-            }
-            if tokio::time::timeout(CLOUDFLARED_GRACE, child.wait())
-                .await
-                .is_err()
-                && let Some(pid) = tunnel_pid
-            {
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(pid as i32),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            // No graceful signal path on Windows; force-kill the owned child.
-            let _ = tunnel_pid;
-            let _ = child.start_kill();
-        }
-        let _ = child.wait().await; // ensure reaped
+        cloudflared::shutdown(tunnel_pid, &mut child).await;
     }
 
     for task in tasks {
@@ -640,15 +676,19 @@ async fn run_foreground(dir: &Path, name: Option<String>, port: Option<u16>) -> 
     // `serve`'s own Ctrl-C handler has already begun draining on Ctrl-C; bound
     // it so a stuck request can't hang the foreground command, falling back to
     // abort. (On cloudflared-initiated exit, serve is still running until we
-    // abort/await it here.)
-    match tokio::time::timeout(SERVER_SHUTDOWN_TIMEOUT, &mut server_handle).await {
-        Ok(_) => {}
-        Err(_) => {
-            tracing::warn!(
-                "static server did not drain within {:?}, aborting",
-                SERVER_SHUTDOWN_TIMEOUT
-            );
-            server_handle.abort();
+    // abort/await it here.) A proxy foreground runs no server, so there is
+    // nothing to drain.
+    if let Some(server) = server_handle.as_mut() {
+        // Reborrow so the handle stays usable in the abort fallback below.
+        match tokio::time::timeout(SERVER_SHUTDOWN_TIMEOUT, &mut *server).await {
+            Ok(_) => {}
+            Err(_) => {
+                tracing::warn!(
+                    "static server did not drain within {:?}, aborting",
+                    SERVER_SHUTDOWN_TIMEOUT
+                );
+                server.abort();
+            }
         }
     }
 
@@ -714,7 +754,7 @@ async fn drain_and_announce<R>(
 #[cfg(test)]
 mod tests {
     use super::{EntryGuard, is_sensitive_dir};
-    use crate::model::{Registry, Service};
+    use crate::model::{Registry, Service, ServiceKind};
     use crate::state::StateDir;
     #[cfg(unix)]
     use std::path::Path;
@@ -770,7 +810,8 @@ mod tests {
             reg.services.push(Service {
                 id,
                 name: format!("svc-{id}"),
-                dir: PathBuf::from("/tmp"),
+                kind: ServiceKind::Static,
+                dir: Some(PathBuf::from("/tmp")),
                 port: 8000,
                 local_url: "http://127.0.0.1:8000".to_string(),
                 public_url: None,

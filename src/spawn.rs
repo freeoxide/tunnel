@@ -1,11 +1,11 @@
 //! Detached worker process spawning.
 //!
-//! The background START flow does not run the worker in-process; instead it
-//! re-invokes the current binary as `ft run-worker ...` in a new session so
-//! that the worker (and its `cloudflared` child) survive the parent `ft`
-//! process exiting. The worker's stdout/stderr are redirected to its
-//! `worker.log` so the parent can return immediately and the user can inspect
-//! output later via `ft logs`.
+//! The background start flows (static `ft <dir>` and proxy `ft proxy <port>`)
+//! do not run the worker in-process; instead they re-invoke the current binary
+//! as `ft run-worker ...` in a new session so that the worker (and its
+//! `cloudflared` child) survive the parent `ft` process exiting. The worker's
+//! stdout/stderr are redirected to its `worker.log` so the parent can return
+//! immediately and the user can inspect output later via `ft logs`.
 //!
 //! Spawning follows the standard Unix detach pattern via `process_group(0)`
 //! plus a `setsid()` `pre_exec`: the child becomes its own session leader and
@@ -33,16 +33,49 @@ fn worker_token() -> String {
     format!("{mixed:016x}")
 }
 
+/// Stand-in value for the mandatory `--dir` flag when spawning a PROXY worker.
+///
+/// clap rejects empty flag values (`--dir ""` fails to parse), so a proxy
+/// worker — which has no directory — passes this deliberately non-existent
+/// path instead. The worker never reads it for proxy services (their spec
+/// comes from the reserved registry entry; see [`crate::worker::run`]), and
+/// even a hand-crafted direct invocation against a mis-tagged `Static`
+/// registry entry fails closed on it: `resolve_dir` refuses the non-existent
+/// path and `is_sensitive_dir` fail-closes on the un-resolvable one.
+pub(crate) const PROXY_DIR_SENTINEL: &str = "/ft-proxy-has-no-directory";
+
+/// The `run-worker` argv prefix shared by the Unix and Windows spawn paths:
+/// the `--dir` value is the served directory, or [`PROXY_DIR_SENTINEL`] for a
+/// proxy worker.
+fn run_worker_args(id: u64, name: &str, dir: Option<&Path>, port: u16) -> Vec<String> {
+    let dir_arg = dir
+        .map(|d| d.to_string_lossy().into_owned())
+        .unwrap_or_else(|| PROXY_DIR_SENTINEL.to_string());
+    vec![
+        "run-worker".to_string(),
+        "--id".to_string(),
+        id.to_string(),
+        "--name".to_string(),
+        name.to_string(),
+        "--dir".to_string(),
+        dir_arg,
+        "--port".to_string(),
+        port.to_string(),
+    ]
+}
+
 /// Spawn the detached `run-worker` child for a service and return its pid.
 ///
-/// The child is given a fresh process group and session, its stdin is wired to
-/// `/dev/null`, and its stdout + stderr are both pointed at the service's
-/// `worker.log` (opened in append mode so restarts accumulate rather than
-/// clobber). The child is intentionally *not* awaited and `kill_on_drop` is
-/// left disabled so it keeps running after this function returns and after the
-/// parent process exits.
+/// `dir: None` spawns a PROXY worker (the service fronts an upstream the
+/// operator already runs on `port`, and the worker starts no server of its
+/// own); `dir: Some(_)` spawns the usual STATIC worker. The child is given a
+/// fresh process group and session, its stdin is wired to `/dev/null`, and its
+/// stdout + stderr are both pointed at the service's `worker.log` (opened in
+/// append mode so restarts accumulate rather than clobber). The child is
+/// intentionally *not* awaited and `kill_on_drop` is left disabled so it keeps
+/// running after this function returns and after the parent process exits.
 #[cfg(unix)]
-pub fn spawn_worker(id: u64, name: &str, dir: &Path, port: u16) -> Result<u32> {
+pub fn spawn_worker(id: u64, name: &str, dir: Option<&Path>, port: u16) -> Result<u32> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -64,21 +97,11 @@ pub fn spawn_worker(id: u64, name: &str, dir: &Path, port: u16) -> Result<u32> {
 
     let token = worker_token();
     let mut cmd = Command::new(exe);
-    cmd.args([
-        "run-worker",
-        "--id",
-        &id.to_string(),
-        "--name",
-        name,
-        "--dir",
-        &dir.to_string_lossy(),
-        "--port",
-        &port.to_string(),
-    ])
-    .env("FT_WORKER_TOKEN", &token)
-    .stdin(Stdio::null())
-    .stdout(Stdio::from(stdout_file))
-    .stderr(Stdio::from(stderr_file));
+    cmd.args(run_worker_args(id, name, dir, port))
+        .env("FT_WORKER_TOKEN", &token)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file));
 
     // New session via setsid(): the child becomes a session leader AND the
     // leader of a fresh process group whose id equals its pid — so a later
@@ -116,9 +139,9 @@ pub fn spawn_worker(id: u64, name: &str, dir: &Path, port: u16) -> Result<u32> {
 /// are pointed at the service's `worker.log` (append, mode-inherited). The
 /// worker assigns itself to a Job Object (see [`crate::worker::run`]), so
 /// `kill`-the-worker cascades to cloudflared and a hard-killed worker still
-/// reaps its tree.
+/// reaps its tree. `dir: None` spawns a proxy worker (see the Unix variant).
 #[cfg(windows)]
-pub fn spawn_worker(id: u64, name: &str, dir: &Path, port: u16) -> Result<u32> {
+pub fn spawn_worker(id: u64, name: &str, dir: Option<&Path>, port: u16) -> Result<u32> {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -142,22 +165,12 @@ pub fn spawn_worker(id: u64, name: &str, dir: &Path, port: u16) -> Result<u32> {
 
     let token = worker_token();
     let mut cmd = Command::new(exe);
-    cmd.args([
-        "run-worker",
-        "--id",
-        &id.to_string(),
-        "--name",
-        name,
-        "--dir",
-        &dir.to_string_lossy(),
-        "--port",
-        &port.to_string(),
-    ])
-    .env("FT_WORKER_TOKEN", &token)
-    .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS)
-    .stdin(Stdio::null())
-    .stdout(Stdio::from(stdout_file))
-    .stderr(Stdio::from(stderr_file));
+    cmd.args(run_worker_args(id, name, dir, port))
+        .env("FT_WORKER_TOKEN", &token)
+        .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file));
 
     let pid = cmd
         .spawn()
@@ -166,4 +179,53 @@ pub fn spawn_worker(id: u64, name: &str, dir: &Path, port: u16) -> Result<u32> {
     // The std::process::Child handle drops here without `kill_on_drop`, so the
     // detached worker keeps running; only its pid is recorded in the registry.
     Ok(pid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PROXY_DIR_SENTINEL, run_worker_args};
+    use std::path::Path;
+
+    #[test]
+    fn static_worker_passes_the_real_directory() {
+        let args = run_worker_args(7, "blog", Some(Path::new("/srv/blog")), 8000);
+        assert_eq!(
+            args,
+            vec![
+                "run-worker",
+                "--id",
+                "7",
+                "--name",
+                "blog",
+                "--dir",
+                "/srv/blog",
+                "--port",
+                "8000",
+            ]
+        );
+    }
+
+    #[test]
+    fn proxy_worker_passes_the_sentinel_directory() {
+        // A proxy worker has no directory: the mandatory `--dir` flag carries
+        // the sentinel, and the worker takes its real spec from the registry.
+        let args = run_worker_args(9, "api", None, 3000);
+        assert_eq!(
+            args,
+            vec![
+                "run-worker",
+                "--id",
+                "9",
+                "--name",
+                "api",
+                "--dir",
+                PROXY_DIR_SENTINEL,
+                "--port",
+                "3000",
+            ]
+        );
+        // The sentinel must never name an existing path: a mis-tagged Static
+        // worker has to fail closed on it, not serve some real directory.
+        assert!(!std::path::Path::new(PROXY_DIR_SENTINEL).exists());
+    }
 }

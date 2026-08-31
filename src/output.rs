@@ -4,7 +4,7 @@
 //! Output shapes are fixed by the CLI's public contract — see the `OUTPUT
 //! FORMATS` notes in the module docs of the command layer.
 
-use crate::model::Service;
+use crate::model::{Service, ServiceKind};
 use chrono::{Datelike, Timelike};
 use comfy_table::{ContentArrangement, Table};
 
@@ -54,7 +54,10 @@ pub fn print_started(service: &Service) {
 /// Print the service list as a table, or `(no services)` when empty.
 ///
 /// Columns: `ID NAME STATUS PORT URL`. Status comes from `Service::status`;
-/// URL is the public URL or `(pending)`.
+/// URL is the public URL or `(pending)`. Proxy services render through the
+/// same columns unchanged: their `PORT` is the upstream port they front, and
+/// the kind is visible in `ft detail`'s `Mode:` row — adding a kind column
+/// here would perturb the static table, which is a fixed output contract.
 pub fn print_list(services: &[Service]) {
     if services.is_empty() {
         println!("(no services)");
@@ -82,7 +85,14 @@ pub fn print_list(services: &[Service]) {
 }
 
 /// Print a key/value detail block for a single service, including a Logs
-/// section listing the worker, server, and tunnel log paths.
+/// section listing the service's log paths.
+///
+/// The `Mode`/`Directory` rows are kind-aware: a Static service keeps the
+/// historical shape exactly (mode = foreground/background, plus the served
+/// `Directory:`), while a Proxy service renders its kind in the `Mode:` row
+/// and replaces `Directory:` with the `Upstream:` it fronts (the proxy's
+/// `local_url` IS the operator's server). A proxy also runs no static server,
+/// so its Logs section lists no `server.log` (the worker never creates one).
 pub fn print_detail(service: &Service) {
     let tunnel_pid = service
         .tunnel_pid
@@ -92,15 +102,26 @@ pub fn print_detail(service: &Service) {
     println!("Name:         {}", service.name);
     println!("ID:           {}", service.id);
     println!("Status:       {}", service.status().as_str());
-    println!(
-        "Mode:         {}",
-        if service.foreground {
-            "foreground"
-        } else {
-            "background"
-        }
-    );
-    println!("Directory:    {}", service.dir.display());
+    if service.kind == ServiceKind::Proxy {
+        println!("Mode:         {}", service.kind.as_str());
+        println!("Upstream:     {}", service.local_url);
+    } else {
+        println!(
+            "Mode:         {}",
+            if service.foreground {
+                "foreground"
+            } else {
+                "background"
+            }
+        );
+        println!(
+            "Directory:    {}",
+            service
+                .dir
+                .as_deref()
+                .map_or_else(|| "-".to_string(), |d| d.display().to_string())
+        );
+    }
     println!("Port:         {}", service.port);
     println!("Worker PID:   {}", service.worker_pid);
     println!("Tunnel PID:   {tunnel_pid}");
@@ -110,7 +131,10 @@ pub fn print_detail(service: &Service) {
     println!();
     println!("Logs:");
     println!("  {}", service.state_dir.join("worker.log").display());
-    println!("  {}", service.state_dir.join("server.log").display());
+    if service.kind != ServiceKind::Proxy {
+        // Only a Static worker runs (and traces requests into) a server.
+        println!("  {}", service.state_dir.join("server.log").display());
+    }
     println!("  {}", service.state_dir.join("tunnel.log").display());
 }
 
