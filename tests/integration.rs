@@ -34,13 +34,15 @@
 //! foreground liveness is prune's PID-reuse-safe `--foreground` cmdline
 //! probe (NOT `Service::status`'s plain existence check), so a "running"
 //! foreground entry needs a worker whose cmdline actually carries the token
-//! — a decoy `sh -c 'sleep 30' --foreground` child (sanitize never signals
-//! a foreground worker, so the decoy is safe). Its origin port is either
-//! really bound or freshly dead, plus the seeded stale / reservation bodies
-//! prune uses. A live BACKGROUND zombie (which sanitize would tear down
-//! with real group signals) needs a real `run-worker` process, so that arm
-//! is not black-box drivable and stays covered by the pure decision table's
-//! unit tests in `cmd/sanitize.rs`.
+//! — a decoy `sh -c 'while :; do sleep 30; done' --foreground` child
+//! (sanitize never signals a foreground worker, so the decoy is safe; the
+//! loop form keeps the token in the shell's argv — see
+//! `spawn_foreground_worker`).
+//! Its origin port is either really bound or freshly dead, plus the seeded
+//! stale / reservation bodies prune uses. A live BACKGROUND zombie (which
+//! sanitize would tear down with real group signals) needs a real
+//! `run-worker` process, so that arm is not black-box drivable and stays
+//! covered by the pure decision table's unit tests in `cmd/sanitize.rs`.
 
 #![cfg(unix)] // proc::pid_alive uses a Unix-only cmdline identity probe.
 
@@ -166,9 +168,77 @@ fn foreground_proxy_json(pid: u32, port: u16) -> String {
     )
 }
 
+/// A decoy "foreground worker" owned by the test that spawned it: dropping
+/// the guard kills and reaps the shell, so a panic between spawn and the
+/// test's cleanup point cannot leak the decoy — the endless loop would
+/// otherwise outlive the test for the machine's remaining uptime. Killing
+/// the shell does not reach its children, so the in-flight `sleep 30` can
+/// orphan for up to 30 s more before its own timer expires: bounded, and
+/// documented rather than hidden.
+struct DecoyWorker {
+    child: std::process::Child,
+}
+
+impl DecoyWorker {
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Drop for DecoyWorker {
+    fn drop(&mut self) {
+        // Best-effort: both calls fail harmlessly on an already-dead child,
+        // and wait() reaps it so the pid cannot linger as a zombie.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Block until the decoy's command line — as `ps` prints it — carries the
+/// `--foreground` token the binary's identity probe gates on.
+///
+/// A readiness barrier, not paranoia: the cmdline surfaces the probe reads
+/// (`/proc/<pid>/cmdline` on Linux, KERN_PROCARGS2 on macOS) can lag the
+/// fork, and losing that race makes the probe CORRECTLY read the decoy as
+/// stale — surfacing as a baffling assertion failure deep inside `ft
+/// sanitize`'s output instead of an error at the spawn site. Polling here
+/// turns any such platform quirk into a clear setup error, and the timeout
+/// panic reports the LAST observation — ps's output, or the error of a ps
+/// that could not run — keeping "token absent" distinct from "ps
+/// unavailable".
+fn wait_for_foreground_token(pid: u32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // The last poll's observation — the ps output when it ran, the error
+    // when it did not — so the timeout panic cannot conflate the two.
+    let mut last_seen = String::from("`ps` has not completed a poll yet");
+    while std::time::Instant::now() < deadline {
+        // `ps -o command= -p PID` prints the full argv on Linux and macOS
+        // alike — a black-box view of the same cmdline the probe reads.
+        let poll = Command::new("ps")
+            .arg("-o")
+            .arg("command=")
+            .arg("-p")
+            .arg(pid.to_string())
+            .output();
+        match poll {
+            Ok(out) => {
+                let command = String::from_utf8_lossy(&out.stdout).into_owned();
+                if command.contains("--foreground") {
+                    return;
+                }
+                last_seen = format!("`ps` reports {command:?}");
+            }
+            Err(e) => last_seen = format!("`ps` itself failed to run: {e}"),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("decoy never became probe-ready for pid {pid}: {last_seen}");
+}
+
 /// Spawn a decoy "foreground worker": a live process whose cmdline contains
 /// `--foreground` — the exact identity sanitize's foreground liveness probe
-/// gates on — staying alive until killed or timed out.
+/// gates on — staying alive until killed, which the returned [`DecoyWorker`]
+/// guard does on drop.
 ///
 /// A real foreground worker is an `ft <dir> --foreground` process, which
 /// needs `cloudflared` and the network, so the black-box tests drive just
@@ -177,14 +247,43 @@ fn foreground_proxy_json(pid: u32, port: u16) -> String {
 /// KERN_PROCARGS2) happily report it. Sanitize never signals a foreground
 /// worker — it only reports it — so the decoy cannot become collateral
 /// damage of the very rule it stands in for.
-fn spawn_foreground_worker() -> std::process::Child {
-    Command::new("sh")
-        .arg("-c")
-        .arg("sleep 30")
-        // Becomes the shell's $0 and a cmdline token for the identity probe.
-        .arg("--foreground")
-        .spawn()
-        .expect("spawning decoy foreground worker")
+///
+/// The `-c` body is deliberately an endless sleep LOOP (`while :; do
+/// sleep 30; done`), not the simple command — or `;`-separated list — a
+/// tidy-minded pass would reduce it to: several shells silently REPLACE
+/// their own process image with a final external command, taking the token
+/// with them. bash (macOS's /bin/sh) does it for a lone `-c` simple
+/// command — the macOS CI flake: argv collapsed to bare `sleep 30` and the
+/// probe correctly read the entry stale — and busybox ash demonstrably
+/// tail-execs the LAST command of a top-level `;` list as well (the same
+/// EV_EXIT/shellexec tail-exec runs throughout the dash/ash/ksh lineage;
+/// Debian dash 0.5.12 happens to fork instead, but one build's behaviour
+/// is not a portable guarantee). A loop body is never in tail position on
+/// any of them — the shell must return to run the next iteration — so the
+/// token stays in the shell's argv for its whole life, and the loop also
+/// never ends: the [`DecoyWorker`] guard's Drop is the decoy's only exit.
+/// The post-spawn [`wait_for_foreground_token`] poll then guarantees the
+/// token is visible before the caller seeds state, so the decoy's identity
+/// is a checked fact rather than a hope.
+fn spawn_foreground_worker() -> DecoyWorker {
+    // The guard is built BEFORE the readiness barrier runs: if the barrier
+    // panics, unwinding drops the guard and reaps the decoy — a bare
+    // `std::process::Child`'s Drop is a no-op and would leak the endless
+    // loop for the machine's remaining uptime.
+    let worker = DecoyWorker {
+        child: Command::new("sh")
+            .arg("-c")
+            // An endless loop on purpose — see the doc comment above before
+            // simplifying.
+            .arg("while :; do sleep 30; done")
+            // Becomes the shell's $0 and a cmdline token for the identity
+            // probe.
+            .arg("--foreground")
+            .spawn()
+            .expect("spawning decoy foreground worker"),
+    };
+    wait_for_foreground_token(worker.pid());
+    worker
 }
 
 /// Seed `registry.json` under `xdg_root` with one service and return its path.
@@ -938,18 +1037,17 @@ fn sanitize_keeps_a_healthy_live_service() {
     // the entry must survive, the report must say there was nothing to do,
     // and the command exits 0.
     let dir = TempDir::new().unwrap();
-    let mut worker = spawn_foreground_worker();
+    let worker = spawn_foreground_worker();
     let listener =
         TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral loopback listener");
     let port = listener.local_addr().expect("local addr").port();
-    seed_registry(dir.path(), &foreground_proxy_json(worker.id(), port));
+    seed_registry(dir.path(), &foreground_proxy_json(worker.pid(), port));
 
     let (ok, out) = run_ft(dir.path(), &["sanitize"]);
     // The listener (and worker) must outlive the run: the probes happen
-    // inside it.
+    // inside it. Dropping the DecoyWorker guard kills and reaps the decoy.
     drop(listener);
-    let _ = worker.kill();
-    let _ = worker.wait();
+    drop(worker);
 
     assert!(ok, "`ft sanitize` on a healthy registry failed: {out}");
     assert!(
@@ -978,13 +1076,13 @@ fn sanitize_reports_but_never_removes_a_foreground_zombie() {
     // needs a real run-worker process; the pure decision table in
     // cmd/sanitize.rs covers that arm instead.)
     let dir = TempDir::new().unwrap();
-    let mut worker = spawn_foreground_worker();
+    let worker = spawn_foreground_worker();
     let port = dead_loopback_port();
-    seed_registry(dir.path(), &foreground_proxy_json(worker.id(), port));
+    seed_registry(dir.path(), &foreground_proxy_json(worker.pid(), port));
 
     let (ok, out) = run_ft(dir.path(), &["sanitize"]);
-    let _ = worker.kill();
-    let _ = worker.wait();
+    // The decoy only needs to outlive the run itself; the guard reaps it.
+    drop(worker);
 
     assert!(ok, "a skipped foreground zombie is not a failure: {out}");
     assert!(
