@@ -3,7 +3,8 @@
 //! Uses clap derive. `ft` with no subcommand is treated as the implicit START
 //! command against a positional directory: `ft ./site` starts a tunnel for
 //! `./site`. All other invocations are explicit subcommands (`ls`, `detail`,
-//! `kill`, `logs`, `open`, `prune`, `proxy`, and the hidden `run-worker`).
+//! `doctor`, `kill`, `logs`, `open`, `prune`, `proxy`, `sanitize`, and the
+//! hidden `run-worker`).
 
 use std::path::PathBuf;
 
@@ -62,6 +63,19 @@ pub enum Command {
         target: String,
     },
 
+    /// Diagnose tunnel health and report problems with actionable hints.
+    ///
+    /// Checks that `cloudflared` is on `PATH`, that every registered
+    /// service's worker is still alive, and — the motivating case — that a
+    /// live worker's local origin still accepts connections: a proxy whose
+    /// upstream port went away serves 502s through an otherwise healthy
+    /// tunnel, and nothing in `ft ls` shows it. Strictly read-only: no
+    /// registry mutation, no signalling, no spawning; remediations are
+    /// printed as hints (`ft kill <name>`, `ft sanitize`, …), never executed.
+    /// Takes no arguments and exits 0 whenever it ran at all — findings are
+    /// information, not command failures.
+    Doctor,
+
     /// Stop a running service and remove it from the registry.
     #[command(alias = "stop")]
     Kill {
@@ -110,6 +124,22 @@ pub enum Command {
         #[arg(long, short)]
         foreground: bool,
     },
+
+    /// Remove every dangling service — stale entries AND live tunnels whose
+    /// local origin port is dead.
+    ///
+    /// Covers everything `ft prune` does (entries whose worker died,
+    /// abandoned start reservations, best-effort reaping of orphaned
+    /// `cloudflared`) plus the zombie prune cannot see: an `ft proxy`
+    /// service whose worker and tunnel are happily up while the upstream
+    /// server behind them died — the tunnel 502s every request while `ft ls`
+    /// shows a healthy service. Origin ports are double-probed (~750 ms
+    /// apart) so a dev server that is mid-restart is not reaped. Foreground
+    /// services are never killed: an upstream-dead foreground service is
+    /// reported as left alone instead (stop it with Ctrl-C in its own
+    /// terminal). Takes no arguments and exits 0 whenever it ran.
+    #[command(alias = "clean")]
+    Sanitize,
 
     /// Internal: detached worker process spawned by START.
     #[command(hide = true)]
@@ -197,6 +227,53 @@ mod tests {
             parse(&["proxy", "http"]).is_err(),
             "non-numeric ports must be rejected"
         );
+    }
+
+    #[test]
+    fn doctor_parses_with_no_arguments() {
+        // `ft doctor` is deliberately flagless and argumentless: everything it
+        // needs is discovered from the environment, so there is nothing a user
+        // could pass that would change what is checked.
+        let cli = parse(&["doctor"]).expect("`ft doctor` must parse");
+        assert!(matches!(cli.command, Some(Command::Doctor)));
+    }
+
+    #[test]
+    fn doctor_rejects_any_arguments_or_flags() {
+        // Unknown flags and stray positionals must be clap usage errors, not
+        // silently ignored tokens — a typo like `ft doctor --fxid` should tell
+        // the user rather than run a partial diagnosis.
+        assert!(parse(&["doctor", "--anything"]).is_err(), "no flags exist");
+        assert!(parse(&["doctor", "extra"]).is_err(), "no arguments exist");
+    }
+
+    #[test]
+    fn sanitize_parses_with_no_arguments() {
+        // Like doctor, sanitize is deliberately flagless and argumentless:
+        // its inputs (the registry, worker probes, origin double-probes) are
+        // all discovered from the environment, so there is nothing a user
+        // could pass that would change what gets cleaned.
+        let cli = parse(&["sanitize"]).expect("`ft sanitize` must parse");
+        assert!(matches!(cli.command, Some(Command::Sanitize)));
+    }
+
+    #[test]
+    fn clean_is_an_alias_for_sanitize() {
+        // Same variant as the repo's other aliases (ls→ps, kill→stop,
+        // prune→gc, detail→inspect): a friendlier spelling, nothing more.
+        let cli = parse(&["clean"]).expect("`ft clean` must parse");
+        assert!(matches!(cli.command, Some(Command::Sanitize)));
+    }
+
+    #[test]
+    fn sanitize_rejects_any_arguments_or_flags() {
+        // A typo like `ft sanitize --force` must be a clap usage error, not a
+        // silently ignored token that runs a partial cleanup.
+        assert!(
+            parse(&["sanitize", "--anything"]).is_err(),
+            "no flags exist"
+        );
+        assert!(parse(&["sanitize", "extra"]).is_err(), "no arguments exist");
     }
 
     #[test]

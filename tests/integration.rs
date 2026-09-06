@@ -23,6 +23,26 @@
 //! the failure path is drivable with a dead ephemeral port, and the proxy
 //! rendering/lifecycle surface is drivable with `"kind": "proxy"` seeded
 //! fixtures (kill/prune/logs are kind-agnostic — they target pids).
+//!
+//! `ft doctor` is covered the same way: it must exit 0 whether or not
+//! `cloudflared` is installed (a missing binary is a finding, never an error —
+//! CI has none), and its motivating 502 finding is drivable by seeding a
+//! foreground "running" proxy (the test's own pid + a public URL) whose
+//! upstream port is a freshly dead ephemeral one.
+//!
+//! `ft sanitize` is covered on those same fixtures, with one wrinkle: its
+//! foreground liveness is prune's PID-reuse-safe `--foreground` cmdline
+//! probe (NOT `Service::status`'s plain existence check), so a "running"
+//! foreground entry needs a worker whose cmdline actually carries the token
+//! — a decoy `sh -c 'while :; do sleep 30; done' --foreground` child
+//! (sanitize never signals a foreground worker, so the decoy is safe; the
+//! loop form keeps the token in the shell's argv — see
+//! `spawn_foreground_worker`).
+//! Its origin port is either really bound or freshly dead, plus the seeded
+//! stale / reservation bodies prune uses. A live BACKGROUND zombie (which
+//! sanitize would tear down with real group signals) needs a real
+//! `run-worker` process, so that arm is not black-box drivable and stays
+//! covered by the pure decision table's unit tests in `cmd/sanitize.rs`.
 
 #![cfg(unix)] // proc::pid_alive uses a Unix-only cmdline identity probe.
 
@@ -114,6 +134,156 @@ fn proxy_registry_json(worker_pid: u32, created_at: &str, public_url: Option<&st
   ]
 }}"#
     )
+}
+
+/// Registry body for a foreground proxy that reads Running through sanitize's
+/// real probes: the given (live) pid with `foreground: true` plus a published
+/// public URL, fronting `port`. Whether its origin is alive depends only on
+/// whether the caller bound a listener on `port` first — exactly the seam
+/// doctor's finding and sanitize's double-probe decide on. The pid must come
+/// from [`spawn_foreground_worker`]: sanitize checks foreground liveness with
+/// the PID-reuse-safe `--foreground` cmdline probe (prune's rule), so a bare
+/// "own pid" fixture would — correctly — read as stale.
+fn foreground_proxy_json(pid: u32, port: u16) -> String {
+    format!(
+        r#"{{
+  "next_id": 2,
+  "services": [
+    {{
+      "id": 1,
+      "name": "seed-proxy",
+      "kind": "proxy",
+      "dir": null,
+      "port": {port},
+      "local_url": "http://127.0.0.1:{port}",
+      "public_url": "https://x.trycloudflare.com",
+      "worker_pid": {pid},
+      "tunnel_pid": null,
+      "created_at": "2026-07-21T00:00:00Z",
+      "state_dir": "/tmp/seed-proxy-state",
+      "foreground": true
+    }}
+  ]
+}}"#
+    )
+}
+
+/// A decoy "foreground worker" owned by the test that spawned it: dropping
+/// the guard kills and reaps the shell, so a panic between spawn and the
+/// test's cleanup point cannot leak the decoy — the endless loop would
+/// otherwise outlive the test for the machine's remaining uptime. Killing
+/// the shell does not reach its children, so the in-flight `sleep 30` can
+/// orphan for up to 30 s more before its own timer expires: bounded, and
+/// documented rather than hidden.
+struct DecoyWorker {
+    child: std::process::Child,
+}
+
+impl DecoyWorker {
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Drop for DecoyWorker {
+    fn drop(&mut self) {
+        // Best-effort: both calls fail harmlessly on an already-dead child,
+        // and wait() reaps it so the pid cannot linger as a zombie.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Block until the decoy's command line — as `ps` prints it — carries the
+/// `--foreground` token the binary's identity probe gates on.
+///
+/// A readiness barrier, not paranoia: the cmdline surfaces the probe reads
+/// (`/proc/<pid>/cmdline` on Linux, KERN_PROCARGS2 on macOS) can lag the
+/// fork, and losing that race makes the probe CORRECTLY read the decoy as
+/// stale — surfacing as a baffling assertion failure deep inside `ft
+/// sanitize`'s output instead of an error at the spawn site. Polling here
+/// turns any such platform quirk into a clear setup error, and the timeout
+/// panic reports the LAST observation — ps's output, or the error of a ps
+/// that could not run — keeping "token absent" distinct from "ps
+/// unavailable".
+fn wait_for_foreground_token(pid: u32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // The last poll's observation — the ps output when it ran, the error
+    // when it did not — so the timeout panic cannot conflate the two.
+    let mut last_seen = String::from("`ps` has not completed a poll yet");
+    while std::time::Instant::now() < deadline {
+        // `ps -o command= -p PID` prints the full argv on Linux and macOS
+        // alike — a black-box view of the same cmdline the probe reads.
+        let poll = Command::new("ps")
+            .arg("-o")
+            .arg("command=")
+            .arg("-p")
+            .arg(pid.to_string())
+            .output();
+        match poll {
+            Ok(out) => {
+                let command = String::from_utf8_lossy(&out.stdout).into_owned();
+                if command.contains("--foreground") {
+                    return;
+                }
+                last_seen = format!("`ps` reports {command:?}");
+            }
+            Err(e) => last_seen = format!("`ps` itself failed to run: {e}"),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("decoy never became probe-ready for pid {pid}: {last_seen}");
+}
+
+/// Spawn a decoy "foreground worker": a live process whose cmdline contains
+/// `--foreground` — the exact identity sanitize's foreground liveness probe
+/// gates on — staying alive until killed, which the returned [`DecoyWorker`]
+/// guard does on drop.
+///
+/// A real foreground worker is an `ft <dir> --foreground` process, which
+/// needs `cloudflared` and the network, so the black-box tests drive just
+/// the identity seam instead: `sh -c CMD NAME` puts NAME (`--foreground`)
+/// into the sh process's cmdline, where `/proc/<pid>/cmdline` (and macOS's
+/// KERN_PROCARGS2) happily report it. Sanitize never signals a foreground
+/// worker — it only reports it — so the decoy cannot become collateral
+/// damage of the very rule it stands in for.
+///
+/// The `-c` body is deliberately an endless sleep LOOP (`while :; do
+/// sleep 30; done`), not the simple command — or `;`-separated list — a
+/// tidy-minded pass would reduce it to: several shells silently REPLACE
+/// their own process image with a final external command, taking the token
+/// with them. bash (macOS's /bin/sh) does it for a lone `-c` simple
+/// command — the macOS CI flake: argv collapsed to bare `sleep 30` and the
+/// probe correctly read the entry stale — and busybox ash demonstrably
+/// tail-execs the LAST command of a top-level `;` list as well (the same
+/// EV_EXIT/shellexec tail-exec runs throughout the dash/ash/ksh lineage;
+/// Debian dash 0.5.12 happens to fork instead, but one build's behaviour
+/// is not a portable guarantee). A loop body is never in tail position on
+/// any of them — the shell must return to run the next iteration — so the
+/// token stays in the shell's argv for its whole life, and the loop also
+/// never ends: the [`DecoyWorker`] guard's Drop is the decoy's only exit.
+/// The post-spawn [`wait_for_foreground_token`] poll then guarantees the
+/// token is visible before the caller seeds state, so the decoy's identity
+/// is a checked fact rather than a hope.
+fn spawn_foreground_worker() -> DecoyWorker {
+    // The guard is built BEFORE the readiness barrier runs: if the barrier
+    // panics, unwinding drops the guard and reaps the decoy — a bare
+    // `std::process::Child`'s Drop is a no-op and would leak the endless
+    // loop for the machine's remaining uptime.
+    let worker = DecoyWorker {
+        child: Command::new("sh")
+            .arg("-c")
+            // An endless loop on purpose — see the doc comment above before
+            // simplifying.
+            .arg("while :; do sleep 30; done")
+            // Becomes the shell's $0 and a cmdline token for the identity
+            // probe.
+            .arg("--foreground")
+            .spawn()
+            .expect("spawning decoy foreground worker"),
+    };
+    wait_for_foreground_token(worker.pid());
+    worker
 }
 
 /// Seed `registry.json` under `xdg_root` with one service and return its path.
@@ -727,5 +897,308 @@ fn prune_keeps_a_fresh_proxy_reservation_and_reaps_an_expired_one() {
     assert!(
         after.contains("proxy-fresh") && !after.contains("proxy-expired"),
         "prune must keep the fresh and drop the expired reservation, registry: {after}"
+    );
+}
+
+// --- `ft doctor` (read-only diagnosis; no cloudflared needed) ---------------
+
+#[test]
+fn doctor_on_a_missing_registry_exits_zero_with_no_service_checks() {
+    // Fresh install: no registry file at all is the ordinary "no services
+    // yet" state — NOT a finding (only an unloadable registry is). Doctor
+    // must run, exit 0, print the cloudflared check (whatever it found on
+    // this machine — CI has no cloudflared, and its absence is a finding,
+    // not an error), print a summary line, and run no per-service checks.
+    let dir = TempDir::new().unwrap();
+    let (ok, out) = run_ft(dir.path(), &["doctor"]);
+    assert!(
+        ok,
+        "`ft doctor` must exit 0 — findings are informational, got: {out}"
+    );
+    assert!(
+        out.contains("cloudflared"),
+        "expected the cloudflared check line, got: {out}"
+    );
+    assert!(
+        !out.contains("worker "),
+        "no service checks may run without services, got: {out}"
+    );
+    assert!(
+        out.contains("all checks passed") || out.contains("problem(s)"),
+        "expected a summary line (which one depends on cloudflared), got: {out}"
+    );
+    // Read-only: even after running, the state tree is still empty.
+    assert!(
+        tree_paths(dir.path()).is_empty(),
+        "doctor must create nothing, found: {:?}",
+        tree_paths(dir.path())
+    );
+}
+
+#[test]
+fn doctor_flags_a_live_proxy_whose_upstream_port_is_dead() {
+    // The motivating case end-to-end: the worker reads Running through the
+    // real foreground liveness probe (the test's own pid with `foreground:
+    // true` and a published URL — the same trick as the model.rs unit
+    // tests), while the port it fronts has nothing listening. Doctor must
+    // still exit 0 and report the 502 finding with its remediation hint.
+    let dir = TempDir::new().unwrap();
+    let port = dead_loopback_port();
+    let body = format!(
+        r#"{{
+  "next_id": 2,
+  "services": [
+    {{
+      "id": 1,
+      "name": "seed-proxy",
+      "kind": "proxy",
+      "dir": null,
+      "port": {port},
+      "local_url": "http://127.0.0.1:{port}",
+      "public_url": "https://x.trycloudflare.com",
+      "worker_pid": {pid},
+      "tunnel_pid": null,
+      "created_at": "2026-07-21T00:00:00Z",
+      "state_dir": "/tmp/seed-proxy-state",
+      "foreground": true
+    }}
+  ]
+}}"#,
+        pid = std::process::id()
+    );
+    seed_registry(dir.path(), &body);
+
+    let (ok, out) = run_ft(dir.path(), &["doctor"]);
+    assert!(
+        ok,
+        "a finding is not a command failure — doctor exits 0, got: {out}"
+    );
+    assert!(
+        out.contains(&format!("proxying {port} but nothing is listening")),
+        "expected the dead-upstream finding naming the port, got: {out}"
+    );
+    assert!(
+        out.contains("502"),
+        "expected the 502 explanation, got: {out}"
+    );
+    assert!(
+        out.contains(
+            "hint: start the upstream server, or stop the service (`ft kill seed-proxy` — `ft \
+             sanitize` cleans background dead-upstream tunnels; stop a foreground one with \
+             Ctrl-C in its terminal)"
+        ),
+        "expected the remediation hint verbatim, got: {out}"
+    );
+    assert!(
+        out.contains("problem(s)"),
+        "the summary must count the finding, got: {out}"
+    );
+    // The worker itself is healthy: only its origin check fails.
+    assert!(
+        out.contains("worker seed-proxy: worker pid") && out.contains("fail origin seed-proxy:"),
+        "expected an ok worker line and a fail origin line, got: {out}"
+    );
+    // Read-only: doctor seeded nothing, changed nothing.
+    let after = fs::read_to_string(registry_path(dir.path())).unwrap();
+    assert!(
+        after.contains("seed-proxy"),
+        "doctor must not mutate the registry, got: {after}"
+    );
+}
+
+// --- `ft sanitize` (the cleanup counterpart; no cloudflared needed) ----------
+
+#[test]
+fn sanitize_on_a_missing_registry_reports_nothing_and_creates_no_state() {
+    // Fresh machine: no registry file at all is the ordinary "no services"
+    // state, not an error. Sanitize must exit 0 with the nothing-to-do
+    // message and — like doctor, and unlike a seeded prune — must not even
+    // create the state tree: nothing was judged, so no lock is ever taken.
+    let dir = TempDir::new().unwrap();
+    let (ok, out) = run_ft(dir.path(), &["sanitize"]);
+    assert!(ok, "`ft sanitize` on a fresh machine failed: {out}");
+    assert!(
+        out.contains("Nothing to clean."),
+        "expected the nothing-to-clean message, got: {out}"
+    );
+    assert!(
+        tree_paths(dir.path()).is_empty(),
+        "a no-op sanitize must create nothing, found: {:?}",
+        tree_paths(dir.path())
+    );
+}
+
+#[test]
+fn sanitize_keeps_a_healthy_live_service() {
+    // A foreground service reading Running through sanitize's REAL probes:
+    // a decoy worker carrying the `--foreground` cmdline token plus a
+    // published URL, and a REAL loopback listener bound on the fronted port
+    // so the origin double-probe finds it answering. Nothing is dangling —
+    // the entry must survive, the report must say there was nothing to do,
+    // and the command exits 0.
+    let dir = TempDir::new().unwrap();
+    let worker = spawn_foreground_worker();
+    let listener =
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral loopback listener");
+    let port = listener.local_addr().expect("local addr").port();
+    seed_registry(dir.path(), &foreground_proxy_json(worker.pid(), port));
+
+    let (ok, out) = run_ft(dir.path(), &["sanitize"]);
+    // The listener (and worker) must outlive the run: the probes happen
+    // inside it. Dropping the DecoyWorker guard kills and reaps the decoy.
+    drop(listener);
+    drop(worker);
+
+    assert!(ok, "`ft sanitize` on a healthy registry failed: {out}");
+    assert!(
+        out.contains("Nothing to clean."),
+        "expected the nothing-to-clean message, got: {out}"
+    );
+    assert!(
+        !out.contains("Sanitized") && !out.contains("Left"),
+        "nothing may be reported removed or skipped, got: {out}"
+    );
+    let after = fs::read_to_string(registry_path(dir.path())).unwrap();
+    assert!(
+        after.contains("seed-proxy"),
+        "the healthy entry must survive untouched, registry: {after}"
+    );
+}
+
+#[test]
+fn sanitize_reports_but_never_removes_a_foreground_zombie() {
+    // The motivating zombie, in the one shape black-box tests can drive: a
+    // foreground service whose decoy worker (cmdline: `--foreground`) is
+    // alive and Running while its port is freshly dead. Sanitize must NEVER
+    // kill or remove a foreground service — its worker is an `ft` attached
+    // to the operator's terminal — so the expectation is the left-alone
+    // note, the entry still on disk, and exit 0. (A live BACKGROUND zombie
+    // needs a real run-worker process; the pure decision table in
+    // cmd/sanitize.rs covers that arm instead.)
+    let dir = TempDir::new().unwrap();
+    let worker = spawn_foreground_worker();
+    let port = dead_loopback_port();
+    seed_registry(dir.path(), &foreground_proxy_json(worker.pid(), port));
+
+    let (ok, out) = run_ft(dir.path(), &["sanitize"]);
+    // The decoy only needs to outlive the run itself; the guard reaps it.
+    drop(worker);
+
+    assert!(ok, "a skipped foreground zombie is not a failure: {out}");
+    assert!(
+        out.contains("Left 1 foreground service"),
+        "expected the left-alone note, got: {out}"
+    );
+    assert!(
+        out.contains("seed-proxy"),
+        "the skipped service must be named, got: {out}"
+    );
+    assert!(
+        !out.contains("Sanitized"),
+        "nothing may be reported removed, got: {out}"
+    );
+    let after = fs::read_to_string(registry_path(dir.path())).unwrap();
+    assert!(
+        after.contains("seed-proxy"),
+        "a foreground zombie must never be removed, registry: {after}"
+    );
+}
+
+#[test]
+fn sanitize_reaps_a_stale_proxy_entry() {
+    // Through the `clean` alias, to prove the alias routes end-to-end: a
+    // recorded-but-dead worker pid (4_000_000 is far outside any real pid
+    // namespace) makes the entry stale, and sanitize — a superset of prune —
+    // removes it with its per-entry reason bullet and persists the empty
+    // registry.
+    let dir = TempDir::new().unwrap();
+    let reg = seed_registry(
+        dir.path(),
+        &proxy_registry_json(4_000_000, "2026-07-21T00:00:00Z", None),
+    );
+
+    let (ok, out) = run_ft(dir.path(), &["clean"]);
+
+    assert!(ok, "`ft clean` on a stale proxy registry failed: {out}");
+    assert!(
+        out.contains("Sanitized 1 service(s)"),
+        "expected one reaped service, got: {out}"
+    );
+    assert!(
+        out.contains("- seed-proxy (worker no longer running)"),
+        "expected the per-entry reason bullet, got: {out}"
+    );
+    let after = fs::read_to_string(&reg).unwrap();
+    assert!(
+        !after.contains("seed-proxy"),
+        "sanitize should have removed the stale entry, registry: {after}"
+    );
+}
+
+#[test]
+fn sanitize_keeps_a_fresh_reservation_and_reaps_an_expired_one() {
+    // The pid-0 grace split, end to end: a fresh reservation (inside
+    // START_GRACE — a parent may be mid reserve→spawn→record) is kept, while
+    // an expired one (the parent died mid-start) is removed with the
+    // abandoned-reservation reason. Classification is purely
+    // created_at-vs-grace; kind plays no role.
+    let dir = TempDir::new().unwrap();
+    let body = format!(
+        r#"{{
+  "next_id": 3,
+  "services": [
+    {{
+      "id": 1,
+      "name": "proxy-fresh",
+      "kind": "proxy",
+      "dir": null,
+      "port": 3001,
+      "local_url": "http://127.0.0.1:3001",
+      "public_url": null,
+      "worker_pid": 0,
+      "tunnel_pid": null,
+      "created_at": "{fresh}",
+      "state_dir": "/tmp/proxy-fresh-state",
+      "foreground": false
+    }},
+    {{
+      "id": 2,
+      "name": "proxy-expired",
+      "kind": "proxy",
+      "dir": null,
+      "port": 3002,
+      "local_url": "http://127.0.0.1:3002",
+      "public_url": null,
+      "worker_pid": 0,
+      "tunnel_pid": null,
+      "created_at": "2026-07-21T00:00:00Z",
+      "state_dir": "/tmp/proxy-expired-state",
+      "foreground": false
+    }}
+  ]
+}}"#,
+        fresh = now_rfc3339()
+    );
+    let reg = seed_registry(dir.path(), &body);
+
+    let (ok, out) = run_ft(dir.path(), &["sanitize"]);
+
+    assert!(ok, "`ft sanitize` on the reservations failed: {out}");
+    assert!(
+        out.contains("Sanitized 1 service(s)") && out.contains("proxy-expired"),
+        "expected exactly the expired reservation reaped, got: {out}"
+    );
+    assert!(
+        out.contains("(worker pid was never recorded"),
+        "expected the abandoned-reservation reason, got: {out}"
+    );
+    assert!(
+        !out.contains("proxy-fresh"),
+        "the fresh reservation must not be reported, got: {out}"
+    );
+    let after = fs::read_to_string(&reg).unwrap();
+    assert!(
+        after.contains("proxy-fresh") && !after.contains("proxy-expired"),
+        "sanitize must keep the fresh and drop the expired reservation, registry: {after}"
     );
 }

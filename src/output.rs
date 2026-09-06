@@ -4,6 +4,7 @@
 //! Output shapes are fixed by the CLI's public contract — see the `OUTPUT
 //! FORMATS` notes in the module docs of the command layer.
 
+use crate::cmd::doctor::{Check, CheckStatus};
 use crate::model::{Service, ServiceKind};
 use chrono::{Datelike, Timelike};
 use comfy_table::{ContentArrangement, Table};
@@ -146,4 +147,85 @@ pub fn print_stopped(name: &str) {
 /// Print the confirmation for removing a service that was already dead.
 pub fn print_removed_stale(name: &str) {
     println!("Removed stale service {name}.");
+}
+
+/// Print the DOCTOR report.
+///
+/// Shape (one line per check, then a blank line and the one-line summary):
+/// ```text
+/// ok    cloudflared: found at /usr/local/bin/cloudflared
+/// fail  origin api: proxying 3000 but nothing is listening — the tunnel will 502 every request
+///       hint: start the upstream server or stop the service (`ft kill api`)
+///
+/// 1 problem(s), 0 note(s)
+/// ```
+/// The three status words (`ok`, `warn`, `fail`) are left-aligned to the
+/// same width; an indented `hint:` line follows any problem that carries a
+/// remediation. The summary counts problems (warn + fail) and notes
+/// separately, collapsing to `all checks passed` only when there are none
+/// of either. Rendering only — doctor's decision logic lives in
+/// `cmd/doctor.rs`.
+pub fn print_doctor(checks: &[Check]) {
+    for check in checks {
+        // Width 4 aligns `ok` under `warn`/`fail`.
+        println!(
+            "{:<4} {}: {}",
+            check.status.as_str(),
+            check.name,
+            check.detail
+        );
+        if check.status.is_problem()
+            && let Some(hint) = &check.hint
+        {
+            println!("      hint: {hint}");
+        }
+    }
+    let problems = checks.iter().filter(|c| c.status.is_problem()).count();
+    let notes = checks
+        .iter()
+        .filter(|c| c.status == CheckStatus::Note)
+        .count();
+    println!();
+    if problems == 0 && notes == 0 {
+        println!("all checks passed");
+    } else {
+        println!("{problems} problem(s), {notes} note(s)");
+    }
+}
+
+/// Print the SANITIZE report.
+///
+/// Shape (prune-style plain text; `removed` is a list of
+/// `(name, reason)` pairs, the reason rendering inside the bullet's
+/// parentheses — e.g. `worker no longer running` or `upstream
+/// 127.0.0.1:3000 is dead — tunnel was 502ing every request`):
+/// ```text
+/// Sanitized 2 service(s):
+///   - proxy-3000 (upstream 127.0.0.1:3000 is dead — tunnel was 502ing every request)
+///   - demo (worker no longer running)
+/// Left 1 foreground service(s) alone (stop it with Ctrl-C in its terminal):
+///   - web
+/// ```
+/// `Nothing to clean.` is printed when nothing was removed; the left-alone
+/// note still follows when foreground zombies were skipped, since that is
+/// the operator's cue to stop them by hand. Rendering only — the decision
+/// logic lives in `cmd/sanitize.rs`.
+pub fn print_sanitized(removed: &[(String, String)], skipped_foreground: &[String]) {
+    if removed.is_empty() {
+        println!("Nothing to clean.");
+    } else {
+        println!("Sanitized {} service(s):", removed.len());
+        for (name, reason) in removed {
+            println!("  - {name} ({reason})");
+        }
+    }
+    if !skipped_foreground.is_empty() {
+        println!(
+            "Left {} foreground service(s) alone (stop it with Ctrl-C in its terminal):",
+            skipped_foreground.len()
+        );
+        for name in skipped_foreground {
+            println!("  - {name}");
+        }
+    }
 }
