@@ -6,12 +6,14 @@
 //! `dir` (`ft <dir>`), matching the contract documented on [`crate::cli::Cli`].
 
 pub mod detail;
+pub mod doctor;
 pub mod kill;
 pub mod list;
 pub mod logs;
 pub mod open;
 pub mod proxy;
 pub mod prune;
+pub mod sanitize;
 pub mod start;
 
 use std::path::PathBuf;
@@ -28,6 +30,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Some(Command::Ls) => list::run().await,
         Some(Command::Detail { target }) => detail::run(target).await,
+        Some(Command::Doctor) => doctor::run().await,
         Some(Command::Kill { target }) => kill::run(target).await,
         Some(Command::Logs { target, follow }) => logs::run(target, follow).await,
         Some(Command::Open { target }) => open::run(target).await,
@@ -37,6 +40,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             name,
             foreground,
         }) => proxy::run(port, name, foreground).await,
+        Some(Command::Sanitize) => sanitize::run().await,
         Some(Command::RunWorker {
             id,
             name,

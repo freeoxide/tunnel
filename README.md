@@ -101,11 +101,13 @@ literally named `proxy`), prefix it with `./` — `ft ./proxy` — to reach the 
 | `ft ls` | List all known services. (alias: `ps`) |
 | `ft ps` | Alias for `ls`. |
 | `ft detail <id\|name>` | Show detailed information about a single service. (alias: `inspect`) |
+| `ft doctor` | Diagnose tunnel health (cloudflared, workers, upstream ports) — read-only, always exits 0. |
 | `ft kill <id\|name>` | Stop a running service and remove it from the registry. (alias: `stop`) |
 | `ft logs <id\|name>` | Print the logs for a service. |
 | `ft logs <id\|name> --follow` | Tail the log output (`tail -f` style). |
 | `ft open <id\|name>` | Open the public URL of a service in your default browser. |
 | `ft prune` | Remove stale services whose worker is no longer running. (alias: `gc`) |
+| `ft sanitize` | Remove every dangling service: stale entries plus tunnels whose origin port is dead. (alias: `clean`) |
 | `ft proxy <port>` | Attach a tunnel to a local server that is already running on `port`. |
 
 ### Flags for START
@@ -124,6 +126,45 @@ These flags belong after the subcommand (`ft proxy 3000 --name api`). A `--name`
 `-f` placed before it is parsed as the implicit START's top-level flags, which `proxy`
 ignores. There is no `--yes` — no directory is published, so there is nothing to confirm.
 
+### Diagnosing problems
+
+Run `ft doctor` when a tunnel misbehaves, or to sanity-check the setup. It checks:
+
+- `cloudflared` is on your `PATH` (warns with install pointers when it is not);
+- every registered service's worker process is still alive (a stale one hints
+  `ft kill <name>`, or `ft sanitize` for a general cleanup);
+- when the worker is alive, that the service's local origin (`127.0.0.1:<port>`) still
+  accepts connections — the silent failure this catches is a `ft proxy` service whose
+  upstream server went away: the tunnel stays up and 502s every request, and nothing in
+  `ft ls` shows it (`ft sanitize` cleans such zombies — background ones; a foreground one
+  is left for its own terminal);
+- each service's state directory (where its logs live) still exists.
+
+`ft doctor` is strictly read-only: it never mutates the registry, signals processes, or
+spawns anything — problems are reported as `hint:` lines naming the command that would
+fix them. It takes no arguments and always exits 0 when it ran at all (only a broken
+environment, such as an unresolvable state dir, exits non-zero), so it is safe to script
+and safe to run at any time.
+
+### Cleaning up dangling services
+
+`ft prune` and `ft sanitize` (alias `clean`) split the cleanup job by what died:
+
+- `ft prune` removes entries whose **worker** process is no longer running — the
+  registry claiming a tunnel nobody serves.
+- `ft sanitize` removes those **and** the zombie prune cannot see: an entry whose
+  worker and tunnel are still up while the local origin port has nothing listening —
+  typically an `ft proxy` service whose upstream server died, leaving a
+  healthy-looking tunnel that 502s every request. (A `static` service counts too: its
+  worker hosts the server itself, so a live worker with a dead port is an anomaly worth
+  cleaning.)
+
+Before reaping a zombie, `ft sanitize` probes the origin port twice, roughly 750 ms
+apart — both probes must fail, so a dev server that is mid-restart (dropping and
+rebinding its listener) is left alone. Foreground services are never killed: a
+foreground zombie is reported as "left alone" for you to stop with Ctrl-C in its
+terminal, since its worker is an `ft` attached to your own shell.
+
 ### Examples
 
 ```sh
@@ -141,6 +182,8 @@ ft kill blog                              # stop and remove
 ft logs blog                              # print logs
 ft logs blog --follow                     # stream logs
 ft open blog                              # open the public URL in a browser
+ft doctor                                 # check tunnel health (read-only)
+ft sanitize                               # clean up stale and zombie services
 ```
 
 ## How it works
@@ -191,7 +234,7 @@ or separators. A proxy service runs no server of its own, so its directory only 
   `cloudflared` is reaped automatically via `PR_SET_PDEATHSIG`. Supports background and foreground.
 - **macOS** — full support. PID-reuse-safe identity via `sysctl(KERN_PROCARGS2)`. There is no
   `PR_SET_PDEATHSIG` equivalent, so a worker killed abnormally (OOM, `SIGKILL`) leaves its
-  `cloudflared` orphaned until `ft prune` reaps it. Supports background and foreground.
+  `cloudflared` orphaned until `ft prune` / `ft sanitize` reaps it. Supports background and foreground.
 - **Windows** — full support. The detached worker owns a Job Object (`KILL_ON_JOB_CLOSE`) that
   gives both whole-tree teardown and the `PR_SET_PDEATHSIG` equivalent (the worker's hard death
   still reaps its `cloudflared`). PID identity uses `QueryFullProcessImageNameW`. Supports
