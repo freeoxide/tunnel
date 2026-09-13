@@ -160,6 +160,7 @@ async fn run_background(port: u16, name: Option<String>, keep: u16) -> Result<()
             worker_pid: 0,
             tunnel_pid: None,
             command_pid: None, // Run-only field; a hook spawns no command
+            static_flags: Default::default(),
             created_at: crate::model::now_utc(),
             state_dir: service_dir,
             foreground: false,
@@ -403,6 +404,7 @@ async fn run_foreground(port: u16, name: Option<String>, keep: u16) -> Result<()
             worker_pid: std::process::id(),
             tunnel_pid: None,
             command_pid: None,
+            static_flags: Default::default(),
             created_at: crate::model::now_utc(),
             state_dir: service_dir,
             foreground: true,

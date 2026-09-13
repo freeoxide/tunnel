@@ -23,6 +23,39 @@
 //!   root are still served.)
 //! - **`..` traversal is rejected** — belt-and-suspenders alongside the same
 //!   check tower-http ServeDir already performs.
+//!
+//! # Static-origin flags (`--spa` / `--cors` / `--token`)
+//!
+//! [`router_with`] takes a [`crate::model::StaticFlags`] value (persisted on
+//! the registry entry, so the detached worker re-applies what the operator
+//! asked for):
+//!
+//! - **`--spa`** — the [`spa_fallback`] middleware rewrites a 404 to the root
+//!   `index.html` (client-side router deep links). It sits OUTSIDE `confine`
+//!   (a missing path is itself confined to a 404, so a fallback inside the
+//!   guard could never see one) and re-checks the path itself before
+//!   rewriting: only a genuinely non-existent, dot-free path becomes the app
+//!   shell. Dotfiles/`..` keep their 404, symlink escapes keep their 404, an
+//!   existing-but-refused path keeps its 404, and a root without an
+//!   `index.html` keeps the honest 404 instead of erroring.
+//! - **`--cors`** — permissive CORS headers (`Access-Control-Allow-Origin: *`,
+//!   methods GET/HEAD/OPTIONS, wildcard request headers) stamped on every
+//!   response via `SetResponseHeaderLayer`, errors included. Preflight OPTIONS
+//!   is deliberately NOT answered with a success status: GET/HEAD are
+//!   CORS-simple requests that browsers make without a preflight, so anything
+//!   that would preflight is a non-GET/HEAD request this origin 405s anyway —
+//!   the stamped 405 documents that rather than faking an allowance.
+//! - **`--token`** — the [`require_token`] guard answers 401 for EVERY request
+//!   (GET/HEAD included — unlike the drop bucket's mutation-only gate, the
+//!   static origin's whole value is its content, so there is no safe
+//!   unauthenticated subset) unless `Authorization: Bearer <secret>` or
+//!   `?token=<secret>` matches, compared in constant time. It layers OUTSIDE
+//!   `confine` so a 404-scanner learns nothing about the tree (not even which
+//!   paths 404) without the token; `WWW-Authenticate: Bearer` advertises the
+//!   scheme. The Bearer header is the safer transport (query strings leak into
+//!   shell history and client logs), and because the query value is
+//!   percent-decoded, a secret containing `%` or `+` authenticates via the
+//!   header in exactly its written form — prefer the header for such secrets.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -52,7 +85,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// streaming gigabytes into hyper before ServeDir short-circuits the response.
 const MAX_REQUEST_BODY: usize = 1024;
 
-/// Build an axum [`Router`] that serves `dir` at `/` with HTTP tracing.
+/// Build an axum [`Router`] that serves `dir` at `/` with HTTP tracing and the
+/// given static-origin flags (`--spa`/`--cors`/`--token`) applied.
 ///
 /// The directory contents are mapped directly onto the root path, so a
 /// request to `/foo.html` resolves to `dir/foo.html`. The root is canonicalised
@@ -62,26 +96,65 @@ const MAX_REQUEST_BODY: usize = 1024;
 /// Layers are applied innermost-first, so the LAST `.layer()` is the
 /// outermost: TimeoutLayer wraps everything (bounding slow clients and the
 /// graceful-drain), RequestBodyLimitLayer caps the body before ServeDir runs,
-/// SetResponseHeaderLayer stamps `nosniff` on every response, TraceLayer
-/// observes the finalised response, the [`confine`] guard runs next, and the
-/// [`serve_or_list`] listing middleware is the innermost layer — it sits just
-/// in front of the `ServeDir` fallback and either answers a directory with a
-/// listing or hands the request over untouched.
-pub fn router(dir: PathBuf) -> Router {
+/// SetResponseHeaderLayer stamps `nosniff` on every response, the optional
+/// CORS stamping sits above the token guard so even a 401 carries the CORS
+/// headers, the optional [`require_token`] guard runs next (outside
+/// confinement — see the module docs for why), TraceLayer observes the
+/// response, the optional [`spa_fallback`] rewrite sits outside `confine`,
+/// the [`confine`] guard runs next, and the [`serve_or_list`] listing
+/// middleware is the innermost layer — it sits just in front of the
+/// `ServeDir` fallback and either answers a directory with a listing or hands
+/// the request over untouched.
+pub fn router_with(dir: PathBuf, flags: crate::model::StaticFlags) -> Router {
     // Canonicalise the root so (a) symlinked roots resolve to their real target
     // and (b) the confinement guard compares against a stable, absolute base.
     let root = std::fs::canonicalize(&dir).unwrap_or(dir);
+    let crate::model::StaticFlags { spa, cors, token } = flags;
     // axum 0.8 removed `nest_service("/")` ("nesting at the root is no longer
     // supported"). Serving the directory as the fallback service covers every
     // path: `index.html` at `/`, the matching file beneath it elsewhere, and a
     // 404 for anything missing. The serve_or_list middleware layered in front
     // of it additionally renders a directory listing for a directory that has
     // no `index.html` (see [`serve_or_list`]).
-    Router::new()
+    let mut router = Router::new()
         .fallback_service(ServeDir::new(root.clone()))
         .layer(from_fn_with_state(root.clone(), serve_or_list))
-        .layer(from_fn_with_state(root, confine))
-        .layer(TraceLayer::new_for_http())
+        .layer(from_fn_with_state(root.clone(), confine));
+    // SPA sits OUTSIDE confine: confine itself 404s non-existent paths (its
+    // canonicalize fails on them), so a fallback layered inside the guard
+    // would never observe the deep-link 404s it exists to rewrite. The
+    // fallback re-checks the path itself before rewriting (see spa_fallback).
+    if spa {
+        router = router.layer(from_fn_with_state(root.clone(), spa_fallback));
+    }
+    router = router.layer(TraceLayer::new_for_http());
+    // The token guard sits beside — and outside — the confinement middleware:
+    // auth before confinement means an unauthenticated 404-scanner cannot use
+    // the 404/200 distinction to probe which paths exist.
+    if let Some(expected) = token {
+        router = router.layer(from_fn_with_state(expected, require_token));
+    }
+    // CORS stamping is layered ABOVE the token guard (later layer = outer) so
+    // every response of the origin — 200s, 404s, and 401s alike — carries the
+    // headers, keeping the origin's cross-origin story uniform.
+    if cors {
+        router = router
+            .layer(SetResponseHeaderLayer::overriding(
+                header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                HeaderValue::from_static("*"),
+            ))
+            .layer(SetResponseHeaderLayer::overriding(
+                header::ACCESS_CONTROL_ALLOW_METHODS,
+                HeaderValue::from_static("GET, HEAD, OPTIONS"),
+            ))
+            // Wildcard request headers (no credentials are ever allowed with
+            // an `*` origin, so the wildcard is safe).
+            .layer(SetResponseHeaderLayer::overriding(
+                header::ACCESS_CONTROL_ALLOW_HEADERS,
+                HeaderValue::from_static("*"),
+            ));
+    }
+    router
         .layer(SetResponseHeaderLayer::overriding(
             header::X_CONTENT_TYPE_OPTIONS,
             HeaderValue::from_static("nosniff"),
@@ -437,6 +510,160 @@ fn escapes_root(path: &Path, root: &Path) -> bool {
     }
 }
 
+/// SPA fallback (`--spa`): rewrite a 404 for a genuinely non-existent,
+/// dot-free path to the root `index.html`, so client-side router deep links
+/// (`/settings/profile`) get the app shell instead of a 404.
+///
+/// Deliberately layered OUTSIDE [`confine`] (which is what makes it able to
+/// see missing-path 404s at all — confine 404s those itself), and therefore
+/// re-checking the path itself before rewriting, so the guard's refusals keep
+/// their meaning:
+///
+/// - any `.`-prefixed segment (dotfiles, `.git/...`, `.`, `..`) keeps its 404;
+///   the app shell must never become a dotfile-detection oracle either;
+/// - a path that canonicalises to SOMETHING (existing inside the root, or a
+///   symlink escaping it — both are cases confine/ServeDir answered
+///   deliberately) keeps its 404: only "nothing exists there" is rewritten;
+/// - a root without an `index.html` keeps the honest 404 (never a 500).
+///
+/// The rewrite is GET/HEAD-only (the shell is a representation, like the
+/// listing); HEAD mirrors the GET headers with an empty body, matching the
+/// listing's HEAD discipline. All filesystem syscalls run in one
+/// `spawn_blocking`, per the guard's blocking-I/O discipline.
+async fn spa_fallback(State(root): State<PathBuf>, request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let raw = request.uri().path().to_owned();
+    let response = next.run(request).await;
+    if response.status() != StatusCode::NOT_FOUND
+        || (method != Method::GET && method != Method::HEAD)
+    {
+        return response;
+    }
+    // Rebuild the candidate exactly like `confine` does (percent-decode, drop
+    // the leading `/`, split on `/`) so the fallback decides on the same path
+    // everyone else resolved.
+    let decoded = match percent_decode(raw.as_bytes()).decode_utf8() {
+        Ok(s) => s,
+        // Undecodable paths were refused by confine; never rewrite them.
+        Err(_) => return response,
+    };
+    let mut candidate = root.clone();
+    for seg in decoded.trim_start_matches('/').split('/') {
+        if seg.is_empty() {
+            continue;
+        }
+        // Same rule, same place in the pipeline as the guard: a dot segment is
+        // a refusal, and a refusal must not turn into the app shell.
+        if seg.starts_with('.') {
+            return response;
+        }
+        candidate.push(seg);
+    }
+    let shell = tokio::task::spawn_blocking(move || {
+        // The path resolves to something (inside or outside the root): its 404
+        // was a deliberate confinement/ServeDir answer, not a miss to paper
+        // over — most importantly an escaping symlink must never be laundered
+        // into a 200 by the fallback.
+        if std::fs::canonicalize(&candidate).is_ok() {
+            return None;
+        }
+        std::fs::read(root.join("index.html")).ok()
+    })
+    .await
+    .unwrap_or(None);
+    let Some(bytes) = shell else {
+        return response;
+    };
+    let len = bytes.len();
+    if method == Method::HEAD {
+        let mut response = (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        )
+            .into_response();
+        response
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+        return response;
+    }
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        bytes,
+    )
+        .into_response()
+}
+
+/// Token guard (`--token`): answer 401 for EVERY request that does not carry
+/// the configured secret — via `Authorization: Bearer <secret>` or
+/// `?token=<secret>`, compared in constant time — before the request reaches
+/// confinement, the listing, or ServeDir. Gating all methods (unlike the drop
+/// bucket's mutation-only gate) is deliberate: the static origin's entire
+/// value is its content, so reads are exactly what needs protecting, and
+/// gating before confinement means a 404-scanner without the token cannot use
+/// the 404/200 distinction to learn which paths exist.
+async fn require_token(State(expected): State<String>, request: Request, next: Next) -> Response {
+    let header_token = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_owned);
+    let query_token = request.uri().query().and_then(|q| query_param(q, "token"));
+    let ok = header_token
+        .or(query_token)
+        .is_some_and(|t| tokens_match(&t, &expected));
+    if !ok {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            "this static origin requires the access token (Authorization: Bearer or ?token=)\n",
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+/// Extract the first value of `key` from a raw query string, percent-decoded.
+/// Byte-for-byte twin of the private `drop_server::query_param` (same `+`
+/// policy: a literal plus means a plus, the form-encoding convention is not
+/// applied) — the two must stay in sync if either changes.
+fn query_param(query: &str, key: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        if k != key {
+            return None;
+        }
+        percent_decode(v.as_bytes())
+            .decode_utf8()
+            .ok()
+            .map(|d| d.into_owned())
+    })
+}
+
+/// Constant-time token comparison for the operator-chosen static secret: the
+/// decision folds XOR over every byte AND the length difference into one
+/// accumulator, so it never early-returns on the first mismatching byte — or
+/// on a length mismatch (unlike the drop bucket's fixed-length generated hex,
+/// an operator-chosen secret's length is worth not advertising). The total
+/// work still scales with the longer input, so a length *class* is inferable
+/// from timing, as with any looped compare. An empty configured token matches
+/// nothing (the CLI refuses one, and an empty secret must never open the
+/// origin).
+fn tokens_match(provided: &str, expected: &str) -> bool {
+    if expected.is_empty() {
+        return false;
+    }
+    let (a, b) = (provided.as_bytes(), expected.as_bytes());
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= usize::from(x ^ y);
+    }
+    diff == 0
+}
+
 /// Bind `router` to `127.0.0.1:port` and serve until interrupted by Ctrl-C.
 ///
 /// Binding is restricted to the loopback interface on purpose: only the
@@ -480,6 +707,14 @@ pub async fn serve_on(
         .with_graceful_shutdown(shutdown)
         .await?;
     Ok(())
+}
+
+/// The no-flags router the bulk of the HTTP tests exercise — [`router_with`]
+/// under its default arm, kept under a short local name since the production
+/// entry point now always carries the flags.
+#[cfg(test)]
+fn plain_router(dir: PathBuf) -> Router {
+    router_with(dir, crate::model::StaticFlags::default())
 }
 
 #[cfg(test)]
@@ -540,16 +775,16 @@ mod http_confinement_tests {
         std::fs::create_dir_all(dir.path().join("sub")).expect("mkdir");
         std::fs::write(dir.path().join("sub").join("f.html"), "x").expect("write");
 
-        let r = router(dir.path().to_path_buf());
+        let r = plain_router(dir.path().to_path_buf());
         assert_eq!(r.oneshot(req("/")).await.unwrap().status(), StatusCode::OK);
 
-        let r = router(dir.path().to_path_buf());
+        let r = plain_router(dir.path().to_path_buf());
         assert_eq!(
             r.oneshot(req("/sub/f.html")).await.unwrap().status(),
             StatusCode::OK
         );
 
-        let r = router(dir.path().to_path_buf());
+        let r = plain_router(dir.path().to_path_buf());
         assert_eq!(
             r.oneshot(req("/missing.html")).await.unwrap().status(),
             StatusCode::NOT_FOUND
@@ -563,12 +798,12 @@ mod http_confinement_tests {
         std::fs::create_dir_all(dir.path().join(".git")).expect("mkdir");
         std::fs::write(dir.path().join(".git").join("config"), "x").expect("write");
 
-        let r = router(dir.path().to_path_buf());
+        let r = plain_router(dir.path().to_path_buf());
         assert_eq!(
             r.oneshot(req("/.env")).await.unwrap().status(),
             StatusCode::NOT_FOUND
         );
-        let r = router(dir.path().to_path_buf());
+        let r = plain_router(dir.path().to_path_buf());
         assert_eq!(
             r.oneshot(req("/.git/config")).await.unwrap().status(),
             StatusCode::NOT_FOUND
@@ -580,7 +815,7 @@ mod http_confinement_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("index.html"), "hi").expect("write");
 
-        let r = router(dir.path().to_path_buf());
+        let r = plain_router(dir.path().to_path_buf());
         // ServeDir already blocks '..'; the confine guard blocks it earlier.
         assert_eq!(
             r.oneshot(req("/../etc/passwd")).await.unwrap().status(),
@@ -599,7 +834,7 @@ mod http_confinement_tests {
         std::fs::write(dir.path().join("index.html"), "ok").expect("write");
         symlink(outside.path().join("secret"), dir.path().join("link")).expect("symlink");
 
-        let r = router(dir.path().to_path_buf());
+        let r = plain_router(dir.path().to_path_buf());
         assert_eq!(
             r.oneshot(req("/link")).await.unwrap().status(),
             StatusCode::NOT_FOUND,
@@ -625,7 +860,7 @@ mod http_confinement_tests {
         .expect("symlink");
 
         for uri in ["/sub/", "/sub", "/sub/index.html"] {
-            let r = router(dir.path().to_path_buf());
+            let r = plain_router(dir.path().to_path_buf());
             assert_eq!(
                 r.oneshot(req(uri)).await.unwrap().status(),
                 StatusCode::NOT_FOUND,
@@ -638,7 +873,7 @@ mod http_confinement_tests {
     async fn x_content_type_options_nosniff_is_set() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("index.html"), "hi").expect("write");
-        let r = router(dir.path().to_path_buf());
+        let r = plain_router(dir.path().to_path_buf());
         let resp = r.oneshot(req("/")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
@@ -678,7 +913,7 @@ mod http_confinement_tests {
             return;
         }
 
-        let r = router(dir.path().to_path_buf());
+        let r = plain_router(dir.path().to_path_buf());
         assert_eq!(
             r.oneshot(req("/link")).await.unwrap().status(),
             StatusCode::NOT_FOUND,
@@ -720,7 +955,7 @@ mod listing_tests {
         std::fs::create_dir(dir.path().join("beta")).expect("mkdir");
         std::fs::write(dir.path().join("beta").join("inner.html"), "i").expect("write");
 
-        let resp = router(dir.path().to_path_buf())
+        let resp = plain_router(dir.path().to_path_buf())
             .oneshot(req("GET", "/"))
             .await
             .expect("oneshot");
@@ -756,7 +991,7 @@ mod listing_tests {
         std::fs::create_dir(dir.path().join("bare")).expect("mkdir");
 
         // Root: the real index.html is served, not a listing.
-        let resp = router(dir.path().to_path_buf())
+        let resp = plain_router(dir.path().to_path_buf())
             .oneshot(req("GET", "/"))
             .await
             .expect("oneshot");
@@ -764,7 +999,7 @@ mod listing_tests {
         assert_eq!(body_of(resp).await, "<h1>root index</h1>");
 
         // A subdirectory with its own index.html serves it too...
-        let resp = router(dir.path().to_path_buf())
+        let resp = plain_router(dir.path().to_path_buf())
             .oneshot(req("GET", "/sub/"))
             .await
             .expect("oneshot");
@@ -773,7 +1008,7 @@ mod listing_tests {
 
         // ...while a sibling directory without one still gets a listing,
         // including the ../ parent link.
-        let resp = router(dir.path().to_path_buf())
+        let resp = plain_router(dir.path().to_path_buf())
             .oneshot(req("GET", "/bare/"))
             .await
             .expect("oneshot");
@@ -791,7 +1026,7 @@ mod listing_tests {
         std::fs::write(dir.path().join(".git").join("config"), "x").expect("write");
         std::fs::write(dir.path().join("ok.txt"), "fine").expect("write");
 
-        let resp = router(dir.path().to_path_buf())
+        let resp = plain_router(dir.path().to_path_buf())
             .oneshot(req("GET", "/"))
             .await
             .expect("oneshot");
@@ -817,7 +1052,7 @@ mod listing_tests {
         std::fs::create_dir(dir.path().join("sub dir")).expect("mkdir");
         std::fs::write(dir.path().join("sub dir").join("inner.txt"), "i").expect("write");
 
-        let resp = router(dir.path().to_path_buf())
+        let resp = plain_router(dir.path().to_path_buf())
             .oneshot(req("GET", "/"))
             .await
             .expect("oneshot");
@@ -835,7 +1070,7 @@ mod listing_tests {
 
         // A subdirectory listing reached through its encoded href keeps
         // encoding its own path and shows the parent link.
-        let resp = router(dir.path().to_path_buf())
+        let resp = plain_router(dir.path().to_path_buf())
             .oneshot(req("GET", "/sub%20dir/"))
             .await
             .expect("oneshot");
@@ -854,7 +1089,7 @@ mod listing_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("lt<gt>.txt"), "angled").expect("write");
 
-        let resp = router(dir.path().to_path_buf())
+        let resp = plain_router(dir.path().to_path_buf())
             .oneshot(req("GET", "/"))
             .await
             .expect("oneshot");
@@ -872,7 +1107,7 @@ mod listing_tests {
 
         // The hrefs the listing advertises must round-trip as real requests.
         for (uri, want) in [("/a%20b.txt", "spaced"), ("/amp%26and.txt", "ampered")] {
-            let resp = router(dir.path().to_path_buf())
+            let resp = plain_router(dir.path().to_path_buf())
                 .oneshot(req("GET", uri))
                 .await
                 .expect("oneshot");
@@ -887,7 +1122,7 @@ mod listing_tests {
         std::fs::write(dir.path().join("f.txt"), "x").expect("write");
 
         // The listing's GET representation, for the Content-Length check.
-        let resp = router(dir.path().to_path_buf())
+        let resp = plain_router(dir.path().to_path_buf())
             .oneshot(req("GET", "/"))
             .await
             .expect("oneshot");
@@ -895,7 +1130,7 @@ mod listing_tests {
 
         // Listing path: same status/type, the GET representation's true
         // Content-Length, and an empty body.
-        let resp = router(dir.path().to_path_buf())
+        let resp = plain_router(dir.path().to_path_buf())
             .oneshot(req("HEAD", "/"))
             .await
             .expect("oneshot");
@@ -912,7 +1147,7 @@ mod listing_tests {
         assert!(body_of(resp).await.is_empty());
 
         // File path (ServeDir) still answers HEAD headers-only.
-        let resp = router(dir.path().to_path_buf())
+        let resp = plain_router(dir.path().to_path_buf())
             .oneshot(req("HEAD", "/f.txt"))
             .await
             .expect("oneshot");
@@ -930,7 +1165,7 @@ mod listing_tests {
         std::fs::create_dir(dir.path().join("x<h1 onx=y")).expect("mkdir");
 
         // The root listing escapes the entry's label...
-        let resp = router(dir.path().to_path_buf())
+        let resp = plain_router(dir.path().to_path_buf())
             .oneshot(req("GET", "/"))
             .await
             .expect("oneshot");
@@ -940,7 +1175,7 @@ mod listing_tests {
 
         // ...and the directory's own listing escapes the title/h1 built from
         // its name.
-        let resp = router(dir.path().to_path_buf())
+        let resp = plain_router(dir.path().to_path_buf())
             .oneshot(req("GET", "/x%3Ch1%20onx%3Dy/"))
             .await
             .expect("oneshot");
@@ -968,7 +1203,7 @@ mod listing_tests {
         // the absolute href must name the immediate parent `/a/` in both
         // forms.
         for uri in ["/a/b", "/a/b/"] {
-            let resp = router(dir.path().to_path_buf())
+            let resp = plain_router(dir.path().to_path_buf())
                 .oneshot(req("GET", uri))
                 .await
                 .expect("oneshot");
@@ -995,7 +1230,7 @@ mod listing_tests {
         std::fs::write(dir.path().join("ok.txt"), "fine").expect("write");
         symlink(outside.path().join("secret"), dir.path().join("leak")).expect("symlink");
 
-        let resp = router(dir.path().to_path_buf())
+        let resp = plain_router(dir.path().to_path_buf())
             .oneshot(req("GET", "/"))
             .await
             .expect("oneshot");
@@ -1015,7 +1250,7 @@ mod listing_tests {
 
         // ServeDir answers non-GET/HEAD with 405; the listing must not turn
         // a POST to a directory into a 200.
-        let resp = router(dir.path().to_path_buf())
+        let resp = plain_router(dir.path().to_path_buf())
             .oneshot(req("POST", "/"))
             .await
             .expect("oneshot");
@@ -1035,7 +1270,7 @@ mod listing_tests {
         std::fs::write(dir.path().join("zfile.txt"), "z").expect("write");
         symlink("real", dir.path().join("alias")).expect("symlink");
 
-        let resp = router(dir.path().to_path_buf())
+        let resp = plain_router(dir.path().to_path_buf())
             .oneshot(req("GET", "/"))
             .await
             .expect("oneshot");
@@ -1054,7 +1289,7 @@ mod listing_tests {
         );
 
         // And the link is real: its own listing renders through the alias.
-        let resp = router(dir.path().to_path_buf())
+        let resp = plain_router(dir.path().to_path_buf())
             .oneshot(req("GET", "/alias/"))
             .await
             .expect("oneshot");
@@ -1094,7 +1329,7 @@ mod listing_tests {
             return;
         }
 
-        let resp = router(dir.path().to_path_buf())
+        let resp = plain_router(dir.path().to_path_buf())
             .oneshot(req("GET", "/"))
             .await
             .expect("oneshot");
@@ -1116,7 +1351,7 @@ mod listing_tests {
         std::fs::write(dir.path().join("ok.txt"), "fine").expect("write");
         symlink("no-such-target", dir.path().join("dangling")).expect("symlink");
 
-        let resp = router(dir.path().to_path_buf())
+        let resp = plain_router(dir.path().to_path_buf())
             .oneshot(req("GET", "/"))
             .await
             .expect("oneshot");
@@ -1127,5 +1362,388 @@ mod listing_tests {
             !html.contains("dangling"),
             "a broken symlink must not be listed: {html}"
         );
+    }
+}
+
+#[cfg(test)]
+mod origin_flags_tests {
+    //! The `--spa` / `--cors` / `--token` static-origin flags, driven through
+    //! the real `router_with` with tower::oneshot (the established
+    //! no-cloudflared HTTP-layer pattern).
+    use super::*;
+    use crate::model::StaticFlags;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    /// A router over `dir` with the given flags, mirroring what the worker
+    /// builds from the persisted registry entry.
+    fn flagged_router(dir: &Path, spa: bool, cors: bool, token: Option<&str>) -> Router {
+        router_with(
+            dir.to_path_buf(),
+            StaticFlags {
+                spa,
+                cors,
+                token: token.map(str::to_owned),
+            },
+        )
+    }
+
+    fn req(method: &str, uri: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .expect("build request")
+    }
+
+    fn req_with(method: &str, uri: &str, headers: &[(&str, &str)]) -> Request<Body> {
+        let mut builder = Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder.body(Body::empty()).expect("build request")
+    }
+
+    async fn body_of(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        String::from_utf8(bytes.to_vec()).expect("body is utf-8")
+    }
+
+    /// A served tree with an SPA-style app: a root `index.html` shell, a real
+    /// asset, and a subdirectory (no index of its own → listing territory).
+    fn spa_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("index.html"), "SHELL").expect("write shell");
+        std::fs::write(dir.path().join("asset.js"), "console.log(1)").expect("write asset");
+        std::fs::create_dir(dir.path().join("posts")).expect("mkdir");
+        std::fs::write(dir.path().join("posts").join("a.txt"), "a").expect("write post");
+        dir
+    }
+
+    // --- --spa ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn spa_serves_the_shell_for_a_deep_link_and_keeps_real_files() {
+        // The SPA contract: a path matching no file falls back to the root
+        // index.html, while paths matching real files (and the root itself)
+        // are served untouched.
+        let dir = spa_dir();
+        let app = flagged_router(dir.path(), true, false, None);
+
+        let resp = app
+            .clone()
+            .oneshot(req("GET", "/settings/profile"))
+            .await
+            .expect("deep link");
+        assert_eq!(resp.status(), StatusCode::OK, "deep link gets the shell");
+        assert_eq!(body_of(resp).await, "SHELL");
+
+        let resp = app
+            .clone()
+            .oneshot(req("GET", "/asset.js"))
+            .await
+            .expect("real asset");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_of(resp).await, "console.log(1)", "no rewrite");
+
+        // HEAD mirrors the GET representation headers-only (the listing's
+        // HEAD discipline).
+        let resp = app
+            .oneshot(req("HEAD", "/settings/profile"))
+            .await
+            .expect("HEAD deep link");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_LENGTH).unwrap(),
+            &HeaderValue::from("SHELL".len())
+        );
+        assert!(body_of(resp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn spa_without_a_root_index_keeps_the_404() {
+        // A root with no index.html must keep the honest 404 for missing
+        // paths — never a 500 for the unreadable fallback target, and never a
+        // rewrite to a file that does not exist.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("real.txt"), "x").expect("write");
+        let resp = flagged_router(dir.path(), true, false, None)
+            .oneshot(req("GET", "/missing"))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn spa_keeps_dotfiles_traversal_and_the_listing() {
+        // The rewrite must not break the security or listing disciplines:
+        // dotfiles stay 404 (and never become the shell, which would leak a
+        // dotfile oracle the other way), `..` traversal stays 404, and a
+        // directory without an index.html still renders the generated listing
+        // instead of being swallowed by the fallback.
+        let dir = spa_dir();
+        std::fs::write(dir.path().join(".env"), "SECRET=1").expect("plant dotfile");
+        let app = flagged_router(dir.path(), true, false, None);
+
+        for uri in ["/.env", "/posts/../.env", "/a/../b"] {
+            let resp = app.clone().oneshot(req("GET", uri)).await.expect("oneshot");
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "{uri} must stay 404 under --spa"
+            );
+            assert_ne!(
+                body_of(resp).await,
+                "SHELL",
+                "{uri} must never be answered with the shell"
+            );
+        }
+
+        let resp = app
+            .clone()
+            .oneshot(req("GET", "/posts/"))
+            .await
+            .expect("listing");
+        assert_eq!(resp.status(), StatusCode::OK, "listings still render");
+        assert!(body_of(resp).await.contains("Index of /posts"));
+
+        // An existing real file inside a nested dir is still served (not
+        // rewritten, not listing-redirected).
+        let resp = app
+            .oneshot(req("GET", "/posts/a.txt"))
+            .await
+            .expect("nested file");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_of(resp).await, "a");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spa_never_launders_an_escaping_symlink_into_the_shell() {
+        // The adversarial case for the "canonicalize succeeded → keep the
+        // 404" rule: a symlink escaping the root is confined to a 404, and the
+        // SPA fallback must not turn that refusal into a 200 shell (which
+        // would make the tunnel answer poisoned routes with app content).
+        use std::os::unix::fs::symlink;
+        let dir = spa_dir();
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("secret"), "TOPSECRET").expect("write");
+        symlink(outside.path().join("secret"), dir.path().join("leak")).expect("symlink");
+
+        let resp = flagged_router(dir.path(), true, false, None)
+            .oneshot(req("GET", "/leak"))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_ne!(body_of(resp).await, "SHELL");
+    }
+
+    // --- --cors ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn cors_headers_are_stamped_when_on_and_absent_when_off() {
+        let dir = spa_dir();
+        let on = flagged_router(dir.path(), false, true, None)
+            .oneshot(req("GET", "/"))
+            .await
+            .expect("oneshot");
+        assert_eq!(
+            on.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "*"
+        );
+        assert_eq!(
+            on.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_METHODS)
+                .unwrap(),
+            "GET, HEAD, OPTIONS"
+        );
+        assert_eq!(
+            on.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+                .unwrap(),
+            "*"
+        );
+
+        let off = flagged_router(dir.path(), false, false, None)
+            .oneshot(req("GET", "/"))
+            .await
+            .expect("oneshot");
+        assert!(
+            !off.headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            "no CORS headers without --cors"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_stamps_error_responses_and_preflights_stay_unanswered() {
+        // The documented preflight choice: OPTIONS reaches ServeDir's uniform
+        // 405 (the origin is GET/HEAD-only, both CORS-simple), and the stamped
+        // headers ride even that 405 — and on 404s — so the origin's
+        // cross-origin story is uniform rather than faking an allowance with a
+        // fake-2xx preflight.
+        let dir = spa_dir();
+        let app = flagged_router(dir.path(), false, true, None);
+
+        let resp = app
+            .clone()
+            .oneshot(req("GET", "/missing"))
+            .await
+            .expect("404");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            resp.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "*",
+            "errors carry the CORS headers too"
+        );
+
+        let resp = app.oneshot(req("OPTIONS", "/")).await.expect("OPTIONS");
+        assert_eq!(
+            resp.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "a preflight is not specially answered"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "*"
+        );
+    }
+
+    // --- --token --------------------------------------------------------------
+
+    #[tokio::test]
+    async fn token_is_required_by_header_or_query_and_401s_otherwise() {
+        // The auth contract: every method is gated; the token passes via
+        // `Authorization: Bearer` OR `?token=`; wrong and missing both 401
+        // with the WWW-Authenticate scheme advertised.
+        let dir = spa_dir();
+        let app = flagged_router(dir.path(), false, false, Some("sekrit"));
+
+        for method in ["GET", "HEAD", "POST", "OPTIONS"] {
+            let resp = app
+                .clone()
+                .oneshot(req(method, "/asset.js"))
+                .await
+                .expect("no token");
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{method} ungated");
+            assert_eq!(
+                resp.headers().get(header::WWW_AUTHENTICATE).unwrap(),
+                "Bearer"
+            );
+        }
+
+        let resp = app
+            .clone()
+            .oneshot(req_with(
+                "GET",
+                "/asset.js",
+                &[("authorization", "Bearer sekrit")],
+            ))
+            .await
+            .expect("bearer");
+        assert_eq!(resp.status(), StatusCode::OK, "valid Bearer passes");
+
+        let resp = app
+            .clone()
+            .oneshot(req("GET", "/asset.js?token=sekrit"))
+            .await
+            .expect("query token");
+        assert_eq!(resp.status(), StatusCode::OK, "valid ?token= passes");
+
+        let resp = app
+            .clone()
+            .oneshot(req_with(
+                "GET",
+                "/asset.js",
+                &[("authorization", "Bearer wrong")],
+            ))
+            .await
+            .expect("wrong bearer");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "wrong Bearer");
+
+        let resp = app
+            .oneshot(req("GET", "/asset.js?token=wrong"))
+            .await
+            .expect("wrong query token");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "wrong ?token=");
+    }
+
+    #[tokio::test]
+    async fn token_gates_before_confinement_so_the_tree_cannot_be_probed() {
+        // The layering reason the guard sits OUTSIDE confine: without a valid
+        // token even a dotfile path reads 401 (indistinguishable from any
+        // other path — no 404-scanning oracle), while WITH a valid token the
+        // confinement refusals keep their exact meaning (dotfile → 404, not
+        // the shell), and --spa deep links still work for the bearer.
+        let dir = spa_dir();
+        std::fs::write(dir.path().join(".env"), "SECRET=1").expect("plant dotfile");
+        let app = flagged_router(dir.path(), true, false, Some("sekrit"));
+
+        let resp = app
+            .clone()
+            .oneshot(req("GET", "/.env"))
+            .await
+            .expect("unauthenticated probe");
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a dotfile probe without the token must 401, not 404"
+        );
+
+        let resp = app
+            .clone()
+            .oneshot(req_with(
+                "GET",
+                "/.env",
+                &[("authorization", "Bearer sekrit")],
+            ))
+            .await
+            .expect("authenticated probe");
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "confinement still denies the dotfile for a valid bearer"
+        );
+
+        let resp = app
+            .clone()
+            .oneshot(req("GET", "/settings/profile?token=sekrit"))
+            .await
+            .expect("spa + query token");
+        assert_eq!(resp.status(), StatusCode::OK, "deep link with ?token=");
+        assert_eq!(body_of(resp).await, "SHELL");
+
+        let resp = app
+            .oneshot(req("GET", "/settings/profile"))
+            .await
+            .expect("spa without token");
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "the shell itself is gated too"
+        );
+    }
+
+    #[test]
+    fn tokens_match_is_exact_and_constant_time_shaped() {
+        // The compare must never early-return on a mismatching byte or on a
+        // length difference (the accumulator folds both), an empty configured
+        // token matches nothing, and only the exact secret passes.
+        let m = |p: &str, e: &str| super::tokens_match(p, e);
+        assert!(m("sekrit", "sekrit"));
+        assert!(!m("sekriT", "sekrit"), "one differing byte is enough");
+        assert!(!m("sekri", "sekrit"), "shorter never matches");
+        assert!(!m("sekritlonger", "sekrit"), "longer never matches");
+        assert!(!m("", "sekrit"), "nothing provided never matches");
+        assert!(!m("sekrit", ""), "an unconfigured token matches nothing");
     }
 }

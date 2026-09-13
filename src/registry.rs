@@ -298,6 +298,7 @@ mod tests {
             worker_pid: 0,
             tunnel_pid: None,
             command_pid: None,
+            static_flags: Default::default(),
             created_at: crate::model::now_utc(),
             state_dir: PathBuf::from("/tmp/state"),
             foreground: false,
@@ -626,6 +627,7 @@ mod tests {
             worker_pid: 4242,
             tunnel_pid: Some(5353),
             command_pid: None,
+            static_flags: Default::default(),
             // Pinned instant (SystemTime epoch) so created_at is deterministic.
             created_at: std::time::SystemTime::UNIX_EPOCH.into(),
             state_dir: PathBuf::from("/srv/ft-state/services/blog"),
@@ -680,6 +682,7 @@ mod tests {
                 worker_pid: 4242,
                 tunnel_pid: Some(5353),
                 command_pid: None,
+                static_flags: Default::default(),
                 created_at: std::time::SystemTime::UNIX_EPOCH.into(),
                 state_dir: PathBuf::from("/srv/ft-state/services/dev"),
                 foreground: false,

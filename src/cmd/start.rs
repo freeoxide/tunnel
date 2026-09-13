@@ -26,7 +26,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::cloudflared;
 use crate::error::Result;
-use crate::model::{Registry, Service, ServiceKind};
+use crate::model::{Registry, Service, ServiceKind, StaticFlags};
 use crate::name;
 use crate::output;
 use crate::port;
@@ -46,13 +46,18 @@ const LAST_REASON_CAP: u64 = 16 * 1024;
 
 /// Entry point for the START command.
 ///
-/// `dir` defaults to `.` when the caller passes `None`.
+/// `dir` defaults to `.` when the caller passes `None`. `static_flags` carries
+/// the static-origin flags (`--spa`/`--cors`/`--token`); they are refused
+/// outright with an empty `--token` value (an empty secret would either lock
+/// everyone out or — worse — read as "no auth" to a future reader) and are
+/// persisted on the reserved entry so the detached worker re-applies them.
 pub async fn run(
     dir: Option<PathBuf>,
     name: Option<String>,
     port: Option<u16>,
     foreground: bool,
     yes: bool,
+    static_flags: StaticFlags,
 ) -> Result<()> {
     let dir = dir.unwrap_or_else(|| PathBuf::from("."));
     let dir = resolve_dir(&dir)?;
@@ -60,11 +65,21 @@ pub async fn run(
     // filesystem root to the public internet. Dotfiles are already refused by
     // the server (C1), but `$HOME` still exposes most of a user's life.
     confirm_sensitive(&dir, yes)?;
+    // Before any state is touched: an empty (or whitespace-only) --token is a
+    // typo, not a configuration. The value itself is kept verbatim — both the
+    // foreground server and the detached worker read the SAME registry value,
+    // so unlike a file round-trip there is no trim-mismatch to paper over.
+    if let Some(token) = &static_flags.token {
+        ensure!(
+            !token.trim().is_empty(),
+            "--token must be a non-empty secret"
+        );
+    }
 
     if foreground {
-        run_foreground(Some(dir.as_path()), name, port).await
+        run_foreground_with_options(dir.as_path(), name, port, static_flags).await
     } else {
-        run_background(&dir, name, port).await
+        run_background(&dir, name, port, static_flags).await
     }
 }
 
@@ -186,7 +201,12 @@ fn is_readable(dir: &Path) -> bool {
 /// `kill(-pgid)`; on Windows it is detached via `CREATE_NEW_PROCESS_GROUP |
 /// DETACHED_PROCESS` and owns a `KILL_ON_JOB_CLOSE` Job Object. Both are hidden
 /// behind [`spawn::spawn_worker`] and [`proc::shutdown_process_group`].
-async fn run_background(dir: &Path, name: Option<String>, port: Option<u16>) -> Result<()> {
+async fn run_background(
+    dir: &Path,
+    name: Option<String>,
+    port: Option<u16>,
+    static_flags: StaticFlags,
+) -> Result<()> {
     let state = StateDir::new()?;
 
     // --- Port -------------------------------------------------------------
@@ -241,6 +261,10 @@ async fn run_background(dir: &Path, name: Option<String>, port: Option<u16>) -> 
             public_url: None,
             worker_pid: 0,
             tunnel_pid: None,
+            // The origin flags ride the entry itself: the worker reloads this
+            // entry before starting (that is where it reads the kind), so it
+            // re-applies exactly these values — no flag rides the argv.
+            static_flags,
             command_pid: None,
             created_at: crate::model::now_utc(),
             state_dir: service_dir,
@@ -442,13 +466,28 @@ impl Drop for EntryGuard {
 ///
 /// Shared entry kept at the historical signature so the proxy flow's call site
 /// (frozen for this area) stays untouched; the run flow enters through
-/// [`run_foreground_with_command`].
+/// [`run_foreground_with_command`] and a static start with origin flags through
+/// [`run_foreground_with_options`].
 pub(crate) async fn run_foreground(
     dir: Option<&Path>,
     name: Option<String>,
     port: Option<u16>,
 ) -> Result<()> {
-    run_foreground_inner(dir, name, port, None).await
+    run_foreground_inner(dir, name, port, None, StaticFlags::default()).await
+}
+
+/// Foreground entry for `ft <dir> --foreground` with static-origin flags.
+///
+/// The same machinery as [`run_foreground`], with the `--spa`/`--cors`/
+/// `--token` values applied to the static server and persisted on the
+/// reserved entry.
+pub(crate) async fn run_foreground_with_options(
+    dir: &Path,
+    name: Option<String>,
+    port: Option<u16>,
+    static_flags: StaticFlags,
+) -> Result<()> {
+    run_foreground_inner(Some(dir), name, port, None, static_flags).await
 }
 
 /// Foreground entry for `ft run --port <p> -- <cmd> --foreground`.
@@ -462,14 +501,16 @@ pub(crate) async fn run_foreground_with_command(
     port: Option<u16>,
     command: &[OsString],
 ) -> Result<()> {
-    run_foreground_inner(None, name, port, Some(command)).await
+    run_foreground_inner(None, name, port, Some(command), StaticFlags::default()).await
 }
 
 /// The shared foreground machinery behind both entries.
 ///
 /// `dir` selects the static origin, mirroring the registry invariant (`Static`
 /// services carry a directory): `Some(dir)` runs ft's own static server for
-/// `dir` (the implicit `ft <dir> --foreground` flow). `None` with a `command`
+/// `dir` (the implicit `ft <dir> --foreground` flow), applying `static_flags`
+/// (the `--spa`/`--cors`/`--token` values; ignored by the run/proxy flows,
+/// which pass the default). `None` with a `command`
 /// runs the operator's command as ft's child and fronts it (the
 /// `ft run --foreground` flow); `None` without a command runs NO server of our
 /// own — cloudflared points straight at the operator's existing upstream on
@@ -486,6 +527,7 @@ async fn run_foreground_inner(
     name: Option<String>,
     port: Option<u16>,
     command: Option<&[OsString]>,
+    static_flags: StaticFlags,
 ) -> Result<()> {
     use crate::static_server;
     use std::time::Duration;
@@ -585,6 +627,12 @@ async fn run_foreground_inner(
             // foreground entry starts like a background one, with no child
             // recorded yet.
             command_pid: None,
+            // The static-origin flags ride the entry here too, so `ft detail`
+            // shows what the operator started with and the registry stays the
+            // single source of truth. Defaulted (all off) for the run/proxy
+            // foreground flows, which pass no flags. (Cloned: the same value
+            // also configures the in-process server below.)
+            static_flags: static_flags.clone(),
             created_at: crate::model::now_utc(),
             state_dir: service_dir,
             foreground: true,
@@ -622,7 +670,10 @@ async fn run_foreground_inner(
     // server at all — `server_handle` stays `None` below and the drain at the
     // end is skipped.
     let mut server_handle = dir.map(|dir| {
-        let router = static_server::router(dir.to_path_buf());
+        // The static-origin flags (defaulted for the run/proxy foreground
+        // flows, where `dir` is None and this closure never runs) configure
+        // the same router the detached worker would build from the entry.
+        let router = static_server::router_with(dir.to_path_buf(), static_flags.clone());
         // `serve` installs its own Ctrl-C handler for graceful shutdown: on
         // Ctrl-C it stops accepting and drains in-flight requests. We keep the
         // JoinHandle so we can bound that drain below.
@@ -933,7 +984,7 @@ async fn drain_and_announce<R>(
 #[cfg(test)]
 mod tests {
     use super::{EntryGuard, is_sensitive_dir};
-    use crate::model::{Registry, Service, ServiceKind};
+    use crate::model::{Registry, Service, ServiceKind, StaticFlags};
     use crate::state::StateDir;
     #[cfg(unix)]
     use std::path::Path;
@@ -997,6 +1048,7 @@ mod tests {
                 worker_pid: 0,
                 tunnel_pid: None,
                 command_pid: None,
+                static_flags: StaticFlags::default(),
                 created_at: crate::model::now_utc(),
                 state_dir: PathBuf::from("/tmp"),
                 foreground: true,

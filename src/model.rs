@@ -72,6 +72,48 @@ impl ServiceKind {
     }
 }
 
+/// Static-origin behaviour flags (`ft <dir> --spa/--cors/--token`), carried on
+/// a [`Service`] so the detached worker re-applies exactly what the operator
+/// asked for.
+///
+/// They travel on the registry entry — not the worker argv — because the
+/// worker already reloads the reserved entry before starting (that is where
+/// the `kind` comes from), so a second channel would duplicate this state and,
+/// worse, put the `token` secret in `ps` output. All three are meaningless for
+/// non-Static kinds (the CLI only accepts them on the implicit `ft <dir>`
+/// START, whose origin is always static; `ft proxy` structurally has no such
+/// flags — the hard never-on-proxy exclusion).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StaticFlags {
+    /// `--spa`: fall unmatched paths (the 404s for non-existent files under
+    /// the served root) back to the root `index.html`, so a client-side
+    /// router's deep links work. Refusal 404s keep their meaning: dotfiles,
+    /// `..` traversal, and symlink escapes are never rewritten to the shell,
+    /// and a root without an `index.html` keeps the honest 404.
+    pub spa: bool,
+    /// `--cors`: stamp permissive CORS headers (`Access-Control-Allow-Origin:
+    /// *`, methods GET/HEAD/OPTIONS, wildcard request headers) on every
+    /// response of the static origin. Preflight OPTIONS requests are
+    /// deliberately NOT answered with a success status — the origin is
+    /// GET/HEAD-only, both of which are CORS-"simple" requests that browsers
+    /// send without a preflight, so any request that would preflight is one
+    /// this origin would 405 anyway.
+    pub cors: bool,
+    /// `--token <secret>`: require this operator-chosen secret on EVERY
+    /// request (GET/HEAD included — the static origin's entire value is its
+    /// content, so unlike the drop bucket's write-only gate there is no safe
+    /// unauthenticated subset) via `Authorization: Bearer <secret>` or
+    /// `?token=<secret>`, compared in constant time, answered 401 before the
+    /// confinement layer so a 404-scanner cannot probe the tree shape without
+    /// the token. Deliberately never auto-generated (unlike the drop bucket's
+    /// write credential): the brief makes it an operator-chosen secret, and a
+    /// value the operator already knows needs no minting ceremony. Stored here
+    /// in the registry — the save path is owner-only 0600, the same protection
+    /// the drop token's private file gets.
+    pub token: Option<String>,
+}
+
 /// A single managed tunnel service.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(PartialEq))]
@@ -115,6 +157,14 @@ pub struct Service {
     pub worker_pid: u32,
     /// PID of the `cloudflared` child, once spawned.
     pub tunnel_pid: Option<u32>,
+    /// Static-origin flags for `Static` services (`--spa`/`--cors`/`--token`),
+    /// persisted so the detached worker re-applies them — see [`StaticFlags`]
+    /// for why they live here rather than on the worker argv. Serde-defaulted
+    /// so every registry written before the flags existed (and every non-Static
+    /// entry, which never sets them) keeps loading unchanged with all flags
+    /// off.
+    #[serde(default)]
+    pub static_flags: StaticFlags,
     /// PID of the user's command child, for `Run` services only: `None` for
     /// every other kind, and for a `Run` entry until its worker has actually
     /// spawned the command. The worker records it under the registry lock so
@@ -264,6 +314,7 @@ mod tests {
             public_url: public_url.map(str::to_string),
             worker_pid,
             tunnel_pid: None,
+            static_flags: StaticFlags::default(),
             command_pid: None,
             created_at: super::now_utc(),
             state_dir: PathBuf::from("/tmp/state"),
@@ -414,6 +465,63 @@ mod tests {
         let json = service_json(r#""kind": "proxy", "dir": null,"#);
         let s: Service = serde_json::from_str(&json).expect("entry without command_pid");
         assert_eq!(s.command_pid, None);
+    }
+
+    #[test]
+    fn omitted_static_flags_deserialize_as_all_off() {
+        // `static_flags` is serde-defaulted so every registry written before
+        // the static-origin flags existed keeps loading unchanged: a legacy
+        // (or plain) entry must read as spa off, cors off, no token — never
+        // fail the parse, never silently enable a behaviour the operator did
+        // not ask for.
+        let json = service_json(r#""kind": "static", "dir": "/tmp/dir","#);
+        let s: Service = serde_json::from_str(&json).expect("entry without static_flags");
+        assert_eq!(s.static_flags, StaticFlags::default());
+        assert!(!s.static_flags.spa);
+        assert!(!s.static_flags.cors);
+        assert_eq!(s.static_flags.token, None);
+    }
+
+    #[test]
+    fn static_flags_round_trip_through_json() {
+        // A static entry carrying all three origin flags must survive a
+        // serialize → deserialize cycle field-for-field: the flags ARE the
+        // persistence story — the detached worker re-applies exactly these
+        // values (including the token secret) from the reloaded entry.
+        let s = Service {
+            static_flags: StaticFlags {
+                spa: true,
+                cors: true,
+                token: Some("hunter2".to_string()),
+            },
+            ..service(7, Some("https://example.trycloudflare.com"), false)
+        };
+        let encoded = serde_json::to_string(&s).expect("encode");
+        let decoded: Service = serde_json::from_str(&encoded).expect("decode");
+        assert_eq!(decoded, s);
+    }
+
+    #[test]
+    fn explicit_static_flags_json_deserializes() {
+        // The on-disk shape a real `ft <dir> --spa --cors --token s` start
+        // reserves: a `static_flags` object on the entry. Partial objects work
+        // too (container-level serde default), so a hand-edited entry cannot
+        // be bricked by an incomplete flag group.
+        let json = service_json(
+            r#""kind": "static", "dir": "/tmp/dir",
+            "static_flags": {"spa": true, "cors": false, "token": "s"},"#,
+        );
+        let s: Service = serde_json::from_str(&json).expect("flagged entry must parse");
+        assert!(s.static_flags.spa);
+        assert!(!s.static_flags.cors);
+        assert_eq!(s.static_flags.token.as_deref(), Some("s"));
+
+        let json =
+            service_json(r#""kind": "static", "dir": "/tmp/dir", "static_flags": {"spa": true},"#);
+        let s: Service = serde_json::from_str(&json).expect("partial flag group must parse");
+        assert!(s.static_flags.spa);
+        assert!(!s.static_flags.cors);
+        assert_eq!(s.static_flags.token, None);
     }
 
     #[test]

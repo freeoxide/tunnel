@@ -75,7 +75,23 @@ pub async fn run(cli: Cli) -> Result<()> {
         }) => crate::worker::run(id, name, dir, port, command, keep, max_size).await,
         None => {
             let dir: PathBuf = cli.dir.unwrap_or_else(|| PathBuf::from("."));
-            start::run(Some(dir), cli.name, cli.port, cli.foreground, cli.yes).await
+            // The static-origin flags only exist on the implicit START (the
+            // CLI structurally has no such flag on any subcommand), so the
+            // never-on-proxy exclusion holds by construction.
+            let static_flags = crate::model::StaticFlags {
+                spa: cli.spa,
+                cors: cli.cors,
+                token: cli.token,
+            };
+            start::run(
+                Some(dir),
+                cli.name,
+                cli.port,
+                cli.foreground,
+                cli.yes,
+                static_flags,
+            )
+            .await
         }
     }
 }

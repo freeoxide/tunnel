@@ -108,7 +108,9 @@ pub fn print_list(services: &[Service]) {
 ///
 /// The `Mode`/`Directory` rows are kind-aware: a Static service keeps the
 /// historical shape exactly (mode = foreground/background, plus the served
-/// `Directory:`), a Proxy service renders its kind in the `Mode:` row and
+/// `Directory:`) and adds its static-origin flag rows (`SPA:`/`CORS:` always,
+/// on/off; `Token:` only when the operator started it with `--token`), a Proxy
+/// service renders its kind in the `Mode:` row and
 /// replaces `Directory:` with the `Upstream:` it fronts (the proxy's
 /// `local_url` IS the operator's server), a Run service renders its kind with
 /// no Directory row at all (its origin is the command ft spawned — the
@@ -171,6 +173,31 @@ pub fn print_detail(service: &Service) {
                     .as_deref()
                     .map_or_else(|| "-".to_string(), |d| d.display().to_string())
             );
+            // The static-origin flags as started (`--spa`/`--cors`/`--token`):
+            // always rendered on/off so the shape is predictable, with the
+            // token row only when one is configured (a `-` placeholder for a
+            // value that never existed would just be noise on the historical
+            // no-flag shape). The token renders because the operator chose it
+            // — same recovery convenience as the drop bucket's token row.
+            println!(
+                "SPA:          {}",
+                if service.static_flags.spa {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
+            println!(
+                "CORS:         {}",
+                if service.static_flags.cors {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
+            if let Some(token) = &service.static_flags.token {
+                println!("Token:        {token}");
+            }
         }
     }
     println!("Port:         {}", service.port);

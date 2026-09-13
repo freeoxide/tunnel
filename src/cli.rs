@@ -4,7 +4,10 @@
 //! command against a positional directory: `ft ./site` starts a tunnel for
 //! `./site`. All other invocations are explicit subcommands (`ls`, `detail`,
 //! `doctor`, `kill`, `logs`, `open`, `prune`, `proxy`, `sanitize`, and the
-//! hidden `run-worker`).
+//! hidden `run-worker`). The static-origin flags (`--spa`/`--cors`/`--token`)
+//! live on the top-level command only — the implicit START's origin is the
+//! only one they can meaningfully configure, and `ft proxy` structurally takes
+//! none of them (the never-on-proxy exclusion is a parse-level guarantee).
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -48,6 +51,30 @@ pub struct Cli {
     /// a sensitive directory must pass this or they will refuse to start.
     #[arg(long, short = 'y')]
     pub yes: bool,
+
+    /// Serve a single-page app: paths that match no file under the directory
+    /// fall back to the root `index.html`, so client-side router deep links
+    /// work. Security discipline is unchanged — dotfiles stay denied, symlink
+    /// confinement stays on, and directories without an `index.html` still
+    /// render the generated listing.
+    #[arg(long)]
+    pub spa: bool,
+
+    /// Send permissive CORS headers (`Access-Control-Allow-Origin: *`, methods
+    /// GET/HEAD/OPTIONS, wildcard request headers) on this static origin.
+    /// Preflight OPTIONS requests are not answered specially: the origin is
+    /// GET/HEAD-only, which browsers request cross-origin without a preflight.
+    #[arg(long)]
+    pub cors: bool,
+
+    /// Require this secret on every request of the static origin — sent as
+    /// `Authorization: Bearer <SECRET>` (preferred) or `?token=<SECRET>` —
+    /// compared in constant time; anything else is answered 401 before the
+    /// tree can be probed. You choose the value (it is never auto-generated)
+    /// and it is stored in the service's registry entry, where `ft detail`
+    /// shows it again.
+    #[arg(long, value_name = "SECRET")]
+    pub token: Option<String>,
 }
 
 /// Explicit subcommands.
@@ -827,5 +854,58 @@ mod tests {
         let cli = parse(&["./site"]).expect("`ft ./site` must parse");
         assert!(cli.command.is_none());
         assert_eq!(cli.dir, Some(PathBuf::from("./site")));
+    }
+
+    #[test]
+    fn static_origin_flags_parse_on_the_implicit_start() {
+        // All three static-origin flags parse on the implicit START, before or
+        // after the positional directory, and default to off/absent when
+        // omitted.
+        let cli = parse(&["--spa", "--cors", "--token", "sekrit", "./site"])
+            .expect("`ft --spa --cors --token s ./site` must parse");
+        assert!(cli.command.is_none());
+        assert_eq!(cli.dir, Some(PathBuf::from("./site")));
+        assert!(cli.spa && cli.cors);
+        assert_eq!(cli.token.as_deref(), Some("sekrit"));
+
+        let cli = parse(&["./site", "--spa"]).expect("flags after the positional must parse too");
+        assert!(cli.command.is_none());
+        assert!(cli.spa);
+        assert!(!cli.cors);
+        assert_eq!(cli.token, None);
+
+        let cli = parse(&["./site"]).expect("`ft ./site` must keep parsing");
+        assert!(!cli.spa && !cli.cors && cli.token.is_none());
+    }
+
+    #[test]
+    fn proxy_takes_no_static_origin_flags() {
+        // NEVER-ON-PROXY (hard exclusion): the static-origin flags exist only
+        // on the implicit START. `ft proxy` fronts the operator's own server,
+        // so ft-owned origin policy (SPA rewriting, CORS stamping, token auth)
+        // must be a parse-level error there, not a silently ignored flag — a
+        // typo like `ft proxy 3000 --token x` has to fail loudly.
+        for flag in [["--spa"].as_slice(), &["--cors"], &["--token", "sekrit"]] {
+            let mut args = vec!["proxy", "3000"];
+            args.extend_from_slice(flag);
+            assert!(
+                parse(&args).is_err(),
+                "`ft {}` must not parse: proxy takes no static-origin flags",
+                args.join(" ")
+            );
+        }
+        // Same parse-level exclusion for the other subcommands whose origins
+        // are not a static directory (hook/drop/run carry their own flag sets).
+        for args in [
+            vec!["hook", "--spa"],
+            vec!["drop", "inbox", "--cors"],
+            vec!["run", "--port", "3000", "--token", "s", "--", "x"],
+        ] {
+            assert!(
+                parse(&args).is_err(),
+                "`ft {}` must not parse: static-origin flags are START-only",
+                args.join(" ")
+            );
+        }
     }
 }

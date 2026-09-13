@@ -136,15 +136,19 @@ pub async fn run(
     // the kind (and, for Static, the directory) before spawning us. A miss here
     // means the entry vanished between the probe and this load (a concurrent
     // `ft kill`): exit rather than serve an untracked tunnel.
-    let Some(kind) = Registry::load(&state)?
-        .find(&id.to_string())
-        .map(|s| s.kind)
-    else {
+    let Some(entry) = Registry::load(&state)?.find(&id.to_string()).cloned() else {
         let _ = Registry::update(&state, |reg| {
             reg.remove(id);
         });
         anyhow::bail!("registry entry for service id={id} vanished before start");
     };
+    let kind = entry.kind;
+    // The static-origin flags (`--spa`/`--cors`/`--token`) were persisted on
+    // the reserved entry by the parent, so the detached worker re-applies
+    // exactly what the operator asked for — no flag rides the worker argv
+    // (which would duplicate this state and leak the token secret into `ps`).
+    // Meaningless for non-Static kinds, which never read it.
+    let static_flags = entry.static_flags;
 
     // Tracing setup sits AFTER the kind read rather than at the top of `run`:
     // the server.log sink exists to receive tower_http request traces, which
@@ -270,7 +274,7 @@ pub async fn run(
             let listener = bind_loopback_fail_fast(&state, id, port).await?;
             tracing::info!("static server bound on 127.0.0.1:{port}");
 
-            let router = static_server::router(dir.to_path_buf());
+            let router = static_server::router_with(dir.to_path_buf(), static_flags);
             serve_origin(router, listener)
         }
         ServiceKind::Hook => {
@@ -953,6 +957,7 @@ mod tests {
             public_url: None,
             worker_pid: 0,
             tunnel_pid: None,
+            static_flags: crate::model::StaticFlags::default(),
             command_pid: None,
             created_at: crate::model::now_utc(),
             state_dir: PathBuf::from("/tmp/state"),

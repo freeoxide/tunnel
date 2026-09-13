@@ -207,6 +207,7 @@ async fn run_background(
             worker_pid: 0,
             tunnel_pid: None,
             command_pid: None, // Run-only field; a drop spawns no command
+            static_flags: Default::default(),
             created_at: crate::model::now_utc(),
             state_dir: service_dir,
             foreground: false,
@@ -517,6 +518,7 @@ async fn run_foreground(
             worker_pid: std::process::id(),
             tunnel_pid: None,
             command_pid: None,
+            static_flags: Default::default(),
             created_at: crate::model::now_utc(),
             state_dir: service_dir,
             foreground: true,
@@ -757,6 +759,7 @@ mod tests {
             worker_pid: 0,
             tunnel_pid: None,
             command_pid: None,
+            static_flags: Default::default(),
             created_at: crate::model::now_utc(),
             state_dir: PathBuf::from("/tmp/state"),
             foreground: false,

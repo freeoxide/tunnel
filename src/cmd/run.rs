@@ -184,6 +184,7 @@ async fn run_background(port: u16, name: Option<String>, command: &[OsString]) -
             worker_pid: 0,
             tunnel_pid: None,
             command_pid: None,
+            static_flags: Default::default(),
             created_at: crate::model::now_utc(),
             state_dir: service_dir,
             foreground: false,

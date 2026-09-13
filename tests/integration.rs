@@ -1824,3 +1824,206 @@ fn hook_fixture_renders_in_ls_and_detail() {
         "kill should have removed the hook entry, but registry is: {after}"
     );
 }
+
+// --- static-origin flags on `ft <dir>` (A5): CLI surface, never-on-proxy,
+// --- registry persistence + detail rendering. No cloudflared: the origin
+// --- behaviour itself (SPA fallback, CORS headers, 401 token gate) is covered
+// --- by the static_server unit tests driving `router_with` directly; these
+// --- binary-level tests pin the plumbing around it.
+
+#[test]
+fn start_help_documents_the_static_origin_flags() {
+    // The implicit START's help is the flags' only documentation surface at
+    // the CLI level (README is A6's sweep): all three must be listed.
+    let dir = TempDir::new().unwrap();
+    let (ok, out) = run_ft(dir.path(), &["--help"]);
+    assert!(ok, "`ft --help` failed: {out}");
+    assert!(out.contains("--spa"), "missing --spa in: {out}");
+    assert!(out.contains("--cors"), "missing --cors in: {out}");
+    assert!(out.contains("--token"), "missing --token in: {out}");
+}
+
+#[test]
+fn proxy_takes_no_static_origin_flags() {
+    // NEVER-ON-PROXY (hard exclusion, binary level): the static-origin flags
+    // exist only on the implicit START, so `ft proxy` with any of them is a
+    // clap usage error — before any preflight, state, or cloudflared lookup —
+    // and `ft proxy --help` does not even advertise them. A proxy fronts the
+    // operator's own server; ft-owned origin policy must be unparsable there,
+    // not silently ignored.
+    let dir = TempDir::new().unwrap();
+    for args in [
+        vec!["proxy", "--help"],
+        vec!["proxy", "3000", "--spa"],
+        vec!["proxy", "3000", "--cors"],
+        vec!["proxy", "3000", "--token", "sekrit"],
+    ] {
+        let (ok, out) = run_ft(dir.path(), &args);
+        if args == vec!["proxy", "--help"] {
+            assert!(ok, "`ft proxy --help` failed: {out}");
+            assert!(
+                !out.contains("--spa") && !out.contains("--cors") && !out.contains("--token"),
+                "proxy help must not advertise static-origin flags: {out}"
+            );
+        } else {
+            assert!(
+                !ok,
+                "expected a usage error for `ft {}`, got: {out}",
+                args.join(" ")
+            );
+            assert!(
+                out.contains("unexpected argument"),
+                "expected a clap unknown-argument error for `ft {}`, got: {out}",
+                args.join(" ")
+            );
+        }
+    }
+    assert!(
+        tree_paths(dir.path()).is_empty(),
+        "rejected proxy invocations must leave no state, found: {:?}",
+        tree_paths(dir.path())
+    );
+}
+
+#[test]
+fn static_flags_fixture_renders_in_detail() {
+    // A seeded static entry carrying `static_flags` (the on-disk shape `ft
+    // <dir> --spa --cors --token s` reserves) must render the flags in `ft
+    // detail` — SPA/CORS always (on/off) and the token only when configured —
+    // while a plain static entry in the same registry keeps the historical
+    // shape (SPA/CORS off, no Token row).
+    let dir = TempDir::new().unwrap();
+    let body = r#"{
+  "next_id": 3,
+  "services": [
+    {
+      "id": 1,
+      "name": "flagged-svc",
+      "kind": "static",
+      "dir": "/tmp/seed-dir",
+      "port": 8080,
+      "local_url": "http://127.0.0.1:8080",
+      "public_url": "https://x.trycloudflare.com",
+      "worker_pid": 4000000,
+      "tunnel_pid": null,
+      "static_flags": { "spa": true, "cors": true, "token": "hunter2" },
+      "created_at": "2026-07-21T00:00:00Z",
+      "state_dir": "/tmp/seed-state",
+      "foreground": false
+    },
+    {
+      "id": 2,
+      "name": "plain-svc",
+      "kind": "static",
+      "dir": "/tmp/plain-dir",
+      "port": 8081,
+      "local_url": "http://127.0.0.1:8081",
+      "public_url": null,
+      "worker_pid": 4000000,
+      "tunnel_pid": null,
+      "created_at": "2026-07-21T00:00:00Z",
+      "state_dir": "/tmp/plain-state",
+      "foreground": false
+    }
+  ]
+}"#;
+    seed_registry(dir.path(), body);
+
+    let (ok, out) = run_ft(dir.path(), &["detail", "flagged-svc"]);
+    assert!(ok, "`ft detail flagged-svc` failed: {out}");
+    assert!(
+        out.contains("SPA:          on"),
+        "expected the SPA row on, got: {out}"
+    );
+    assert!(
+        out.contains("CORS:         on"),
+        "expected the CORS row on, got: {out}"
+    );
+    assert!(
+        out.contains("Token:        hunter2"),
+        "expected the configured token row, got: {out}"
+    );
+
+    let (ok_plain, out_plain) = run_ft(dir.path(), &["detail", "plain-svc"]);
+    assert!(ok_plain, "`ft detail plain-svc` failed: {out_plain}");
+    assert!(
+        out_plain.contains("SPA:          off") && out_plain.contains("CORS:         off"),
+        "a plain static entry must render both flags off, got: {out_plain}"
+    );
+    assert!(
+        !out_plain.contains("Token:"),
+        "a plain static entry must not render a Token row: {out_plain}"
+    );
+}
+
+#[test]
+fn static_flags_persist_through_a_full_registry_rewrite() {
+    // The re-apply story end to end at the registry layer: the detached worker
+    // re-applies the flags by reading them off the entry, so they must survive
+    // a real load → update → save cycle through the binary. Prune reaps the
+    // EXPIRED pid-0 reservation but keeps the FRESH one (M1 grace) — and the
+    // kept entry must come out of the rewrite with its static_flags intact,
+    // byte-identical in meaning, in the compact JSON the save path writes.
+    let dir = TempDir::new().unwrap();
+    let body = format!(
+        r#"{{
+  "next_id": 3,
+  "services": [
+    {{
+      "id": 1,
+      "name": "flagged-fresh",
+      "kind": "static",
+      "dir": "/tmp/seed-dir",
+      "port": 8080,
+      "local_url": "http://127.0.0.1:8080",
+      "public_url": null,
+      "worker_pid": 0,
+      "tunnel_pid": null,
+      "static_flags": {{ "spa": true, "cors": true, "token": "hunter2" }},
+      "created_at": "{fresh}",
+      "state_dir": "/tmp/seed-state",
+      "foreground": false
+    }},
+    {{
+      "id": 2,
+      "name": "expired-reservation",
+      "kind": "static",
+      "dir": "/tmp/old-dir",
+      "port": 8081,
+      "local_url": "http://127.0.0.1:8081",
+      "public_url": null,
+      "worker_pid": 0,
+      "tunnel_pid": null,
+      "created_at": "2026-07-21T00:00:00Z",
+      "state_dir": "/tmp/old-state",
+      "foreground": false
+    }}
+  ]
+}}"#,
+        fresh = now_rfc3339()
+    );
+    let reg = seed_registry(dir.path(), &body);
+
+    let (ok, out) = run_ft(dir.path(), &["prune"]);
+    assert!(ok, "`ft prune` failed: {out}");
+    assert!(
+        out.contains("Pruned 1 stale service") && out.contains("expired-reservation"),
+        "expected exactly the expired reservation reaped, got: {out}"
+    );
+
+    // The rewrite kept the flagged entry WITH its flags (so a re-started or
+    // inspected service still re-applies them), through the real save path.
+    let after = fs::read_to_string(&reg).unwrap();
+    assert!(
+        after.contains("flagged-fresh")
+            && after.contains("static_flags")
+            && after.contains("\"spa\":true")
+            && after.contains("\"cors\":true")
+            && after.contains("\"token\":\"hunter2\""),
+        "the flagged entry must survive the rewrite with its flags, registry: {after}"
+    );
+    assert!(
+        !after.contains("expired-reservation"),
+        "the expired reservation must be gone, registry: {after}"
+    );
+}
