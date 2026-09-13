@@ -92,48 +92,63 @@ pub fn print_list(services: &[Service]) {
 /// historical shape exactly (mode = foreground/background, plus the served
 /// `Directory:`), while a Proxy service renders its kind in the `Mode:` row
 /// and replaces `Directory:` with the `Upstream:` it fronts (the proxy's
-/// `local_url` IS the operator's server). A proxy also runs no static server,
-/// so its Logs section lists no `server.log` (the worker never creates one).
+/// `local_url` IS the operator's server), and a Run service renders its kind
+/// with no Directory row at all (its origin is the command ft spawned — the
+/// `Command PID:` row is the run-specific fact). A proxy or run service runs
+/// no static server, so the Logs section lists no `server.log` (a run's
+/// command output is teed into `worker.log` instead).
 pub fn print_detail(service: &Service) {
     let tunnel_pid = service
         .tunnel_pid
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "-".into());
+    let command_pid = service
+        .command_pid
         .map(|p| p.to_string())
         .unwrap_or_else(|| "-".into());
 
     println!("Name:         {}", service.name);
     println!("ID:           {}", service.id);
     println!("Status:       {}", service.status().as_str());
-    if service.kind == ServiceKind::Proxy {
-        println!("Mode:         {}", service.kind.as_str());
-        println!("Upstream:     {}", service.local_url);
-    } else {
-        println!(
-            "Mode:         {}",
-            if service.foreground {
-                "foreground"
-            } else {
-                "background"
-            }
-        );
-        println!(
-            "Directory:    {}",
-            service
-                .dir
-                .as_deref()
-                .map_or_else(|| "-".to_string(), |d| d.display().to_string())
-        );
+    match service.kind {
+        ServiceKind::Proxy => {
+            println!("Mode:         {}", service.kind.as_str());
+            println!("Upstream:     {}", service.local_url);
+        }
+        ServiceKind::Run => {
+            println!("Mode:         {}", service.kind.as_str());
+        }
+        ServiceKind::Static => {
+            println!(
+                "Mode:         {}",
+                if service.foreground {
+                    "foreground"
+                } else {
+                    "background"
+                }
+            );
+            println!(
+                "Directory:    {}",
+                service
+                    .dir
+                    .as_deref()
+                    .map_or_else(|| "-".to_string(), |d| d.display().to_string())
+            );
+        }
     }
     println!("Port:         {}", service.port);
     println!("Worker PID:   {}", service.worker_pid);
     println!("Tunnel PID:   {tunnel_pid}");
+    println!("Command PID:  {command_pid}");
     println!("Started:      {}", fmt_started(service));
     println!("Local URL:    {}", service.local_url);
     println!("Public URL:   {}", url_or_pending(service));
     println!();
     println!("Logs:");
     println!("  {}", service.state_dir.join("worker.log").display());
-    if service.kind != ServiceKind::Proxy {
-        // Only a Static worker runs (and traces requests into) a server.
+    if service.kind == ServiceKind::Static {
+        // Only a Static worker runs (and traces requests into) a server. A
+        // run's command output lands in worker.log instead.
         println!("  {}", service.state_dir.join("server.log").display());
     }
     println!("  {}", service.state_dir.join("tunnel.log").display());

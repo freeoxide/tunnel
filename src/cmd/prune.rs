@@ -136,6 +136,7 @@ mod tests {
             public_url: None,
             worker_pid: 0,
             tunnel_pid: None,
+            command_pid: None,
             created_at: crate::model::now_utc(),
             state_dir: PathBuf::from("/tmp/state"),
             foreground: false,

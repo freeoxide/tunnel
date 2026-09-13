@@ -38,6 +38,14 @@ pub enum ServiceKind {
     /// The operator already runs a server on [`Service::port`]; the tunnel
     /// fronts it directly and `ft` starts no server of its own.
     Proxy,
+    /// `ft run -- <command>`: `ft` itself spawns the operator's command (a
+    /// dev server), which is expected to listen on [`Service::port`], and
+    /// the tunnel fronts it directly — nothing ft-owned in between. Unlike
+    /// `Proxy`, `ft` OWNS the child's lifecycle: the worker spawns it in its
+    /// own process group, so `ft kill` tears the tunnel and the command down
+    /// together, and [`Service::command_pid`] records the child so a
+    /// survivor can still be found after the worker is gone.
+    Run,
 }
 
 impl ServiceKind {
@@ -45,6 +53,7 @@ impl ServiceKind {
         match self {
             ServiceKind::Static => "static",
             ServiceKind::Proxy => "proxy",
+            ServiceKind::Run => "run",
         }
     }
 }
@@ -58,16 +67,18 @@ pub struct Service {
     /// Human-friendly name, usable as a target.
     pub name: String,
     /// How this service sources its local origin: ft's own static server
-    /// ([`ServiceKind::Static`]) or the operator's existing upstream
-    /// ([`ServiceKind::Proxy`]).
+    /// ([`ServiceKind::Static`]), the operator's existing upstream
+    /// ([`ServiceKind::Proxy`]), or a command `ft` spawns itself
+    /// ([`ServiceKind::Run`]).
     ///
     /// Defaults to `Static` on deserialize so pre-proxy `registry.json`
     /// files — which carry no `kind` — keep their existing meaning.
     #[serde(default)]
     pub kind: ServiceKind,
-    /// Absolute path to the directory being served. `None` for `Proxy`
-    /// services, which front an existing port instead of a directory.
-    /// Nullable and defaulted so proxy entries may omit it on disk.
+    /// Absolute path to the directory being served. `None` for `Proxy` and
+    /// `Run` services, which front a port instead of a directory (the proxy
+    /// fronts the operator's server; a run fronts the command `ft` spawned).
+    /// Nullable and defaulted so those entries may omit it on disk.
     #[serde(default)]
     pub dir: Option<PathBuf>,
     /// Local port. For `Static` services this is the port ft's own server
@@ -85,6 +96,16 @@ pub struct Service {
     pub worker_pid: u32,
     /// PID of the `cloudflared` child, once spawned.
     pub tunnel_pid: Option<u32>,
+    /// PID of the user's command child, for `Run` services only: `None` for
+    /// every other kind, and for a `Run` entry until its worker has actually
+    /// spawned the command. The worker records it under the registry lock so
+    /// the child remains reachable by id even if the worker dies without
+    /// tearing it down (the future `ft doctor` "tunnel dead, command still
+    /// running" orphan detection reads exactly this field). Only the pid is
+    /// registry state — the command line itself travels in the worker's argv
+    /// and is deliberately not persisted.
+    #[serde(default)]
+    pub command_pid: Option<u32>,
     pub created_at: DateTime<Utc>,
     /// Per-service directory holding its log files.
     pub state_dir: PathBuf,
@@ -224,6 +245,7 @@ mod tests {
             public_url: public_url.map(str::to_string),
             worker_pid,
             tunnel_pid: None,
+            command_pid: None,
             created_at: super::now_utc(),
             state_dir: PathBuf::from("/tmp/state"),
             foreground,
@@ -262,7 +284,8 @@ mod tests {
     #[test]
     fn explicit_kind_tags_deserialize() {
         // tests/integration.rs fixtures seed `"kind": "static"` explicitly;
-        // proxy entries tag `"proxy"` and may carry `"dir": null`.
+        // proxy entries tag `"proxy"` and may carry `"dir": null`, and run
+        // entries tag `"run"` the same way (a run fronts a port, no dir).
         let json = service_json(r#""kind": "static", "dir": "/tmp/dir","#);
         let s: Service = serde_json::from_str(&json).expect("explicit static must parse");
         assert_eq!(s.kind, ServiceKind::Static);
@@ -270,6 +293,11 @@ mod tests {
         let json = service_json(r#""kind": "proxy", "dir": null,"#);
         let s: Service = serde_json::from_str(&json).expect("proxy must parse");
         assert_eq!(s.kind, ServiceKind::Proxy);
+        assert_eq!(s.dir, None);
+
+        let json = service_json(r#""kind": "run", "dir": null,"#);
+        let s: Service = serde_json::from_str(&json).expect("run must parse");
+        assert_eq!(s.kind, ServiceKind::Run);
         assert_eq!(s.dir, None);
     }
 
@@ -298,14 +326,47 @@ mod tests {
     }
 
     #[test]
+    fn run_service_round_trips_through_json() {
+        // A run service — dir: None plus the command child's recorded pid —
+        // must survive a serialize → deserialize cycle field-for-field,
+        // including the `kind` tag and `command_pid` (the field A2's orphan
+        // detection reads back).
+        let s = Service {
+            kind: ServiceKind::Run,
+            dir: None,
+            command_pid: Some(4242),
+            ..service(7, Some("https://example.trycloudflare.com"), false)
+        };
+        let encoded = serde_json::to_string(&s).expect("encode");
+        let decoded: Service = serde_json::from_str(&encoded).expect("decode");
+        assert_eq!(decoded, s);
+    }
+
+    #[test]
+    fn omitted_command_pid_deserializes_as_none() {
+        // `command_pid` is serde-defaulted so every registry written before
+        // `ft run` existed (and every non-run entry, which never sets it)
+        // keeps loading unchanged — an old entry must read as "no command
+        // child", never fail the parse.
+        let json = service_json(r#""kind": "proxy", "dir": null,"#);
+        let s: Service = serde_json::from_str(&json).expect("entry without command_pid");
+        assert_eq!(s.command_pid, None);
+    }
+
+    #[test]
     fn kind_as_str_matches_serde_tags() {
         // `as_str` is the human/CLI rendering and must agree with the on-disk
         // serde tag for each variant.
         assert_eq!(ServiceKind::Static.as_str(), "static");
         assert_eq!(ServiceKind::Proxy.as_str(), "proxy");
+        assert_eq!(ServiceKind::Run.as_str(), "run");
         assert_eq!(
             serde_json::to_value(ServiceKind::Proxy).expect("encode"),
             serde_json::json!("proxy")
+        );
+        assert_eq!(
+            serde_json::to_value(ServiceKind::Run).expect("encode"),
+            serde_json::json!("run")
         );
     }
 

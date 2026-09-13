@@ -1,23 +1,27 @@
 //! The detached worker process.
 //!
-//! Invoked as `ft run-worker --id --name --dir --port`, this fronts the
-//! service's local origin with a `cloudflared` Quick Tunnel child, discovers
-//! the tunnel URL from cloudflared's output, records it on the registry entry,
-//! and stays alive until cloudflared exits, a terminating signal arrives, or
-//! (static services only) the server task ends.
+//! Invoked as `ft run-worker --id --name --dir --port [-- <command>]`, this
+//! fronts the service's local origin with a `cloudflared` Quick Tunnel child,
+//! discovers the tunnel URL from cloudflared's output, records it on the
+//! registry entry, and stays alive until cloudflared exits, a terminating
+//! signal arrives, or (static services only) the server task ends.
 //!
 //! What to front is decided by the reserved registry entry's `kind`, not by
 //! the CLI args: a `Static` worker re-runs the START flow's directory safety
 //! checks, binds ft's own static server on `127.0.0.1` (fail-fast if the port
 //! cannot be bound), and tunnels it; a `Proxy` worker runs no server of its
 //! own — it points cloudflared straight at the operator's existing upstream
-//! on `http://127.0.0.1:<port>`. cloudflared connects lazily, so a dead
-//! upstream is deliberately NOT a start-time failure here (a friendly
-//! pre-flight, if any, belongs to the CLI layer).
+//! on `http://127.0.0.1:<port>`; a `Run` worker spawns the operator's command
+//! (which fronts `http://127.0.0.1:<port>`) as a child of THIS process — same
+//! process-group discipline as cloudflared, so tunnel and command live and
+//! die together. cloudflared connects lazily, so a dead upstream is
+//! deliberately NOT a start-time failure here (a friendly pre-flight, if any,
+//! belongs to the CLI layer).
 //!
 //! All registry writes go through [`Registry::update`] (an exclusive flock), so
 //! the parent's writes and ours never clobber each other.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,12 +49,20 @@ const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 /// Run the worker to completion.
 ///
 /// `dir` is the `--dir` CLI value: the served directory for `Static` services,
-/// and [`crate::spawn::PROXY_DIR_SENTINEL`] for `Proxy` services (which have
-/// no directory — clap rejects an empty `--dir` value, so the spawn path
-/// passes that deliberately non-existent stand-in path; see the module docs
-/// for why the kind comes from the reserved registry entry rather than the
-/// CLI).
-pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
+/// and [`crate::spawn::PROXY_DIR_SENTINEL`] for `Proxy` and `Run` services
+/// (which have no directory — clap rejects an empty `--dir` value, so the
+/// spawn path passes that deliberately non-existent stand-in path; see the
+/// module docs for why the kind comes from the reserved registry entry rather
+/// than the CLI). `command` is the Run worker's child command (everything the
+/// spawn path placed after `--`); it is empty and ignored for every other
+/// kind.
+pub async fn run(
+    id: u64,
+    name: String,
+    dir: PathBuf,
+    port: u16,
+    command: Vec<OsString>,
+) -> Result<()> {
     // Defense in depth against direct invocation: `run-worker` is an internal
     // command only ever launched by `spawn::spawn_worker`, which sets
     // `FT_WORKER_TOKEN`; reject anything without a non-empty value. This is a
@@ -148,6 +160,14 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
             tracing::info!("proxy worker: fronting existing upstream http://127.0.0.1:{port}");
             None
         }
+        ServiceKind::Run => {
+            // The local origin is the command this worker is about to spawn
+            // (same process, same process group) — there is no directory to
+            // resolve or confirm: the operator explicitly asked for this
+            // command to be published, mirroring proxy's rationale.
+            tracing::info!("run worker: will spawn the command as the local origin");
+            None
+        }
         ServiceKind::Static => {
             let dir = match resolve_dir(&dir) {
                 Ok(d) => d,
@@ -231,10 +251,101 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
         });
         return Err(e);
     }
+
+    // Run only: open the command's log sink BEFORE spawning the child, so a
+    // failure to open worker.log can never orphan an already-running command.
+    // The command's output is teed into worker.log — the log `ft logs` already
+    // reads — so a run service's origin output stays visible without a fourth
+    // log file. Nothing is extracted from these lines: tunnel URLs come only
+    // from cloudflared's streams.
+    let command_log_writer = if kind == ServiceKind::Run {
+        Some(Arc::new(Mutex::new(
+            crate::fsutil::open_private_append_async(&worker_log)
+                .await
+                .with_context(|| format!("opening worker log {}", worker_log.display()))?,
+        )))
+    } else {
+        None
+    };
+
+    // Run only: spawn the operator's command as THIS worker's child. It is
+    // the local origin cloudflared will front, so it exists before the tunnel
+    // does, and it inherits the worker's process group (see
+    // `proc::spawn_command_child`) — a `ft kill` group kill takes tunnel and
+    // command down together. The monitor owns the child handle (exit observed
+    // + zombie reaped); the worker keeps the bare pid for registry + teardown.
+    let (command_pid, mut command_monitor, command_out) = match kind {
+        ServiceKind::Run => match crate::proc::spawn_command_child(&command, port) {
+            Ok(mut c) => {
+                // A freshly spawned, unreaped child always reports its pid
+                // (tokio's id() is only None after wait() reaped it, which
+                // cannot have happened yet — the monitor below is the first
+                // waiter).
+                let pid = c.id();
+                let stdout = c.stdout.take();
+                let stderr = c.stderr.take();
+                let monitor = crate::proc::spawn_wait_monitor(c);
+                (pid, monitor, (stdout, stderr))
+            }
+            Err(e) => {
+                tracing::error!(%e, "failed to spawn the command");
+                stop_server(kind, shutdown_tx, &mut server_handle).await;
+                // Dying worker mustn't leave a permanent stale entry.
+                let _ = Registry::update(&state, |reg| {
+                    reg.remove(id);
+                });
+                return Err(e);
+            }
+        },
+        _ => (
+            None,
+            tokio::spawn(std::future::pending::<()>()),
+            (None, None),
+        ),
+    };
+
+    // Record the command child's pid under the lock (Run only — the field the
+    // future orphan detection reads). Best-effort, NOT `?`: with the child
+    // already running, a registry-write failure here must not abort the
+    // worker and orphan it — the pid just stays unrecorded, and the
+    // keep-alive loop still tears everything down on exit like any other
+    // worker. A vanished entry (concurrent `ft kill` won the race) is handled
+    // by the normal channels.
+    if let Some(pid) = command_pid
+        && let Err(e) = Registry::update(&state, |reg| {
+            if let Some(svc) = reg.find_mut(&id.to_string()) {
+                svc.command_pid = Some(pid);
+            }
+        })
+    {
+        tracing::warn!(%e, id, "failed to record the command pid on the registry entry");
+    }
+
+    let (command_stdout, command_stderr) = command_out;
+    let mut reader_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    if let Some(command_log_writer) = command_log_writer {
+        if let Some(out) = command_stdout {
+            reader_tasks.push(tokio::spawn(pipe_command_stream(
+                BufReader::new(out),
+                command_log_writer.clone(),
+            )));
+        }
+        if let Some(err) = command_stderr {
+            reader_tasks.push(tokio::spawn(pipe_command_stream(
+                BufReader::new(err),
+                command_log_writer,
+            )));
+        }
+    }
+
     let mut child = match cloudflared::spawn(port, tunnel_log.clone()) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(%e, "failed to spawn cloudflared");
+            // The command child must not outlive a tunnel that never came to
+            // be; the monitor handles the teardown (graceful SIGTERM → KILL
+            // on Unix, terminate + job close on Windows).
+            crate::proc::shutdown_child_command(command_pid, &mut command_monitor).await;
             stop_server(kind, shutdown_tx, &mut server_handle).await;
             // Dying worker mustn't leave a permanent stale entry.
             let _ = Registry::update(&state, |reg| {
@@ -266,7 +377,6 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
         log_writer: log_writer.clone(),
     };
 
-    let mut reader_tasks = Vec::new();
     if let Some(out) = stdout {
         reader_tasks.push(tokio::spawn(pipe_stream(BufReader::new(out), ctx.clone())));
     }
@@ -274,12 +384,17 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
         reader_tasks.push(tokio::spawn(pipe_stream(BufReader::new(err), ctx.clone())));
     }
 
-    // Keep alive until cloudflared exits, the server task ends, or we're
-    // signalled. Polling server_handle ensures a serve failure (post-bind) is
-    // observed rather than silently lost. For a proxy worker the server slot
-    // holds [`no_server`]'s never-completing placeholder, so the server arm
-    // below can never fire — exactly the intent: the only local origin is the
-    // operator's, which this worker does not own and cannot observe.
+    // Keep alive until cloudflared exits, the server task ends, the command
+    // child (Run only) exits, or we're signalled. Polling server_handle
+    // ensures a serve failure (post-bind) is observed rather than silently
+    // lost. For a proxy worker the server slot holds [`no_server`]'s
+    // never-completing placeholder, so the server arm below can never fire —
+    // exactly the intent: the only local origin is the operator's, which this
+    // worker does not own and cannot observe. For a Run worker the command
+    // slot holds the monitor of the spawned child (its exit is the origin
+    // dying — the worker must tear the tunnel down instead of serving 502s
+    // forever), and for static/proxy workers a never-completing placeholder,
+    // mirroring the server slot trick.
     //
     // The signal arms are platform-split: on Unix we install explicit
     // SIGTERM/SIGINT handlers (tokio::signal::unix); on Windows we fall back to
@@ -308,6 +423,10 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
                     Err(e) => tracing::error!(%e, "static server task panicked"),
                 }
                 ReaderExit::ServerEnded
+            }
+            _ = &mut command_monitor => {
+                tracing::info!("command child exited");
+                ReaderExit::CommandExited
             }
             _ = sig_term.recv() => {
                 tracing::info!("received SIGTERM, shutting down");
@@ -338,6 +457,10 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
                 }
                 ReaderExit::ServerEnded
             }
+            _ = &mut command_monitor => {
+                tracing::info!("command child exited");
+                ReaderExit::CommandExited
+            }
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("received Ctrl-C, shutting down");
                 ReaderExit::Signal
@@ -345,6 +468,13 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
         };
         teardown_on_exit(exit_reason, tunnel_pid, &mut child).await;
     }
+
+    // The command child must NEVER outlive the worker's ownership of the
+    // tunnel — including the cloudflared-exited path (ReaderExit::ChildExited),
+    // where cloudflared is already reaped but a Run worker's command may still
+    // be running. A no-op for other kinds (pending placeholder) and whenever
+    // the monitor already observed the child's exit.
+    crate::proc::shutdown_child_command(command_pid, &mut command_monitor).await;
 
     // Abort the reader tasks AND await them. Aborting alone only schedules
     // cancellation at the next `.await`; if a reader is mid-way through the
@@ -372,25 +502,32 @@ pub async fn run(id: u64, name: String, dir: PathBuf, port: u16) -> Result<()> {
 /// Why the keep-alive loop ended — drives cloudflared teardown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReaderExit {
+    /// cloudflared itself exited; it was reaped by the select's `wait()`.
     ChildExited,
+    /// The static server task ended (static workers only).
     ServerEnded,
+    /// The Run worker's command child exited — the origin is gone, so the
+    /// worker follows it down instead of serving a 502-ing tunnel.
+    CommandExited,
+    /// SIGTERM/SIGINT (or Ctrl-C on Windows) arrived.
     Signal,
 }
 
 /// Pure decision: should teardown actively signal/reap cloudflared for this
 /// exit reason? On `ChildExited` the select's `wait()` already reaped the child,
-/// so there is nothing to do. On `Signal`/`ServerEnded` cloudflared may still be
+/// so there is nothing to do. On every other reason cloudflared may still be
 /// alive and must be torn down. Extracted so the branching is unit-testable
 /// without a real child process.
 fn teardown_should_signal(exit_reason: &ReaderExit) -> bool {
-    matches!(exit_reason, ReaderExit::Signal | ReaderExit::ServerEnded)
+    !matches!(exit_reason, ReaderExit::ChildExited)
 }
 
-/// The local-origin stand-in for proxy services, which run no static server of
-/// their own — the worker fronts the operator's existing upstream directly.
+/// The local-origin stand-in for workers that run no static server of their
+/// own — a proxy worker fronts the operator's existing upstream directly, and
+/// a run worker's origin is the spawned command child.
 ///
 /// The keep-alive `select!` in [`run`] is written against a server task handle,
-/// so a proxy worker parks a never-completing task in that slot (the server arm
+/// so such workers park a never-completing task in that slot (the server arm
 /// can then never fire) together with a shutdown sender whose receiver is
 /// dropped, which makes sending on it a harmless no-op. [`stop_server`] aborts
 /// the placeholder instead of waiting out [`SERVER_SHUTDOWN_TIMEOUT`] on
@@ -410,15 +547,17 @@ fn no_server() -> (
 ///
 /// `Static`: fire the graceful-shutdown signal and let axum finish what it's
 /// serving, bounded by [`SERVER_SHUTDOWN_TIMEOUT`] so a stuck request cannot
-/// hang the worker; on overrun the task is aborted as a fallback. `Proxy`:
-/// there is no server — the handle is [`no_server`]'s placeholder, which never
-/// completes — so it is aborted outright rather than burning the timeout.
+/// hang the worker; on overrun the task is aborted as a fallback. `Proxy` and
+/// `Run`: there is no server — the handle is [`no_server`]'s placeholder,
+/// which never completes — so it is aborted outright rather than burning the
+/// timeout (a run's origin is the spawned command, torn down by
+/// [`crate::proc::shutdown_child_command`], not by this slot).
 async fn stop_server(
     kind: ServiceKind,
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
     server_handle: &mut tokio::task::JoinHandle<crate::error::Result<()>>,
 ) {
-    if kind == ServiceKind::Proxy {
+    if kind != ServiceKind::Static {
         server_handle.abort();
         return;
     }
@@ -524,6 +663,32 @@ where
     }
 }
 
+/// Read a command child's output stream line by line, teeing each line into
+/// worker.log so `ft logs` shows the origin's own output. Unlike the
+/// cloudflared readers there is nothing to extract from these lines — tunnel
+/// URLs come only from cloudflared.
+async fn pipe_command_stream<R>(reader: BufReader<R>, log_writer: Arc<Mutex<tokio::fs::File>>)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut lines = reader.lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                let mut buf = line.as_bytes().to_vec();
+                buf.push(b'\n');
+                let mut f = log_writer.lock().await;
+                let _ = f.write_all(&buf).await;
+            }
+            Ok(None) => break, // EOF — the child closed this stream
+            Err(e) => {
+                tracing::warn!(%e, "error reading command output stream");
+                break;
+            }
+        }
+    }
+}
+
 /// Record the discovered `url` (and the tunnel pid, if known) on the registry
 /// entry for `ctx.id` under an exclusive lock. Looks up by id so a stale worker
 /// draining alongside a name-reuse can't clobber the freshly-reused name's entry.
@@ -607,6 +772,7 @@ mod tests {
             public_url: None,
             worker_pid: 0,
             tunnel_pid: None,
+            command_pid: None,
             created_at: crate::model::now_utc(),
             state_dir: PathBuf::from("/tmp/state"),
             foreground: false,
@@ -776,9 +942,12 @@ mod tests {
         // ChildExited: the select already reaped cloudflared, so teardown is a
         // no-op.
         assert!(!teardown_should_signal(&ReaderExit::ChildExited));
-        // Signal / ServerEnded: cloudflared may still be alive -> must signal.
+        // Signal / ServerEnded / CommandExited: cloudflared may still be alive
+        // -> must signal. (A dead command child is itself a teardown trigger:
+        // the origin is gone, so the tunnel must follow it down.)
         assert!(teardown_should_signal(&ReaderExit::Signal));
         assert!(teardown_should_signal(&ReaderExit::ServerEnded));
+        assert!(teardown_should_signal(&ReaderExit::CommandExited));
     }
 
     #[tokio::test]
@@ -796,6 +965,24 @@ mod tests {
         let err = server_handle
             .await
             .expect_err("proxy placeholder must be aborted, still pending");
+        assert!(err.is_cancelled());
+        assert!(started.elapsed() < SERVER_SHUTDOWN_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn stop_server_aborts_a_run_placeholder_without_waiting_out_the_timeout() {
+        // Same contract as the proxy worker, Run flavour: a run worker's
+        // origin is the spawned command child (torn down elsewhere), so its
+        // parked server placeholder must be aborted immediately — a
+        // kind-matched guard that forgot Run would silently add the full
+        // drain timeout to every run worker's exit.
+        let (shutdown_tx, mut server_handle) = no_server();
+        let started = std::time::Instant::now();
+        stop_server(ServiceKind::Run, shutdown_tx, &mut server_handle).await;
+
+        let err = server_handle
+            .await
+            .expect_err("run placeholder must be aborted, still pending");
         assert!(err.is_cancelled());
         assert!(started.elapsed() < SERVER_SHUTDOWN_TIMEOUT);
     }

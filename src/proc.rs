@@ -23,6 +23,157 @@
 use nix::sys::signal::{Signal, kill};
 #[cfg(unix)]
 use nix::unistd::Pid;
+use tokio::process::{Child, Command};
+
+// --- run-service command children -------------------------------------------
+//
+// A `Run` service's local origin is a command `ft` itself spawns (the
+// operator's dev server). The detached worker and the foreground flow share
+// the spawn + teardown discipline below, deliberately mirroring how
+// cloudflared itself is handled: the child inherits the spawner's process
+// group (NO setsid, so a Unix group kill reaches it), Linux adds
+// PR_SET_PDEATHSIG against a SIGKILL'd spawner, and Windows relies on the
+// worker's KILL_ON_JOB_CLOSE Job Object (plus an explicit terminate on the
+// foreground paths, which run no job).
+
+/// Spawn the user's command child with `PORT=port` exported, so well-behaved
+/// dev servers pick their port up from the environment instead of a flag.
+///
+/// stdout/stderr are piped (the caller tees them into `worker.log`, which is
+/// what `ft logs` reads), stdin is null. Like `cloudflared::spawn`, the child
+/// deliberately stays in the spawner's process group — a `ft kill` group kill
+/// reaches it directly even if the worker can no longer relay a signal.
+pub(crate) fn spawn_command_child(
+    command: &[std::ffi::OsString],
+    port: u16,
+) -> crate::error::Result<Child> {
+    use anyhow::Context;
+
+    // clap already refuses an empty `--` tail at the CLI layer; this is the
+    // defense-in-depth for direct internal callers.
+    let Some((bin, args)) = command.split_first() else {
+        anyhow::bail!("cannot spawn an empty command");
+    };
+    let mut cmd = Command::new(bin);
+    cmd.args(args)
+        .env("PORT", port.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    // Best-effort: on Linux, SIGKILL the child if its parent (the worker or
+    // foreground ft) dies — even via SIGKILL or OOM — so the command can never
+    // outlive the process that owns its tunnel. Duplicated from
+    // cloudflared::spawn's pre_exec (that module is frozen for this area);
+    // keep the two in sync. There is an inherent fork→prctl window (see
+    // cloudflared::spawn for the full race discussion); the getppid re-check
+    // closes it the same way.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        cmd.pre_exec(parent_death_signal);
+    }
+
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("failed to spawn command {:?}", bin))?;
+    Ok(child)
+}
+
+/// Linux-only pre-exec hook: request SIGKILL on parent death and refuse to
+/// exec if the parent is ALREADY gone (reparented to init). Kept as a named
+/// function so `pre_exec`'s unsafe-unsafe closure stays a single call.
+#[cfg(target_os = "linux")]
+fn parent_death_signal() -> Result<(), std::io::Error> {
+    // SAFETY: prctl only sets a kernel attribute on this (pre-exec) process;
+    // getppid is a plain read. Unlike cloudflared::spawn (which ignores the
+    // prctl return), a failed prctl is surfaced — the whole point of the hook
+    // is the death signal, and skipping it silently is what it must prevent.
+    unsafe {
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::getppid() == 1 {
+            return Err(std::io::Error::other(
+                "parent died before prctl(PR_SET_PDEATHSIG); refusing to exec",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Move a freshly spawned command child into a background task that awaits
+/// (and thereby reaps) it.
+///
+/// The keep-alive `select!` in the worker and foreground flows needs a
+/// child-exit arm, while the teardown paths need to signal the child by pid —
+/// impossible while tokio's owned `Child` is mutably borrowed by a `wait()`.
+/// The monitor resolves the split: it owns the handle (exit observed, zombie
+/// reaped), the spawner keeps the bare pid for signalling, and
+/// [`shutdown_child_command`] coordinates the two.
+pub(crate) fn spawn_wait_monitor(mut child: Child) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    })
+}
+
+/// Grace before a SIGTERM'd command child is SIGKILL'd (Unix). Slightly longer
+/// than cloudflared's: dev servers often flush state (build caches, sockets)
+/// on TERM and are the thing the operator is iterating on.
+#[cfg(unix)]
+const CHILD_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Tear down the spawned command child — the counterpart of
+/// [`spawn_wait_monitor`].
+///
+/// A no-op when the monitor already observed the child's exit (nothing to
+/// signal, nothing left to reap). Otherwise: Unix signals the child pid
+/// (SIGTERM, bounded wait, SIGKILL) and then awaits the monitor so the reap
+/// completes before the caller proceeds; Windows terminates by pid — sound
+/// without an identity needle because the monitor's open `Child` handle pins
+/// the pid against reuse until this call aborts it — and the worker's Job
+/// Object additionally guarantees whole-tree teardown when the flow exits.
+pub(crate) async fn shutdown_child_command(
+    pid: Option<u32>,
+    monitor: &mut tokio::task::JoinHandle<()>,
+) {
+    if monitor.is_finished() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+        if let Some(pid) = pid {
+            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+            if tokio::time::timeout(CHILD_SHUTDOWN_GRACE, &mut *monitor)
+                .await
+                .is_err()
+            {
+                let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+            }
+        }
+        // Await the monitor even on the pid-less (cannot happen for a spawned
+        // Unix child, but stay correct) path: it reaps the child and proves
+        // the task is gone before the caller removes the registry entry.
+        let _ = (&mut *monitor).await;
+    }
+    #[cfg(windows)]
+    {
+        if let Some(pid) = pid {
+            windows_proc::terminate_child(pid);
+        }
+        monitor.abort();
+        let _ = monitor.await;
+    }
+    // No terminate primitive exists on an unsupported target; the monitor is
+    // still reaped so the flow never leaves a dangling task behind.
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        monitor.abort();
+        let _ = monitor.await;
+    }
+}
 
 /// True if process `pid` exists and its command line contains `needle`.
 ///
@@ -184,6 +335,16 @@ mod windows_proc {
         }
     }
 
+    /// Terminate a spawned command child by pid, WITHOUT an identity needle.
+    ///
+    /// Sound despite the usual PID-reuse concern because the caller only
+    /// reaches here while the command-child monitor still holds the tokio
+    /// `Child` handle — an open handle pins the pid against kernel reuse on
+    /// Windows — and `shutdown_child_command` checked `is_finished` first.
+    pub fn terminate_child(pid: u32) {
+        let _ = terminate(pid);
+    }
+
     /// Terminate a foreground `ft` process by pid (gated on identity; never the
     /// group, which would kill the operator's shell).
     pub fn terminate_foreground(pid: u32) {
@@ -256,7 +417,7 @@ mod windows_proc {
 #[cfg(windows)]
 pub use windows_proc::{
     create_kill_on_close_job, pid_alive, pid_matches, process_exists, shutdown_process_group,
-    terminate_foreground, terminate_orphan,
+    terminate_child, terminate_foreground, terminate_orphan,
 };
 
 /// Gracefully tear down a process group: `SIGTERM`, poll for up to the grace
@@ -475,6 +636,41 @@ fn memmem(haystack: &[u8], needle: &[u8]) -> bool {
 #[allow(dead_code)]
 fn cmdline_contains(_pid: u32, _needle: &str) -> bool {
     false
+}
+
+#[cfg(all(test, unix))]
+mod command_child_tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    /// The contract that lets `ft run` skip a `--port` flag on the child: the
+    /// spawned command must find its port in `PORT`. Proven end-to-end through
+    /// a real child (a shell that echoes `$PORT`), since env inheritance has
+    /// no pure seam.
+    #[tokio::test]
+    async fn command_child_receives_port_in_its_environment() {
+        // Any port value works — the child only reads the env var; the
+        // listener merely produces a realistic, in-use-looking port number.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let child = spawn_command_child(
+            &[
+                OsString::from("sh"),
+                OsString::from("-c"),
+                OsString::from("echo $PORT"),
+            ],
+            port,
+        )
+        .expect("spawn echo child");
+        let output = child.wait_with_output().await.expect("wait for child");
+        let printed = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            printed.trim(),
+            port.to_string(),
+            "the child must see PORT={port} in its environment"
+        );
+    }
 }
 
 #[cfg(all(test, unix))]

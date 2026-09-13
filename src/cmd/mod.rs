@@ -13,6 +13,7 @@ pub mod logs;
 pub mod open;
 pub mod proxy;
 pub mod prune;
+pub mod run;
 pub mod sanitize;
 pub mod start;
 
@@ -40,13 +41,20 @@ pub async fn run(cli: Cli) -> Result<()> {
             name,
             foreground,
         }) => proxy::run(port, name, foreground).await,
+        Some(Command::Run {
+            port,
+            name,
+            foreground,
+            command,
+        }) => run::run(port, name, foreground, &command).await,
         Some(Command::Sanitize) => sanitize::run().await,
         Some(Command::RunWorker {
             id,
             name,
             dir,
             port,
-        }) => crate::worker::run(id, name, dir, port).await,
+            command,
+        }) => crate::worker::run(id, name, dir, port, command).await,
         None => {
             let dir: PathBuf = cli.dir.unwrap_or_else(|| PathBuf::from("."));
             start::run(Some(dir), cli.name, cli.port, cli.foreground, cli.yes).await

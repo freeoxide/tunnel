@@ -195,7 +195,11 @@ fn plan(svc: &Service, worker_alive: Option<bool>, port_dead: Option<bool>) -> A
         Some(true) if svc.foreground => Action::SkipForeground,
         Some(true) => Action::RemoveZombie {
             reason: match svc.kind {
-                ServiceKind::Proxy => ZombieReason::UpstreamDead,
+                // A Run service's origin is the command ft spawned fronting
+                // its port: if the worker+tunnel live but the port is dead,
+                // the command exited — the same "upstream died" story as a
+                // proxy. Keep in sync if the kinds' zombie semantics diverge.
+                ServiceKind::Proxy | ServiceKind::Run => ZombieReason::UpstreamDead,
                 ServiceKind::Static => ZombieReason::InProcessServerDead,
             },
         },
@@ -416,6 +420,7 @@ mod tests {
             public_url: Some("https://x.trycloudflare.com".to_string()),
             worker_pid: 123_456,
             tunnel_pid: None,
+            command_pid: None,
             created_at: crate::model::now_utc(),
             state_dir: PathBuf::from("/tmp/state"),
             foreground,

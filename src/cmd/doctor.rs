@@ -298,6 +298,26 @@ fn service_checks(svc: &Service, status: ServiceStatus, origin: Option<bool>) ->
                         svc.name
                     )),
                 }),
+                // A1 compile arm ONLY: a run service fronts the port its
+                // spawned command should be bound to, so a live worker with
+                // nothing listening there 502s exactly like a proxy. The
+                // run-specific findings (orphaned command detection via
+                // `command_pid`) belong to the doctor area — rework this arm
+                // there.
+                ServiceKind::Run => checks.push(Check {
+                    name: format!("origin {}", svc.name),
+                    status: CheckStatus::Fail,
+                    detail: format!(
+                        "run: {} should be serving but nothing is listening — the \
+                         tunnel will 502 every request (the command likely exited)",
+                        svc.port
+                    ),
+                    hint: Some(format!(
+                        "check the command's output (`ft logs {}`), or stop the \
+                         service (`ft kill {}`)",
+                        svc.name, svc.name
+                    )),
+                }),
                 ServiceKind::Static => checks.push(Check {
                     name: format!("origin {}", svc.name),
                     status: CheckStatus::Warn,
@@ -372,6 +392,7 @@ mod tests {
             public_url: None,
             worker_pid: 0,
             tunnel_pid: None,
+            command_pid: None,
             created_at: crate::model::now_utc(),
             state_dir: PathBuf::from("/tmp/state"),
             foreground: false,

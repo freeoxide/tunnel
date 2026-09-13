@@ -297,6 +297,7 @@ mod tests {
             public_url: None,
             worker_pid: 0,
             tunnel_pid: None,
+            command_pid: None,
             created_at: crate::model::now_utc(),
             state_dir: PathBuf::from("/tmp/state"),
             foreground: false,
@@ -624,6 +625,7 @@ mod tests {
             public_url: Some("https://blog.trycloudflare.com".to_string()),
             worker_pid: 4242,
             tunnel_pid: Some(5353),
+            command_pid: None,
             // Pinned instant (SystemTime epoch) so created_at is deterministic.
             created_at: std::time::SystemTime::UNIX_EPOCH.into(),
             state_dir: PathBuf::from("/srv/ft-state/services/blog"),
@@ -677,6 +679,7 @@ mod tests {
                 public_url: Some("https://dev.trycloudflare.com".to_string()),
                 worker_pid: 4242,
                 tunnel_pid: Some(5353),
+                command_pid: None,
                 created_at: std::time::SystemTime::UNIX_EPOCH.into(),
                 state_dir: PathBuf::from("/srv/ft-state/services/dev"),
                 foreground: false,

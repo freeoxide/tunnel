@@ -6,6 +6,7 @@
 //! `doctor`, `kill`, `logs`, `open`, `prune`, `proxy`, `sanitize`, and the
 //! hidden `run-worker`).
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -125,6 +126,39 @@ pub enum Command {
         foreground: bool,
     },
 
+    /// Run a command (e.g. a dev server) and expose it through a tunnel.
+    ///
+    /// Spawns the given command, waits for it to accept connections on
+    /// `PORT`, then fronts it with a cloudflared Quick Tunnel pointing
+    /// straight at `http://127.0.0.1:PORT` — nothing ft-owned in between.
+    /// The service is registered and managed like any other (`ls`, `detail`,
+    /// `kill`, `logs`, `open`, `prune`), and `ft kill` tears the tunnel AND
+    /// the command down together — the spawned child never outlives its
+    /// tunnel. `PORT` is also exported to the command's environment so
+    /// well-behaved tools pick it up.
+    Run {
+        /// Local port the command must end up listening on (1-65535).
+        /// REQUIRED and explicit (mirroring `ft proxy <port>`): `ft` never
+        /// guesses which port a dev server picked. Also exported to the
+        /// command's environment as `PORT`.
+        #[arg(long, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
+        port: u16,
+
+        /// Explicit service name. Defaults to `run-<port>` (made unique).
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Run in the foreground instead of spawning a detached worker.
+        #[arg(long, short)]
+        foreground: bool,
+
+        /// The command to run, after `--` (e.g.
+        /// `ft run --port 3000 -- npm start`). Everything after `--` is the
+        /// command and its arguments, verbatim.
+        #[arg(last = true, value_name = "COMMAND")]
+        command: Vec<OsString>,
+    },
+
     /// Remove every dangling service — stale entries AND live tunnels whose
     /// local origin port is dead.
     ///
@@ -156,11 +190,17 @@ pub enum Command {
         /// Local port to bind on.
         #[arg(long)]
         port: u16,
+        /// The user's command child, for a Run worker: everything the spawn
+        /// path placed after `--`, verbatim. Empty for static and proxy
+        /// workers, which spawn no command.
+        #[arg(last = true, required = false, value_name = "COMMAND")]
+        command: Vec<OsString>,
     },
 }
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::path::PathBuf;
 
     use super::{Cli, Command};
@@ -274,6 +314,168 @@ mod tests {
             "no flags exist"
         );
         assert!(parse(&["sanitize", "extra"]).is_err(), "no arguments exist");
+    }
+
+    #[test]
+    fn run_minimal_form_after_the_separator() {
+        // `ft run --port 3000 -- npm start`: the explicit port is required,
+        // and everything after `--` is the child command, verbatim.
+        let cli = parse(&["run", "--port", "3000", "--", "npm", "start"])
+            .expect("`ft run --port 3000 -- npm start` must parse");
+        match cli.command {
+            Some(Command::Run {
+                port,
+                name,
+                foreground,
+                command,
+            }) => {
+                assert_eq!(port, 3000);
+                assert_eq!(name, None);
+                assert!(!foreground);
+                assert_eq!(
+                    command,
+                    vec![OsString::from("npm"), OsString::from("start")]
+                );
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_name_foreground_and_command_flags() {
+        // Flags belong to `ft` and must be given BEFORE `--`; after the
+        // separator everything — including things that look like flags — is
+        // passed to the child command untouched.
+        let cli = parse(&[
+            "run",
+            "--port",
+            "5173",
+            "--name",
+            "web",
+            "--foreground",
+            "--",
+            "npm",
+            "run",
+            "dev",
+            "--verbose",
+        ])
+        .expect("`ft run` with flags and a flag-looking command arg must parse");
+        match cli.command {
+            Some(Command::Run {
+                port,
+                name,
+                foreground,
+                command,
+            }) => {
+                assert_eq!(port, 5173);
+                assert_eq!(name.as_deref(), Some("web"));
+                assert!(foreground);
+                assert_eq!(
+                    command,
+                    vec![
+                        OsString::from("npm"),
+                        OsString::from("run"),
+                        OsString::from("dev"),
+                        // A flag-looking token AFTER `--` must land in the
+                        // command, never be eaten as an ft flag.
+                        OsString::from("--verbose"),
+                    ]
+                );
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_rejects_port_zero_and_out_of_range() {
+        // The port is the contract with the spawned command (and is exported
+        // as PORT), so 0 — the kernel's "assign me one" sentinel — and
+        // out-of-range values are rejected before anything runs.
+        assert!(
+            parse(&["run", "--port", "0", "--", "x"]).is_err(),
+            "port 0 must be rejected"
+        );
+        assert!(
+            parse(&["run", "--port", "70000", "--", "x"]).is_err(),
+            "ports beyond u16 must be rejected"
+        );
+    }
+
+    #[test]
+    fn run_requires_the_separator_and_a_command() {
+        // `ft run` alone is a usage error (no port, no command). A port
+        // without any `--` tail parses to an EMPTY command here — clap keeps
+        // the `last = true` positional optional — so the empty-command
+        // refusal is deliberately owned by cmd::run's runtime check, which
+        // fires before any state is touched; this test pins that split so a
+        // future clap change cannot move the error into state-creating
+        // territory unnoticed.
+        assert!(parse(&["run"]).is_err(), "missing port and command");
+        match parse(&["run", "--port", "3000"])
+            .expect("port-only must parse")
+            .command
+        {
+            Some(Command::Run { command, .. }) => {
+                assert!(command.is_empty(), "no `--` tail means an empty command");
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+        assert!(
+            parse(&["run", "--port", "3000", "npm", "start"]).is_err(),
+            "a command before `--` is not accepted"
+        );
+    }
+
+    #[test]
+    fn run_worker_command_is_optional_and_verbatim() {
+        // The hidden run-worker subcommand must keep parsing WITHOUT a
+        // command tail (static and proxy workers pass none — existing spawn
+        // argv shape), and with one it receives the child command verbatim
+        // after its own `--`.
+        let cli = parse(&[
+            "run-worker",
+            "--id",
+            "7",
+            "--name",
+            "blog",
+            "--dir",
+            "/srv/blog",
+            "--port",
+            "8000",
+        ])
+        .expect("the historical run-worker argv shape must keep parsing");
+        match cli.command {
+            Some(Command::RunWorker { command, .. }) => assert!(command.is_empty()),
+            other => panic!("expected RunWorker, got {other:?}"),
+        }
+
+        let cli = parse(&[
+            "run-worker",
+            "--id",
+            "9",
+            "--name",
+            "dev",
+            "--dir",
+            "/ft-proxy-has-no-directory",
+            "--port",
+            "3000",
+            "--",
+            "npm",
+            "run",
+            "dev",
+        ])
+        .expect("a run-worker argv carrying a command must parse");
+        match cli.command {
+            Some(Command::RunWorker { command, .. }) => assert_eq!(
+                command,
+                vec![
+                    OsString::from("npm"),
+                    OsString::from("run"),
+                    OsString::from("dev")
+                ]
+            ),
+            other => panic!("expected RunWorker, got {other:?}"),
+        }
     }
 
     #[test]
