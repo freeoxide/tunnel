@@ -442,10 +442,15 @@ mod windows_proc {
     }
 }
 
+// `terminate_child` is deliberately NOT re-exported: its only caller is
+// `shutdown_child_command` in this module, which reaches it through the
+// `windows_proc` module path. Re-exporting it anyway made the import unused
+// under the Windows target (a bin crate warns on crate-internal `pub use`
+// nothing else references) — invisible to every Linux gate.
 #[cfg(windows)]
 pub use windows_proc::{
     create_kill_on_close_job, pid_alive, pid_matches, process_exists, shutdown_process_group,
-    terminate_child, terminate_foreground, terminate_orphan,
+    terminate_foreground, terminate_orphan,
 };
 
 /// Gracefully tear down a process group: `SIGTERM`, poll for up to the grace

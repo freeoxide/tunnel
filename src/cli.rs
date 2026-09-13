@@ -62,8 +62,11 @@ pub struct Cli {
 
     /// Send permissive CORS headers (`Access-Control-Allow-Origin: *`, methods
     /// GET/HEAD/OPTIONS, wildcard request headers) on this static origin.
-    /// Preflight OPTIONS requests are not answered specially: the origin is
-    /// GET/HEAD-only, which browsers request cross-origin without a preflight.
+    /// Preflight OPTIONS requests are not answered specially — they 405 like
+    /// any non-GET/HEAD — so combined with `--token`, a cross-origin BROWSER
+    /// cannot use `Authorization: Bearer` (its preflight is 405'd and the
+    /// authenticated GET never fires); such clients fall back to `?token=`.
+    /// Plain GET/HEAD stays preflight-free.
     #[arg(long)]
     pub cors: bool,
 

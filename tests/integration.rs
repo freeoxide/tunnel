@@ -1442,6 +1442,74 @@ fn doctor_flags_a_live_proxy_whose_upstream_port_is_dead() {
     );
 }
 
+#[test]
+fn doctor_flags_a_stale_run_service_whose_command_is_still_running() {
+    // The Run orphan finding, end to end (the one doctor surface A2 could not
+    // reach from its unit-only paths): a stale run entry — dead worker pid,
+    // so its tunnel is gone — carrying a command_pid that IS alive (this test
+    // process's own pid, probed by the doctor child as plain existence) plus
+    // a run port that still answers (a real listener the test holds). That is
+    // the confident "tunnel dead, command still running" signature. Doctor
+    // must exit 0, flag the `command <name>` check with its verify-first
+    // hint, and stay read-only.
+    let dir = TempDir::new().unwrap();
+    let listener =
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral loopback listener");
+    let port = listener.local_addr().expect("local addr").port();
+    let body = format!(
+        r#"{{
+  "next_id": 2,
+  "services": [
+    {{
+      "id": 1,
+      "name": "seed-run",
+      "kind": "run",
+      "dir": null,
+      "port": {port},
+      "local_url": "http://127.0.0.1:{port}",
+      "public_url": "https://x.trycloudflare.com",
+      "worker_pid": 4000000,
+      "tunnel_pid": null,
+      "command_pid": {pid},
+      "created_at": "2026-07-21T00:00:00Z",
+      "state_dir": "/tmp/seed-run-state",
+      "foreground": false
+    }}
+  ]
+}}"#,
+        pid = std::process::id()
+    );
+    seed_registry(dir.path(), &body);
+
+    let (ok, out) = run_ft(dir.path(), &["doctor"]);
+    // The listener must outlive the run: the orphan cross-check probes it.
+    drop(listener);
+
+    assert!(
+        ok,
+        "a finding is not a command failure — doctor exits 0, got: {out}"
+    );
+    assert!(
+        out.contains("command seed-run: tunnel dead, command still running"),
+        "expected the orphan finding for the run command, got: {out}"
+    );
+    assert!(
+        out.contains(&format!("pid {} is alive", std::process::id()))
+            && out.contains(&format!("127.0.0.1:{port} still answers")),
+        "expected the confident branch's evidence (live pid + answering port), got: {out}"
+    );
+    assert!(
+        out.contains("stop it if it is the command") && out.contains("`ft kill seed-run`"),
+        "expected the shared verify-first hint naming the kill, got: {out}"
+    );
+    // Read-only: doctor reports the orphan but never touches the entry.
+    let after = fs::read_to_string(registry_path(dir.path())).unwrap();
+    assert!(
+        after.contains("seed-run"),
+        "doctor must not mutate the registry, got: {after}"
+    );
+}
+
 // --- `ft sanitize` (the cleanup counterpart; no cloudflared needed) ----------
 
 #[test]
