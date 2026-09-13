@@ -62,11 +62,14 @@ The most security-relevant components are:
 Both token-gated surfaces — the static origin's `--token` and the drop bucket's
 upload token — accept the secret as `Authorization: Bearer <secret>` **or** as a
 `?token=<secret>` query parameter. The header form is the safe one: a query
-string ends up in shell history, in client and intermediary proxy logs, and —
-if request tracing is ever raised (`RUST_LOG=tower_http=trace`) — in the
-service's own `server.log`. That file is mode `0600` and the default log level
-records no request spans, but a secret sent via `?token=` should be treated as
-exposed to every log that keeps URLs. Relatedly, the query form is
+string ends up in shell history and in client and intermediary proxy logs.
+For the static origin there is one ft-owned sink on top of that: it is the
+only origin whose worker opens a `server.log` at all (the hook and drop
+origins run no request tracing, so they keep no per-request log), and — if
+request tracing is ever raised there (`RUST_LOG=tower_http=trace`) — a
+`?token=` query lands in it. That file is mode `0600` and the default log
+level records no request spans, but a secret sent via `?token=` should be
+treated as exposed to every log that keeps URLs. Relatedly, the query form is
 percent-decoded, so a secret containing `%` or `+` authenticates in its written
 form only via the header.
 
