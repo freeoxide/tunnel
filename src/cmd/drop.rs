@@ -24,6 +24,15 @@
 //! fail-fast window as the hook's request store), printed once on success,
 //! and shown by `ft detail`.
 //!
+//! One bucket, one owner: a directory that is ALREADY a drop target refuses a
+//! second drop service (checked inside the reserve's flock, so concurrent
+//! starts are serialized — see [`find_drop_dir_conflict`]). Two drop origins
+//! on one directory would race their writes and stack their total-cap
+//! allowances; the drop origin's write path is additionally cross-process
+//! safe on its own (per-service temp names + collision-checked hard-link
+//! publish, see `drop_server`), which covers shapes the registry cannot see
+//! (hand-edited entries).
+//!
 //! The foreground flow duplicates the shared foreground machinery from
 //! `cmd/start.rs` (`run_foreground_inner`) instead of extending it — that
 //! file is outside this area's allowed paths, and the repo's frozen-core
@@ -161,6 +170,17 @@ async fn run_background(
     // window quickly: token/spawn failure, worker death, and the URL timeout
     // below all remove the entry by id, which bypasses the grace guard.
     let (id, name) = Registry::update(&state, |reg| -> Result<(u64, String)> {
+        // One bucket, one owner (checked INSIDE the flock, atomically with
+        // the reserve — see [`find_drop_dir_conflict`]).
+        if let Some(other) = find_drop_dir_conflict(reg, &dir) {
+            bail!(
+                "directory {} is already the upload target of drop service \
+                 '{other}' — one bucket, one owner (a second drop origin on \
+                 the same directory would race its writes and stack its \
+                 total-cap allowance)",
+                dir.display()
+            );
+        }
         let name = match &name {
             Some(n) => {
                 name::validate_name(n)?;
@@ -373,6 +393,37 @@ fn last_line(path: &Path) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// One bucket, one owner: find an existing Drop service whose upload target
+/// IS `dir` (canonical comparison — aliases and `..` spellings resolve to the
+/// same answer), returning its name.
+///
+/// WHY refuse: two drop origins on one directory would race their writes
+/// (cross-process temp/renames) and each carries its own 1 GiB total-cap
+/// allowance, so the directory's real bound would double per service. The
+/// check runs INSIDE the `Registry::update` flock in both start flows, so
+/// two concurrent `ft drop` invocations on one directory are serialized —
+/// one reserves, the other sees the reservation and refuses (the drop
+/// origin's own write path is, additionally, cross-process safe per
+/// `drop_server`'s hard-link discipline; this pre-flight is the documented,
+/// friendly guarantee). Only Drop-vs-Drop conflicts: a read-only Static
+/// publish of the same directory is untouched by uploads landing in it (they
+/// merely become served files) and stays allowed. An existing entry whose
+/// directory cannot be resolved cannot be PROVEN equal, so it does not
+/// conflict here — the worker's own resolve_dir check refuses such a bucket
+/// at startup anyway.
+fn find_drop_dir_conflict(reg: &Registry, dir: &Path) -> Option<String> {
+    let target = std::fs::canonicalize(dir).ok()?;
+    reg.services
+        .iter()
+        .filter(|svc| svc.kind == ServiceKind::Drop)
+        .find_map(|svc| {
+            let d = svc.dir.as_ref()?;
+            std::fs::canonicalize(d)
+                .is_ok_and(|resolved| resolved == target)
+                .then(|| svc.name.clone())
+        })
+}
+
 /// RAII guard that removes a reserved registry entry on drop. Duplicated from
 /// `cmd/start.rs` (private there) per the frozen-core split — the foreground
 /// flow has early-`?`/panic exits between reserve and teardown, and every one
@@ -431,6 +482,17 @@ async fn run_foreground(
     // logs/open` see the foreground tunnel on every platform — notably
     // Windows, where foreground is the only practical mode.
     let (id, name) = Registry::update(&state, |reg| -> Result<(u64, String)> {
+        // One bucket, one owner (checked INSIDE the flock, atomically with
+        // the reserve — see [`find_drop_dir_conflict`]).
+        if let Some(other) = find_drop_dir_conflict(reg, &dir) {
+            bail!(
+                "directory {} is already the upload target of drop service \
+                 '{other}' — one bucket, one owner (a second drop origin on \
+                 the same directory would race its writes and stack its \
+                 total-cap allowance)",
+                dir.display()
+            );
+        }
         let name = match &name {
             Some(n) => {
                 name::validate_name(n)?;
@@ -670,5 +732,147 @@ async fn drain_and_announce<R>(
                 tracing::error!(%e, "failed to record foreground tunnel URL");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The one-bucket-one-owner pre-flight as a pure decision over a seeded
+    //! registry (the fs input — canonicalization — is exercised with real
+    //! tempdirs, but nothing else here touches state or cloudflared).
+
+    use super::*;
+    use std::path::PathBuf;
+
+    /// A minimal Drop service entry targeting `dir`.
+    fn drop_service(id: u64, name: &str, dir: Option<PathBuf>) -> Service {
+        Service {
+            id,
+            name: name.to_string(),
+            kind: ServiceKind::Drop,
+            dir,
+            port: 9000,
+            local_url: "http://127.0.0.1:9000".to_string(),
+            public_url: None,
+            worker_pid: 0,
+            tunnel_pid: None,
+            command_pid: None,
+            created_at: crate::model::now_utc(),
+            state_dir: PathBuf::from("/tmp/state"),
+            foreground: false,
+        }
+    }
+
+    /// The same entry shape but STATIC (a read-only publish of the dir).
+    fn static_service(id: u64, name: &str, dir: Option<PathBuf>) -> Service {
+        Service {
+            kind: ServiceKind::Static,
+            ..drop_service(id, name, dir)
+        }
+    }
+
+    fn registry_of(services: Vec<Service>) -> Registry {
+        Registry {
+            next_id: services.len() as u64 + 1,
+            services,
+        }
+    }
+
+    #[test]
+    fn conflict_found_for_the_same_directory() {
+        // The core contract: a second drop start on a directory that is
+        // already a Drop service's target finds that service by name.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bucket = tmp.path().join("bucket");
+        std::fs::create_dir_all(&bucket).expect("mkdir");
+        let reg = registry_of(vec![drop_service(1, "first", Some(bucket.clone()))]);
+        assert_eq!(
+            find_drop_dir_conflict(&reg, &bucket).as_deref(),
+            Some("first")
+        );
+    }
+
+    #[test]
+    fn conflict_found_through_path_aliases() {
+        // Canonical comparison: a `..`-spelled or symlinked path to the same
+        // real directory must conflict — the guarantee is about the
+        // DIRECTORY, not the spelling of the argument.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).expect("mkdir");
+        let reg = registry_of(vec![drop_service(1, "first", Some(real.clone()))]);
+
+        // A `..`-spelled alias of the same directory (the intermediate dir
+        // must exist for realpath to walk it, as on a real command line).
+        std::fs::create_dir_all(tmp.path().join("other")).expect("mkdir other");
+        let dotted = tmp.path().join("other").join("..").join("real");
+        assert_eq!(
+            find_drop_dir_conflict(&reg, &dotted).as_deref(),
+            Some("first"),
+            "a ..-spelled alias must resolve to the same bucket"
+        );
+
+        // A symlinked alias (unix only; Windows aliases are junctions with
+        // different creation semantics).
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&real, tmp.path().join("alias")).expect("symlink");
+            assert_eq!(
+                find_drop_dir_conflict(&reg, &tmp.path().join("alias")).as_deref(),
+                Some("first"),
+                "a symlinked alias must resolve to the same bucket"
+            );
+        }
+    }
+
+    #[test]
+    fn different_directory_is_no_conflict() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        std::fs::create_dir_all(&a).expect("mkdir a");
+        std::fs::create_dir_all(&b).expect("mkdir b");
+        let reg = registry_of(vec![drop_service(1, "first", Some(a))]);
+        assert_eq!(find_drop_dir_conflict(&reg, &b), None);
+    }
+
+    #[test]
+    fn static_publish_of_the_same_directory_is_no_conflict() {
+        // Deliberate policy: only Drop-vs-Drop conflicts. A read-only static
+        // publish of the bucket directory is untouched by uploads landing in
+        // it (they merely become served files), so it stays allowed.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bucket = tmp.path().join("bucket");
+        std::fs::create_dir_all(&bucket).expect("mkdir");
+        let reg = registry_of(vec![static_service(1, "site", Some(bucket.clone()))]);
+        assert_eq!(find_drop_dir_conflict(&reg, &bucket), None);
+    }
+
+    #[test]
+    fn unresolvable_existing_dir_is_no_conflict() {
+        // An entry whose dir does not exist cannot be PROVEN equal; the
+        // helper skips it rather than failing the start (the worker's own
+        // resolve_dir check refuses such a bucket at startup anyway). The
+        // same applies to a dir-less Drop entry (hand-edited).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bucket = tmp.path().join("bucket");
+        std::fs::create_dir_all(&bucket).expect("mkdir");
+        let reg = registry_of(vec![
+            drop_service(1, "ghost", Some(tmp.path().join("missing"))),
+            drop_service(2, "hand-edited", None),
+        ]);
+        assert_eq!(find_drop_dir_conflict(&reg, &bucket), None);
+    }
+
+    #[test]
+    fn unresolvable_requested_dir_is_no_conflict() {
+        // A requested dir that cannot canonicalize is refused later by
+        // resolve_dir (in run(), before this helper can even be reached) —
+        // the helper itself must stay total and report no conflict.
+        let reg = registry_of(vec![drop_service(1, "first", None)]);
+        assert_eq!(
+            find_drop_dir_conflict(&reg, std::path::Path::new("/no/such/dir")),
+            None
+        );
     }
 }

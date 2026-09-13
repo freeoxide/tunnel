@@ -84,6 +84,9 @@ libc = "0.2.186"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
+    # BCryptGenRandom (the OS CSPRNG) for drop_server's token minting. Same
+    # crate, extra module gate — no new dependency, Cargo.lock unchanged.
+    "Win32_Security_Cryptography",
     "Win32_System_Threading",
     "Win32_System_JobObjects",
 ] }

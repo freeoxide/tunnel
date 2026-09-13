@@ -207,7 +207,8 @@ pub enum Command {
     Drop {
         /// Directory uploads are stored in. It must already exist; sensitive
         /// directories (/, $HOME, /etc, ...) are refused — uploads WRITE
-        /// into this directory through the public tunnel.
+        /// into this directory through the public tunnel, and only ONE drop
+        /// service may target a given directory.
         #[arg(value_name = "DIR")]
         dir: PathBuf,
 
