@@ -73,12 +73,14 @@ const REPROBE_DELAY: Duration = Duration::from_millis(750);
 /// Split by kind because the two zombies tell different stories: a Proxy
 /// fronts a port the operator owns (the server behind it dying is the
 /// expected failure mode), while a Static worker IS the server, so its port
-/// dying underneath a live worker contradicts the model — an anomaly.
+/// dying underneath a live worker contradicts the model — an anomaly. (A
+/// Hook worker also hosts its origin in-process, so it shares the Static
+/// story.)
 enum ZombieReason {
     /// `kind == Proxy`: the operator's upstream server died; the tunnel 502s
     /// every request.
     UpstreamDead,
-    /// `kind == Static`: the live worker should be serving the port
+    /// `kind == Static | Hook`: the live worker should be serving the port
     /// in-process but is not.
     InProcessServerDead,
 }
@@ -92,8 +94,8 @@ impl ZombieReason {
                 svc.port
             ),
             ZombieReason::InProcessServerDead => format!(
-                "worker is running but 127.0.0.1:{} is not answering — a static \
-                 service serves that port itself, an anomaly",
+                "worker is running but 127.0.0.1:{} is not answering — an ft-owned \
+                 origin (static or hook) serves that port itself, an anomaly",
                 svc.port
             ),
         }
@@ -200,7 +202,10 @@ fn plan(svc: &Service, worker_alive: Option<bool>, port_dead: Option<bool>) -> A
                 // the command exited — the same "upstream died" story as a
                 // proxy. Keep in sync if the kinds' zombie semantics diverge.
                 ServiceKind::Proxy | ServiceKind::Run => ZombieReason::UpstreamDead,
-                ServiceKind::Static => ZombieReason::InProcessServerDead,
+                // A3 compile arm (semantically final): a Hook worker hosts its
+                // origin in-process exactly like a Static worker, so a dead
+                // port under a live worker is the same in-process anomaly.
+                ServiceKind::Static | ServiceKind::Hook => ZombieReason::InProcessServerDead,
             },
         },
         _ => Action::Keep,

@@ -1,10 +1,10 @@
 //! The detached worker process.
 //!
-//! Invoked as `ft run-worker --id --name --dir --port [-- <command>]`, this
-//! fronts the service's local origin with a `cloudflared` Quick Tunnel child,
-//! discovers the tunnel URL from cloudflared's output, records it on the
+//! Invoked as `ft run-worker --id --name --dir --port [--keep N] [-- <command>]`,
+//! this fronts the service's local origin with a `cloudflared` Quick Tunnel
+//! child, discovers the tunnel URL from cloudflared's output, records it on the
 //! registry entry, and stays alive until cloudflared exits, a terminating
-//! signal arrives, or (static services only) the server task ends.
+//! signal arrives, or (static and hook services) the server task ends.
 //!
 //! What to front is decided by the reserved registry entry's `kind`, not by
 //! the CLI args: a `Static` worker re-runs the START flow's directory safety
@@ -14,9 +14,11 @@
 //! on `http://127.0.0.1:<port>`; a `Run` worker spawns the operator's command
 //! (which fronts `http://127.0.0.1:<port>`) as a child of THIS process — same
 //! process-group discipline as cloudflared, so tunnel and command live and
-//! die together. cloudflared connects lazily, so a dead upstream is
-//! deliberately NOT a start-time failure here (a friendly pre-flight, if any,
-//! belongs to the CLI layer).
+//! die together; and a `Hook` worker binds ft's own webhook receiver/inspector
+//! on `127.0.0.1:<port>` (like `Static`, an ft-owned origin inside the
+//! worker), recording every request to the service's request store. cloudflared
+//! connects lazily, so a dead upstream is deliberately NOT a start-time
+//! failure here (a friendly pre-flight, if any, belongs to the CLI layer).
 //!
 //! All registry writes go through [`Registry::update`] (an exclusive flock), so
 //! the parent's writes and ours never clobber each other.
@@ -34,6 +36,8 @@ use tokio::sync::Mutex;
 use crate::cloudflared;
 use crate::cmd::start::{is_sensitive_dir, resolve_dir};
 use crate::error::Result;
+use crate::hook_server;
+use crate::hook_server::HookLog;
 use crate::model::{Registry, ServiceKind};
 use crate::state::StateDir;
 use crate::static_server;
@@ -49,19 +53,21 @@ const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 /// Run the worker to completion.
 ///
 /// `dir` is the `--dir` CLI value: the served directory for `Static` services,
-/// and [`crate::spawn::PROXY_DIR_SENTINEL`] for `Proxy` and `Run` services
-/// (which have no directory — clap rejects an empty `--dir` value, so the
-/// spawn path passes that deliberately non-existent stand-in path; see the
+/// and [`crate::spawn::PROXY_DIR_SENTINEL`] for `Proxy`, `Run`, and `Hook`
+/// services (which have no directory — clap rejects an empty `--dir` value, so
+/// the spawn path passes that deliberately non-existent stand-in path; see the
 /// module docs for why the kind comes from the reserved registry entry rather
 /// than the CLI). `command` is the Run worker's child command (everything the
 /// spawn path placed after `--`); it is empty and ignored for every other
-/// kind.
+/// kind. `keep` is the Hook worker's retention (the `--keep` argv flag);
+/// `None` for every other kind.
 pub async fn run(
     id: u64,
     name: String,
     dir: PathBuf,
     port: u16,
     command: Vec<OsString>,
+    keep: Option<u16>,
 ) -> Result<()> {
     // Defense in depth against direct invocation: `run-worker` is an internal
     // command only ever launched by `spawn::spawn_worker`, which sets
@@ -168,6 +174,13 @@ pub async fn run(
             tracing::info!("run worker: will spawn the command as the local origin");
             None
         }
+        ServiceKind::Hook => {
+            // The local origin is ft's own webhook receiver (an ft-owned
+            // origin like the static server, recording into the service's
+            // request store) — no directory to resolve or confirm.
+            tracing::info!("hook worker: recording requests behind the tunnel");
+            None
+        }
         ServiceKind::Static => {
             let dir = match resolve_dir(&dir) {
                 Ok(d) => d,
@@ -203,40 +216,43 @@ pub async fn run(
         }
     })?;
 
-    // Local origin. Static: bind the listener now (fail-fast) — if the port is
-    // taken, the worker exits immediately and the parent's poll detects the
-    // dead worker instead of waiting out the full timeout with a dead tunnel
-    // returning 502s. Proxy: no server of our own to bind or run.
-    let (shutdown_tx, mut server_handle) = match dir.as_deref() {
-        Some(dir) => {
-            let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
-                Ok(l) => l,
+    // Local origin. Static and Hook: bind the listener now (fail-fast) — if
+    // the port is taken, the worker exits immediately and the parent's poll
+    // detects the dead worker instead of waiting out the full timeout with a
+    // dead tunnel returning 502s. Proxy and Run: no server of our own to bind
+    // or run.
+    let (shutdown_tx, mut server_handle) = match kind {
+        ServiceKind::Static => {
+            let dir =
+                dir.expect("static worker resolved its directory above (kind match invariant)");
+            let listener = bind_loopback_fail_fast(&state, id, port).await?;
+            tracing::info!("static server bound on 127.0.0.1:{port}");
+
+            let router = static_server::router(dir.to_path_buf());
+            serve_origin(router, listener)
+        }
+        ServiceKind::Hook => {
+            // The hook origin records into the service's request store;
+            // open it before binding so a broken service dir fails the
+            // worker (and the start) immediately instead of 500-ing every
+            // webhook once the tunnel is up.
+            let keep = usize::from(keep.unwrap_or(hook_server::DEFAULT_KEEP));
+            let hook_log = match open_request_store(&state, &name, keep) {
+                Ok(log) => log,
                 Err(e) => {
                     // Dying worker mustn't leave a permanent stale entry.
                     let _ = Registry::update(&state, |reg| {
                         reg.remove(id);
                     });
-                    return Err(e).with_context(|| format!("failed to bind 127.0.0.1:{port}"));
+                    return Err(e);
                 }
             };
-            tracing::info!("static server bound on 127.0.0.1:{port}");
+            let listener = bind_loopback_fail_fast(&state, id, port).await?;
+            tracing::info!("hook origin bound on 127.0.0.1:{port}");
 
-            let router = static_server::router(dir.to_path_buf());
-
-            // Graceful shutdown channel: on the teardown path we fire
-            // `shutdown_tx`, which lets axum stop accepting and drain in-flight
-            // requests instead of aborting the server task (and dropping the
-            // requests) mid-flight.
-            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-            let server_handle = tokio::spawn(async move {
-                static_server::serve_on(router, listener, async {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-            });
-            (shutdown_tx, server_handle)
+            serve_origin(hook_server::router(hook_log), listener)
         }
-        None => no_server(),
+        ServiceKind::Proxy | ServiceKind::Run => no_server(),
     };
 
     // cloudflared
@@ -418,9 +434,9 @@ pub async fn run(
             }
             res = &mut server_handle => {
                 match res {
-                    Ok(Ok(())) => tracing::info!("static server task ended"),
-                    Ok(Err(e)) => tracing::error!(%e, "static server task failed"),
-                    Err(e) => tracing::error!(%e, "static server task panicked"),
+                    Ok(Ok(())) => tracing::info!("local origin task ended"),
+                    Ok(Err(e)) => tracing::error!(%e, "local origin task failed"),
+                    Err(e) => tracing::error!(%e, "local origin task panicked"),
                 }
                 ReaderExit::ServerEnded
             }
@@ -451,9 +467,9 @@ pub async fn run(
             }
             res = &mut server_handle => {
                 match res {
-                    Ok(Ok(())) => tracing::info!("static server task ended"),
-                    Ok(Err(e)) => tracing::error!(%e, "static server task failed"),
-                    Err(e) => tracing::error!(%e, "static server task panicked"),
+                    Ok(Ok(())) => tracing::info!("local origin task ended"),
+                    Ok(Err(e)) => tracing::error!(%e, "local origin task failed"),
+                    Err(e) => tracing::error!(%e, "local origin task panicked"),
                 }
                 ReaderExit::ServerEnded
             }
@@ -488,11 +504,11 @@ pub async fn run(
         let _ = task.await;
     }
 
-    // Drain in-flight requests (Static only — a proxy worker's server slot is
-    // the [`no_server`] placeholder, which `stop_server` aborts outright): fire
-    // the shutdown signal and let axum finish what it's serving, with a bounded
-    // timeout so a stuck request can't hang the worker. If the drain doesn't
-    // complete in time, abort as a fallback.
+    // Drain in-flight requests (Static and Hook — a proxy/run worker's server
+    // slot is the [`no_server`] placeholder, which `stop_server` aborts
+    // outright): fire the shutdown signal and let axum finish what it's
+    // serving, with a bounded timeout so a stuck request can't hang the
+    // worker. If the drain doesn't complete in time, abort as a fallback.
     stop_server(kind, shutdown_tx, &mut server_handle).await;
 
     tracing::info!("worker exiting");
@@ -504,13 +520,70 @@ pub async fn run(
 enum ReaderExit {
     /// cloudflared itself exited; it was reaped by the select's `wait()`.
     ChildExited,
-    /// The static server task ended (static workers only).
+    /// The local origin server task ended (static and hook workers).
     ServerEnded,
     /// The Run worker's command child exited — the origin is gone, so the
     /// worker follows it down instead of serving a 502-ing tunnel.
     CommandExited,
     /// SIGTERM/SIGINT (or Ctrl-C on Windows) arrived.
     Signal,
+}
+
+/// Bind the local origin's listener on `127.0.0.1:port`, fail-fast: a bind
+/// failure removes the reserved entry and kills the worker, so the parent's
+/// poll detects the dead worker instead of waiting out the full timeout with
+/// a dead tunnel returning 502s. Loopback-only by construction — only the
+/// local cloudflared tunnel process can reach this server.
+async fn bind_loopback_fail_fast(
+    state: &StateDir,
+    id: u64,
+    port: u16,
+) -> Result<tokio::net::TcpListener> {
+    match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+        Ok(l) => Ok(l),
+        Err(e) => {
+            // Dying worker mustn't leave a permanent stale entry.
+            let _ = Registry::update(state, |reg| {
+                reg.remove(id);
+            });
+            Err(e).with_context(|| format!("failed to bind 127.0.0.1:{port}"))
+        }
+    }
+}
+
+/// Open a hook service's request store (creating its service dir if needed).
+/// The dir exists since the reserve step, but the worker re-ensures it: a
+/// store that cannot live on disk would turn every recorded webhook into a
+/// 500 once the tunnel is up, so the failure belongs at startup.
+fn open_request_store(
+    state: &StateDir,
+    name: &str,
+    keep: usize,
+) -> Result<Arc<std::sync::Mutex<HookLog>>> {
+    state.ensure_service_dir(name)?;
+    let path = state.service_dir(name).join(hook_server::REQUESTS_FILENAME);
+    Ok(Arc::new(std::sync::Mutex::new(HookLog::load(path, keep))))
+}
+
+/// Spawn an origin's serve task with its graceful-shutdown channel: firing the
+/// sender later lets axum stop accepting and drain in-flight requests instead
+/// of aborting the server task (and dropping the requests) mid-flight. Shared
+/// by the static and hook arms, whose origins differ only in the router.
+fn serve_origin(
+    router: axum::Router,
+    listener: tokio::net::TcpListener,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<crate::error::Result<()>>,
+) {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_handle = tokio::spawn(async move {
+        static_server::serve_on(router, listener, async {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+    (shutdown_tx, server_handle)
 }
 
 /// Pure decision: should teardown actively signal/reap cloudflared for this
@@ -545,30 +618,30 @@ fn no_server() -> (
 
 /// Stop the worker's local origin, if it runs one.
 ///
-/// `Static`: fire the graceful-shutdown signal and let axum finish what it's
-/// serving, bounded by [`SERVER_SHUTDOWN_TIMEOUT`] so a stuck request cannot
-/// hang the worker; on overrun the task is aborted as a fallback. `Proxy` and
-/// `Run`: there is no server — the handle is [`no_server`]'s placeholder,
-/// which never completes — so it is aborted outright rather than burning the
-/// timeout (a run's origin is the spawned command, torn down by
+/// `Static` and `Hook`: fire the graceful-shutdown signal and let axum finish
+/// what it's serving, bounded by [`SERVER_SHUTDOWN_TIMEOUT`] so a stuck request
+/// cannot hang the worker; on overrun the task is aborted as a fallback.
+/// `Proxy` and `Run`: there is no server — the handle is [`no_server`]'s
+/// placeholder, which never completes — so it is aborted outright rather than
+/// burning the timeout (a run's origin is the spawned command, torn down by
 /// [`crate::proc::shutdown_child_command`], not by this slot).
 async fn stop_server(
     kind: ServiceKind,
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
     server_handle: &mut tokio::task::JoinHandle<crate::error::Result<()>>,
 ) {
-    if kind != ServiceKind::Static {
+    if !matches!(kind, ServiceKind::Static | ServiceKind::Hook) {
         server_handle.abort();
         return;
     }
     let _ = shutdown_tx.send(());
     match tokio::time::timeout(SERVER_SHUTDOWN_TIMEOUT, &mut *server_handle).await {
-        Ok(Ok(Ok(()))) => tracing::info!("static server drained and exited"),
-        Ok(Ok(Err(e))) => tracing::error!(%e, "static server task failed during shutdown"),
-        Ok(Err(e)) => tracing::error!(%e, "static server task panicked during shutdown"),
+        Ok(Ok(Ok(()))) => tracing::info!("local origin drained and exited"),
+        Ok(Ok(Err(e))) => tracing::error!(%e, "local origin task failed during shutdown"),
+        Ok(Err(e)) => tracing::error!(%e, "local origin task panicked during shutdown"),
         Err(_) => {
             tracing::warn!(
-                "static server did not drain within {:?}, aborting",
+                "local origin did not drain within {:?}, aborting",
                 SERVER_SHUTDOWN_TIMEOUT
             );
             server_handle.abort();
@@ -985,5 +1058,39 @@ mod tests {
             .expect_err("run placeholder must be aborted, still pending");
         assert!(err.is_cancelled());
         assert!(started.elapsed() < SERVER_SHUTDOWN_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn stop_server_drains_a_hook_origin_like_a_static_one() {
+        // A hook worker runs an ft-owned origin in-process (like static), so
+        // its teardown must take the DRAIN path — firing the shutdown signal
+        // and awaiting a bounded graceful exit — not an abort: the drain lets
+        // an in-flight recording finish writing instead of dropping it
+        // mid-append. This pins the Hook arm of stop_server's kind split.
+        let tmp = tempdir().expect("tempdir");
+        let store = crate::hook_server::HookLog::load(
+            tmp.path().join("requests.json"),
+            usize::from(crate::hook_server::DEFAULT_KEEP),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind ephemeral loopback listener");
+        let addr = listener.local_addr().expect("local addr");
+        let (shutdown_tx, mut server_handle) = serve_origin(
+            crate::hook_server::router(Arc::new(std::sync::Mutex::new(store))),
+            listener,
+        );
+        let started = std::time::Instant::now();
+        stop_server(ServiceKind::Hook, shutdown_tx, &mut server_handle).await;
+        assert!(started.elapsed() < SERVER_SHUTDOWN_TIMEOUT);
+
+        // The origin is gone for real: the drained listener no longer accepts
+        // connections. (The JoinHandle is deliberately NOT awaited again —
+        // stop_server's bounded await may already have driven the serve task
+        // to completion, and polling a completed JoinHandle panics.)
+        assert!(
+            tokio::net::TcpStream::connect(addr).await.is_err(),
+            "the hook origin must stop accepting after the drain"
+        );
     }
 }

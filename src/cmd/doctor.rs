@@ -464,7 +464,11 @@ fn service_checks(
                         hint: Some(hint),
                     });
                 }
-                ServiceKind::Static => checks.push(Check {
+                // A3 compile arm (semantically final): a Hook worker also
+                // hosts its ft-owned origin in-process, so a live worker with
+                // a dead port contradicts the model exactly like Static — the
+                // "built-in server should be listening" anomaly, same wording.
+                ServiceKind::Static | ServiceKind::Hook => checks.push(Check {
                     name: format!("origin {}", svc.name),
                     status: CheckStatus::Warn,
                     detail: format!(

@@ -1401,3 +1401,189 @@ fn sanitize_keeps_a_fresh_reservation_and_reaps_an_expired_one() {
         "sanitize must keep the fresh and drop the expired reservation, registry: {after}"
     );
 }
+
+// --- `ft hook` (usage, occupied-port pre-flight, seeded fixtures; no cloudflared)
+//
+// Like the proxy/run sections, only paths that stop BEFORE cloudflared is
+// looked up are driven here: `ft hook` is ft's own origin, so an occupied
+// port fails the pre-flight ahead of that lookup, and everything past it
+// would depend on whether this machine has cloudflared. The origin itself
+// (recording, /__inspect HTML + JSON views, retention, body cap) is covered
+// by the hook_server unit tests driving the Router directly with
+// tower::oneshot.
+
+#[test]
+fn hook_help_documents_the_command() {
+    let dir = TempDir::new().unwrap();
+    let (ok, out) = run_ft(dir.path(), &["hook", "--help"]);
+    assert!(ok, "`ft hook --help` failed: {out}");
+    assert!(
+        out.contains("Usage: ft hook"),
+        "missing the usage line in: {out}"
+    );
+    assert!(out.contains("--port"), "missing --port in: {out}");
+    assert!(out.contains("--name"), "missing --name in: {out}");
+    assert!(
+        out.contains("--foreground"),
+        "missing --foreground in: {out}"
+    );
+    assert!(out.contains("--keep"), "missing --keep in: {out}");
+    assert!(
+        out.contains("/__inspect"),
+        "the help must document the inspection paths in: {out}"
+    );
+}
+
+#[test]
+fn hook_usage_errors_leave_no_state() {
+    // Every rejected invocation must fail before the state tree exists: a
+    // usage error (clap value-parser ranges) means nothing was reserved,
+    // spawned, or written.
+    let dir = TempDir::new().unwrap();
+    for (args, expected) in [
+        (
+            &["hook", "--port", "abc"][..],
+            "invalid digit found in string",
+        ),
+        (&["hook", "--port", "0"][..], "0 is not in 1..=65535"),
+        (
+            &["hook", "--port", "70000"][..],
+            "70000 is not in 1..=65535",
+        ),
+        (&["hook", "--keep", "0"][..], "0 is not in 1..=1000"),
+        (&["hook", "--keep", "1001"][..], "1001 is not in 1..=1000"),
+    ] {
+        let (ok, out) = run_ft(dir.path(), args);
+        assert!(
+            !ok,
+            "expected a failure for `ft {}`, got: {out}",
+            args.join(" ")
+        );
+        assert!(
+            out.contains(expected),
+            "expected `{expected}` for `ft {}`, got: {out}",
+            args.join(" ")
+        );
+    }
+    assert!(
+        tree_paths(dir.path()).is_empty(),
+        "rejected hooks must leave no state, found: {:?}",
+        tree_paths(dir.path())
+    );
+}
+
+#[test]
+fn hook_refuses_an_occupied_port_and_leaves_no_state() {
+    // The hook origin is ft's OWN server, so an occupied port fails the
+    // pre-flight — before cloudflared is looked up and before any state
+    // exists — with a message that names the port. This holds on every
+    // machine regardless of cloudflared, because the check precedes that
+    // lookup entirely (the inverse of proxy's dead-upstream pre-flight).
+    let dir = TempDir::new().unwrap();
+    let listener =
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral loopback listener");
+    let port = listener.local_addr().expect("local addr").port();
+    let port_arg = port.to_string();
+
+    let (ok, out) = run_ft(dir.path(), &["hook", "--port", &port_arg]);
+    // The listener must outlive the run: the probe happens inside it.
+    drop(listener);
+
+    assert!(!ok, "an occupied port must fail `ft hook`, got: {out}");
+    assert!(
+        out.contains(&format!("port {port} is already in use")),
+        "expected the occupied-port error naming the port, got: {out}"
+    );
+    assert!(
+        tree_paths(dir.path()).is_empty(),
+        "a refused hook must leave no state, found: {:?}",
+        tree_paths(dir.path())
+    );
+}
+
+#[test]
+fn hook_fixture_renders_in_ls_and_detail() {
+    // A seeded `"kind": "hook"` entry (the on-disk shape `ft hook` reserves)
+    // must render through the same lifecycle commands as any other kind:
+    // kind-agnostic in `ls`, kind-aware in `detail` — Mode names the hook,
+    // there is no Directory/Upstream row (a hook serves no directory and
+    // fronts no operator upstream), and the Logs list carries the hook's
+    // request store (requests.json) but no server.log (the hook origin's
+    // record IS requests.json — there is no traced static server).
+    let dir = TempDir::new().unwrap();
+    let body = r#"{
+  "next_id": 3,
+  "services": [
+    {
+      "id": 1,
+      "name": "seed-hook",
+      "kind": "hook",
+      "dir": null,
+      "port": 9000,
+      "local_url": "http://127.0.0.1:9000",
+      "public_url": "https://x.trycloudflare.com",
+      "worker_pid": 4000000,
+      "tunnel_pid": null,
+      "created_at": "2026-07-21T00:00:00Z",
+      "state_dir": "/tmp/seed-hook-state",
+      "foreground": false
+    }
+  ]
+}"#;
+    seed_registry(dir.path(), body);
+
+    let (ok_ls, out_ls) = run_ft(dir.path(), &["ls"]);
+    assert!(ok_ls, "`ft ls` on a hook registry failed: {out_ls}");
+    assert!(
+        out_ls.contains("seed-hook") && out_ls.contains("stale") && out_ls.contains("9000"),
+        "expected the hook entry listed with its recorded-but-dead worker status \
+         and port, got: {out_ls}"
+    );
+
+    let (ok, out) = run_ft(dir.path(), &["detail", "seed-hook"]);
+    assert!(ok, "`ft detail seed-hook` failed: {out}");
+    assert!(
+        out.contains("Mode:         hook"),
+        "expected the hook Mode row, got: {out}"
+    );
+    assert!(
+        !out.contains("Directory:"),
+        "a hook entry must not render a Directory row: {out}"
+    );
+    assert!(
+        !out.contains("Upstream:"),
+        "a hook entry is not a proxy and must not render an Upstream row: {out}"
+    );
+    assert!(
+        out.contains("requests.json"),
+        "expected the hook request store listed, got: {out}"
+    );
+    assert!(
+        out.contains("worker.log") && out.contains("tunnel.log"),
+        "expected worker/tunnel logs listed, got: {out}"
+    );
+    assert!(
+        !out.contains("server.log"),
+        "a hook entry must not list server.log: {out}"
+    );
+    assert!(
+        out.contains("https://x.trycloudflare.com"),
+        "expected the seeded public url, got: {out}"
+    );
+
+    // kill is kind-agnostic (it targets pids): a recorded-but-dead worker pid
+    // makes the entry stale, and killing it reports the stale removal and
+    // persists the emptied registry.
+    let reg = registry_path(dir.path());
+    let (ok_kill, out_kill) = run_ft(dir.path(), &["kill", "seed-hook"]);
+    assert!(ok_kill, "`ft kill seed-hook` failed: {out_kill}");
+    assert!(
+        out_kill.contains("Removed stale service seed-hook."),
+        "expected the stale-removal message, got: {out_kill}"
+    );
+    let after = fs::read_to_string(&reg).unwrap();
+    assert!(
+        !after.contains("seed-hook"),
+        "kill should have removed the hook entry, but registry is: {after}"
+    );
+}

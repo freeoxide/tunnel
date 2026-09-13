@@ -159,6 +159,37 @@ pub enum Command {
         command: Vec<OsString>,
     },
 
+    /// Run a webhook receiver/inspector and expose it through a tunnel.
+    ///
+    /// `ft` runs its own origin (like `ft <dir>`, the server lives inside the
+    /// worker) that records every request arriving through the tunnel —
+    /// method, path, query, selected headers, and the size-capped body — to a
+    /// private per-service store, answering each with 200 OK. Inspect the
+    /// records through the tunnel itself: `GET /__inspect` (HTML, newest
+    /// first) or `GET /__inspect.json` (JSON array for scripts). Only the
+    /// newest N requests are kept (`--keep`, default 200), so the disk cannot
+    /// fill. The service is registered and managed like any other (`ls`,
+    /// `detail`, `kill`, `logs`, `open`, `prune`).
+    Hook {
+        /// Local port for ft's own hook origin (1-65535). Defaults to a free,
+        /// allocated port.
+        #[arg(long, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
+        port: Option<u16>,
+
+        /// Explicit service name. Defaults to `hook-<port>` (made unique).
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Run in the foreground instead of spawning a detached worker.
+        #[arg(long, short)]
+        foreground: bool,
+
+        /// Keep the newest N recorded requests (1-1000, default 200). Older
+        /// records are dropped on every append so the store stays bounded.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u16).range(1..=1000))]
+        keep: Option<u16>,
+    },
+
     /// Remove every dangling service — stale entries AND live tunnels whose
     /// local origin port is dead.
     ///
@@ -195,6 +226,13 @@ pub enum Command {
         /// workers, which spawn no command.
         #[arg(last = true, required = false, value_name = "COMMAND")]
         command: Vec<OsString>,
+        /// Retention for a Hook worker: keep the newest N recorded requests.
+        /// `None` for every other kind. Retention is runtime configuration
+        /// carried in the worker's argv (like the command tail), not registry
+        /// state — it is read by the origin itself, not by any lifecycle
+        /// command.
+        #[arg(long)]
+        keep: Option<u16>,
     },
 }
 
@@ -474,6 +512,121 @@ mod tests {
                     OsString::from("dev")
                 ]
             ),
+            other => panic!("expected RunWorker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hook_minimal_form_defaults_everything() {
+        // `ft hook` with no flags at all must parse: the port is allocated
+        // later by the command (like the implicit static start), the name
+        // derives from the port, and retention falls back to the documented
+        // default.
+        let cli = parse(&["hook"]).expect("`ft hook` must parse");
+        match cli.command {
+            Some(Command::Hook {
+                port,
+                name,
+                foreground,
+                keep,
+            }) => {
+                assert_eq!(port, None);
+                assert_eq!(name, None);
+                assert!(!foreground);
+                assert_eq!(keep, None);
+            }
+            other => panic!("expected Hook, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hook_flags_parse_and_reject_out_of_range_values() {
+        // Every flag of `ft hook` parses when in range — and the two numeric
+        // ones are usage errors out of range, before any state is touched
+        // (port 0 is the kernel's "assign me one" sentinel; keep 0 would
+        // retain nothing, and both bounds are the CLI's documented contract).
+        let cli = parse(&[
+            "hook",
+            "--port",
+            "9000",
+            "--name",
+            "gh",
+            "--foreground",
+            "--keep",
+            "50",
+        ])
+        .expect("`ft hook` with all flags must parse");
+        match cli.command {
+            Some(Command::Hook {
+                port,
+                name,
+                foreground,
+                keep,
+            }) => {
+                assert_eq!(port, Some(9000));
+                assert_eq!(name.as_deref(), Some("gh"));
+                assert!(foreground);
+                assert_eq!(keep, Some(50));
+            }
+            other => panic!("expected Hook, got {other:?}"),
+        }
+
+        assert!(
+            parse(&["hook", "--port", "0"]).is_err(),
+            "port 0 must be rejected"
+        );
+        assert!(
+            parse(&["hook", "--port", "70000"]).is_err(),
+            "ports beyond u16 must be rejected"
+        );
+        assert!(
+            parse(&["hook", "--keep", "0"]).is_err(),
+            "keep 0 must be rejected"
+        );
+        assert!(
+            parse(&["hook", "--keep", "1001"]).is_err(),
+            "keep beyond the documented 1000 cap must be rejected"
+        );
+    }
+
+    #[test]
+    fn run_worker_keep_flag_is_optional() {
+        // The hidden run-worker gains the Hook retention flag: it must keep
+        // parsing WITHOUT it (every historical worker argv shape passes none)
+        // and carry it verbatim when a hook spawn passes `--keep N`.
+        let cli = parse(&[
+            "run-worker",
+            "--id",
+            "3",
+            "--name",
+            "gh",
+            "--dir",
+            "/ft-proxy-has-no-directory",
+            "--port",
+            "9000",
+        ])
+        .expect("the historical run-worker argv shape must keep parsing");
+        match cli.command {
+            Some(Command::RunWorker { keep, .. }) => assert_eq!(keep, None),
+            other => panic!("expected RunWorker, got {other:?}"),
+        }
+
+        let cli = parse(&[
+            "run-worker",
+            "--id",
+            "4",
+            "--name",
+            "gh",
+            "--dir",
+            "/ft-proxy-has-no-directory",
+            "--port",
+            "9001",
+            "--keep",
+            "7",
+        ])
+        .expect("a run-worker argv carrying --keep must parse");
+        match cli.command {
+            Some(Command::RunWorker { keep, .. }) => assert_eq!(keep, Some(7)),
             other => panic!("expected RunWorker, got {other:?}"),
         }
     }

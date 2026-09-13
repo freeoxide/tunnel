@@ -10,6 +10,7 @@ mod cloudflared;
 mod cmd;
 mod error;
 mod fsutil;
+mod hook_server;
 mod model;
 mod name;
 mod output;

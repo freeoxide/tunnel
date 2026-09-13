@@ -200,39 +200,59 @@ fn render_listing(candidate: &Path, root: &Path) -> Option<String> {
 
     // The title interpolates a filesystem-derived path into markup, so it is
     // escaped exactly like the entry labels — a directory named `x<h1 …`
-    // must not inject.
-    let title = escape_html(&decoded_title(candidate, root));
+    // must not inject. The literal `Index of ` prefix carries no markup and
+    // is prepended after escaping.
+    let title = escape_html(&format!("Index of {}", decoded_title(candidate, root)));
     // Entry hrefs are rooted at `/` rather than `./`-relative so they resolve
     // identically whether the listing was reached as `/dir/` or `/dir` (for
     // files ServeDir answers the latter with a trailing-slash redirect; for
     // listings both forms are rendered directly).
     let base = href_base(candidate, root);
-    let mut html = format!(
-        "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n\
-         <title>Index of {title}</title>\n\
-         <style>body{{font-family:system-ui,sans-serif;max-width:42em;margin:2em auto;padding:0 1em}}\
-         h1{{font-size:1.3em}}li{{list-style:none;padding:.15em 0}}\
-         .dir{{font-weight:600}}</style>\n</head>\n<body>\n\
-         <h1>Index of {title}</h1>\n<hr>\n<ul>\n"
-    );
+    let mut body = String::from("<ul>\n");
     if candidate != root {
         // Absolute parent href: a relative `../` resolves against the
         // listing's URL, which misses a level when the listing was reached
         // without its trailing slash (/a/b -> / instead of /a/).
         let parent = href_base(candidate.parent().unwrap_or(root), root);
-        html.push_str(&format!("<li><a href=\"{parent}\">../</a></li>\n"));
+        body.push_str(&format!("<li><a href=\"{parent}\">../</a></li>\n"));
     }
     for (name, is_dir) in &entries {
         let kind = if *is_dir { "dir" } else { "file" };
         let slash = if *is_dir { "/" } else { "" };
         let href = encode_href(name);
         let label = escape_html(name);
-        html.push_str(&format!(
+        body.push_str(&format!(
             "<li><a class=\"{kind}\" href=\"{base}{href}{slash}\">{label}{slash}</a></li>\n"
         ));
     }
-    html.push_str("</ul>\n<hr>\n</body>\n</html>\n");
-    Some(html)
+    body.push_str("</ul>\n<hr>\n");
+    Some(html_page(&title, &body))
+}
+
+/// The shared HTML page scaffold behind the ft-owned origins' generated views
+/// (the static directory listing here, and the hook inspector in
+/// [`crate::hook_server`]). One wrapper so every generated page keeps the
+/// exact same styling — the body/max-width/h1/li rules are the visual
+/// contract shared by all of them.
+///
+/// `escaped_title` (rendered into both `<title>` and `<h1>`) and
+/// `escaped_body` (everything between the `<hr>` and `</body>`) must already
+/// be HTML-escaped by the caller: the scaffold interpolates them raw, so the
+/// escaping responsibility stays with the code that derives text from
+/// filesystem or request data (that is also why this takes pre-escaped input
+/// rather than escaping internally — a double-escape bug is visible, while a
+/// missed escape would be an injection).
+pub(crate) fn html_page(escaped_title: &str, escaped_body: &str) -> String {
+    format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n\
+         <title>{title}</title>\n\
+         <style>body{{font-family:system-ui,sans-serif;max-width:42em;margin:2em auto;padding:0 1em}}\
+         h1{{font-size:1.3em}}li{{list-style:none;padding:.15em 0}}\
+         .dir{{font-weight:600}}</style>\n</head>\n<body>\n\
+         <h1>{title}</h1>\n<hr>\n{body}</body>\n</html>\n",
+        title = escaped_title,
+        body = escaped_body,
+    )
 }
 
 /// Title text for the listing, before HTML escaping: the request path, or `/`
@@ -296,8 +316,12 @@ fn encode_href(name: &str) -> String {
     percent_encoding::utf8_percent_encode(name, FRAGMENT).to_string()
 }
 
-/// Minimal HTML text escaping for names inside the listing markup.
-fn escape_html(s: &str) -> String {
+/// Minimal HTML text escaping for names inside the listing markup. Shared
+/// with [`crate::hook_server`], whose inspector renders request-derived text
+/// (paths, header names/values, bodies) into the same page scaffold — any
+/// text that came from outside must pass through here before it touches
+/// markup.
+pub(crate) fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {

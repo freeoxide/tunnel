@@ -90,13 +90,16 @@ pub fn print_list(services: &[Service]) {
 ///
 /// The `Mode`/`Directory` rows are kind-aware: a Static service keeps the
 /// historical shape exactly (mode = foreground/background, plus the served
-/// `Directory:`), while a Proxy service renders its kind in the `Mode:` row
-/// and replaces `Directory:` with the `Upstream:` it fronts (the proxy's
-/// `local_url` IS the operator's server), and a Run service renders its kind
-/// with no Directory row at all (its origin is the command ft spawned — the
-/// `Command PID:` row is the run-specific fact). A proxy or run service runs
-/// no static server, so the Logs section lists no `server.log` (a run's
-/// command output is teed into `worker.log` instead).
+/// `Directory:`), a Proxy service renders its kind in the `Mode:` row and
+/// replaces `Directory:` with the `Upstream:` it fronts (the proxy's
+/// `local_url` IS the operator's server), a Run service renders its kind with
+/// no Directory row at all (its origin is the command ft spawned — the
+/// `Command PID:` row is the run-specific fact), and a Hook service renders
+/// its kind with no Directory/Upstream row (its origin is ft's own webhook
+/// receiver; the `Requests:` file in the Logs section is where the recorded
+/// requests live). A proxy, run, or hook service runs no traced static
+/// server, so the Logs section lists no `server.log` (a run's command output
+/// is teed into `worker.log`; a hook's request record is `requests.json`).
 pub fn print_detail(service: &Service) {
     let tunnel_pid = service
         .tunnel_pid
@@ -115,7 +118,7 @@ pub fn print_detail(service: &Service) {
             println!("Mode:         {}", service.kind.as_str());
             println!("Upstream:     {}", service.local_url);
         }
-        ServiceKind::Run => {
+        ServiceKind::Run | ServiceKind::Hook => {
             println!("Mode:         {}", service.kind.as_str());
         }
         ServiceKind::Static => {
@@ -150,6 +153,12 @@ pub fn print_detail(service: &Service) {
         // Only a Static worker runs (and traces requests into) a server. A
         // run's command output lands in worker.log instead.
         println!("  {}", service.state_dir.join("server.log").display());
+    }
+    if service.kind == ServiceKind::Hook {
+        // The hook origin's own request record — the data the /__inspect
+        // views serve — is a file sibling of the logs, so it is listed here
+        // where the operator already looks for a service's on-disk artifacts.
+        println!("  {}", service.state_dir.join("requests.json").display());
     }
     println!("  {}", service.state_dir.join("tunnel.log").display());
 }
