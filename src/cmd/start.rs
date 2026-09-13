@@ -663,7 +663,11 @@ async fn run_foreground_inner(
             let monitor = crate::proc::spawn_wait_monitor(child);
             (pid, monitor, (stdout, stderr))
         }
-        None => (None, tokio::spawn(std::future::pending()), (None, None)),
+        None => (
+            None,
+            crate::proc::command_monitor_placeholder(),
+            (None, None),
+        ),
     };
     // Record the command child's pid the moment it exists (Run only). Warn on
     // failure rather than `?`: with the child already running, a registry

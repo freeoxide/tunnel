@@ -122,13 +122,31 @@ pub(crate) fn spawn_wait_monitor(mut child: Child) -> tokio::task::JoinHandle<()
 #[cfg(unix)]
 const CHILD_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// The never-completing monitor stand-in for flows that spawn no command
+/// child (static/proxy workers, non-run foreground): the keep-alive `select!`
+/// needs a monitor binding, and [`shutdown_child_command`] treats the
+/// pid-less call as its bounded no-op (abort + await — a pending future never
+/// resolves on its own). One shared constructor so the placeholder shape the
+/// tests pin is the exact one production uses.
+pub(crate) fn command_monitor_placeholder() -> tokio::task::JoinHandle<()> {
+    tokio::spawn(std::future::pending())
+}
+
 /// Tear down the spawned command child — the counterpart of
 /// [`spawn_wait_monitor`].
 ///
-/// A no-op when the monitor already observed the child's exit (nothing to
-/// signal, nothing left to reap). Otherwise: Unix signals the child pid
-/// (SIGTERM, bounded wait, SIGKILL) and then awaits the monitor so the reap
-/// completes before the caller proceeds; Windows terminates by pid — sound
+/// `pid == None` means NO command child was ever spawned: the monitor slot
+/// holds the never-completing placeholder, so this must be a bounded no-op,
+/// not just a polite one — awaiting the placeholder there would hang EVERY
+/// non-Run worker and foreground teardown (the round-1 blocker). The
+/// placeholder is aborted (which resolves it immediately) so no parked task
+/// is left behind.
+///
+/// With a pid: a finished monitor means the child already exited and was
+/// reaped — nothing to signal, nothing left to reap. Otherwise Unix signals
+/// the child pid (SIGTERM, bounded wait, SIGKILL); when the grace elapses the
+/// SIGKILL is followed by one await of the still-pending monitor so the reap
+/// completes before the caller proceeds. Windows terminates by pid — sound
 /// without an identity needle because the monitor's open `Child` handle pins
 /// the pid against reuse until this call aborts it — and the worker's Job
 /// Object additionally guarantees whole-tree teardown when the flow exits.
@@ -136,6 +154,15 @@ pub(crate) async fn shutdown_child_command(
     pid: Option<u32>,
     monitor: &mut tokio::task::JoinHandle<()>,
 ) {
+    // No child, no signal path: abort the placeholder (a pending future never
+    // resolves on its own) and reap the task handle so teardown completes.
+    let Some(pid) = pid else {
+        monitor.abort();
+        let _ = monitor.await;
+        return;
+    };
+    // The monitor already observed the child's exit: nothing to signal,
+    // nothing left to reap.
     if monitor.is_finished() {
         return;
     }
@@ -143,25 +170,26 @@ pub(crate) async fn shutdown_child_command(
     {
         use nix::sys::signal::{Signal, kill};
         use nix::unistd::Pid;
-        if let Some(pid) = pid {
-            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
-            if tokio::time::timeout(CHILD_SHUTDOWN_GRACE, &mut *monitor)
-                .await
-                .is_err()
-            {
-                let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
-            }
+        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+        if tokio::time::timeout(CHILD_SHUTDOWN_GRACE, &mut *monitor)
+            .await
+            .is_err()
+        {
+            // Still running past the grace: SIGKILL is un-ignoreable, and the
+            // monitor is guaranteed still pending here (the timeout only
+            // elapses when the monitor did NOT complete), so this await is
+            // bounded and safe.
+            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+            let _ = (&mut *monitor).await;
         }
-        // Await the monitor even on the pid-less (cannot happen for a spawned
-        // Unix child, but stay correct) path: it reaps the child and proves
-        // the task is gone before the caller removes the registry entry.
-        let _ = (&mut *monitor).await;
+        // On the Ok arm the timeout's await already observed the child's
+        // completion AND reaped it via the monitor's own wait() — the handle
+        // is consumed and must NOT be polled again (tokio panics on a
+        // JoinHandle polled after completion).
     }
     #[cfg(windows)]
     {
-        if let Some(pid) = pid {
-            windows_proc::terminate_child(pid);
-        }
+        windows_proc::terminate_child(pid);
         monitor.abort();
         let _ = monitor.await;
     }
@@ -670,6 +698,96 @@ mod command_child_tests {
             port.to_string(),
             "the child must see PORT={port} in its environment"
         );
+    }
+
+    /// The full teardown path against a REAL child: SIGTERM lands, the
+    /// monitor observes the exit and reaps it, and shutdown returns well
+    /// inside the SIGKILL grace (no escalation was needed). This is the
+    /// companion to the placeholder test below — one proves the no-child
+    /// path is bounded, this proves the with-child path actually kills.
+    #[tokio::test]
+    async fn shutdown_child_command_stops_a_real_child_and_completes() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let child = spawn_command_child(&[OsString::from("sleep"), OsString::from("30")], port)
+            .expect("spawn sleep child");
+        let pid = child.id();
+        let mut monitor = spawn_wait_monitor(child);
+
+        let started = std::time::Instant::now();
+        shutdown_child_command(pid, &mut monitor).await;
+        assert!(
+            started.elapsed() < CHILD_SHUTDOWN_GRACE,
+            "SIGTERM must end the child without waiting out the SIGKILL grace, \
+             took {started:?}"
+        );
+        assert!(
+            monitor.is_finished(),
+            "the monitor must have observed (and reaped) the child"
+        );
+    }
+}
+
+/// Platform-neutral shutdown tests (the placeholder path is reachable on
+/// every target the crate ships: static/proxy workers and non-run foreground
+/// on Windows take the same call).
+#[cfg(test)]
+mod command_shutdown_tests {
+    use super::*;
+
+    /// Round-1 blocker regression: every non-Run flow calls shutdown with
+    /// pid=None and [`command_monitor_placeholder`] in the monitor slot. That
+    /// call MUST complete — the placeholder never resolves on its own, so an
+    /// unconditional await there hung every static/proxy worker and
+    /// foreground teardown at exit (registry cleanup included). The timeout
+    /// bound turns any regression into a failing test instead of a hung
+    /// suite, and the finished-check proves the placeholder was actually
+    /// reaped, not left parked.
+    #[tokio::test]
+    async fn pidless_placeholder_shutdown_completes_immediately() {
+        const BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+        let mut monitor = command_monitor_placeholder();
+        assert!(!monitor.is_finished(), "the placeholder starts pending");
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(BOUND, shutdown_child_command(None, &mut monitor))
+            .await
+            .expect("pid-less shutdown must complete, not hang on the placeholder");
+        assert!(
+            started.elapsed() < BOUND,
+            "the pid-less path is a bounded no-op, took {started:?}"
+        );
+        assert!(
+            monitor.is_finished(),
+            "the placeholder task must be gone after shutdown"
+        );
+    }
+
+    /// The same boundedness contract for an ALREADY-FINISHED monitor with a
+    /// pid: shutdown must complete (and must not panic on a dead/nonexistent
+    /// pid — 4_000_000 is far outside any real pid namespace, so any signal
+    /// sent there fails harmlessly). The is_finished guard makes this the
+    /// pure short-circuit; the timeout bound keeps it honest.
+    #[tokio::test]
+    async fn finished_monitor_shutdown_completes_immediately() {
+        const BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+        let mut monitor = tokio::spawn(async {});
+        // Give the trivial task a chance to finish so is_finished is the
+        // short-circuit taken (an unfinished task would take the abort path,
+        // which is also fine — this test pins the guard, not the scheduler).
+        for _ in 0..100 {
+            if monitor.is_finished() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(BOUND, shutdown_child_command(Some(4_000_000), &mut monitor))
+            .await
+            .expect("finished-monitor shutdown must complete");
+        assert!(started.elapsed() < BOUND);
     }
 }
 

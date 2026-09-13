@@ -299,7 +299,7 @@ pub async fn run(
         },
         _ => (
             None,
-            tokio::spawn(std::future::pending::<()>()),
+            crate::proc::command_monitor_placeholder(),
             (None, None),
         ),
     };
