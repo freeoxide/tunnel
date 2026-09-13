@@ -52,6 +52,12 @@ pub enum ServiceKind {
     /// `Proxy`/`Run` there is no served directory: the recorded requests live
     /// in the service's state dir instead (`requests.json`).
     Hook,
+    /// `ft drop <dir>`: `ft` runs its own upload-receiver origin on
+    /// [`Service::port`] (an ft-owned origin inside the worker, like
+    /// `Static`/`Hook`) that accepts token-gated uploads into
+    /// [`Service::dir`] — a real directory, carried like Static's — and
+    /// serves the stored files back GET-only.
+    Drop,
 }
 
 impl ServiceKind {
@@ -61,6 +67,7 @@ impl ServiceKind {
             ServiceKind::Proxy => "proxy",
             ServiceKind::Run => "run",
             ServiceKind::Hook => "hook",
+            ServiceKind::Drop => "drop",
         }
     }
 }
@@ -73,21 +80,24 @@ pub struct Service {
     pub id: u64,
     /// Human-friendly name, usable as a target.
     pub name: String,
-    /// How this service sources its local origin: ft's own static server
+    /// How this service sources its local origin: ft's own static file server
     /// ([`ServiceKind::Static`]), the operator's existing upstream
     /// ([`ServiceKind::Proxy`]), a command `ft` spawns itself
-    /// ([`ServiceKind::Run`]), or ft's own webhook receiver/inspector
-    /// ([`ServiceKind::Hook`]).
+    /// ([`ServiceKind::Run`]), ft's own webhook receiver/inspector
+    /// ([`ServiceKind::Hook`]), or ft's own upload receiver
+    /// ([`ServiceKind::Drop`]).
     ///
     /// Defaults to `Static` on deserialize so pre-proxy `registry.json`
     /// files — which carry no `kind` — keep their existing meaning.
     #[serde(default)]
     pub kind: ServiceKind,
-    /// Absolute path to the directory being served. `None` for `Proxy`,
-    /// `Run`, and `Hook` services, which front a port instead of a directory
-    /// (the proxy fronts the operator's server; a run fronts the command `ft`
-    /// spawned; a hook records requests into its state dir). Nullable and
-    /// defaulted so those entries may omit it on disk.
+    /// Absolute path to the directory being served. `Some` for `Static` (the
+    /// served tree) and `Drop` (the upload target, which the origin also
+    /// writes into); `None` for `Proxy`, `Run`, and `Hook` services, which
+    /// front a port instead of a directory (the proxy fronts the operator's
+    /// server; a run fronts the command `ft` spawned; a hook records requests
+    /// into its state dir). Nullable and defaulted so those entries may omit
+    /// it on disk.
     #[serde(default)]
     pub dir: Option<PathBuf>,
     /// Local port. For `Static` services this is the port ft's own server
@@ -313,6 +323,11 @@ mod tests {
         let s: Service = serde_json::from_str(&json).expect("hook must parse");
         assert_eq!(s.kind, ServiceKind::Hook);
         assert_eq!(s.dir, None);
+
+        let json = service_json(r#""kind": "drop", "dir": "/tmp/inbox","#);
+        let s: Service = serde_json::from_str(&json).expect("drop must parse");
+        assert_eq!(s.kind, ServiceKind::Drop);
+        assert_eq!(s.dir, Some(PathBuf::from("/tmp/inbox")));
     }
 
     #[test]
@@ -373,6 +388,24 @@ mod tests {
     }
 
     #[test]
+    fn drop_service_round_trips_through_json() {
+        // A drop service — dir: Some (the upload target, carried like
+        // Static's), no command child — must survive a serialize →
+        // deserialize cycle field-for-field, including the `kind` tag: the
+        // token deliberately is NOT registry state (it lives in the service's
+        // private token file), so the round-trip is the whole persistence
+        // story.
+        let s = Service {
+            kind: ServiceKind::Drop,
+            dir: Some(PathBuf::from("/tmp/inbox")),
+            ..service(7, Some("https://example.trycloudflare.com"), false)
+        };
+        let encoded = serde_json::to_string(&s).expect("encode");
+        let decoded: Service = serde_json::from_str(&encoded).expect("decode");
+        assert_eq!(decoded, s);
+    }
+
+    #[test]
     fn omitted_command_pid_deserializes_as_none() {
         // `command_pid` is serde-defaulted so every registry written before
         // `ft run` existed (and every non-run entry, which never sets it)
@@ -391,6 +424,7 @@ mod tests {
         assert_eq!(ServiceKind::Proxy.as_str(), "proxy");
         assert_eq!(ServiceKind::Run.as_str(), "run");
         assert_eq!(ServiceKind::Hook.as_str(), "hook");
+        assert_eq!(ServiceKind::Drop.as_str(), "drop");
         assert_eq!(
             serde_json::to_value(ServiceKind::Proxy).expect("encode"),
             serde_json::json!("proxy")
@@ -402,6 +436,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ServiceKind::Hook).expect("encode"),
             serde_json::json!("hook")
+        );
+        assert_eq!(
+            serde_json::to_value(ServiceKind::Drop).expect("encode"),
+            serde_json::json!("drop")
         );
     }
 

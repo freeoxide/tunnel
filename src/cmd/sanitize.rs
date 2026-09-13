@@ -80,8 +80,8 @@ enum ZombieReason {
     /// `kind == Proxy`: the operator's upstream server died; the tunnel 502s
     /// every request.
     UpstreamDead,
-    /// `kind == Static | Hook`: the live worker should be serving the port
-    /// in-process but is not.
+    /// `kind == Static | Hook | Drop`: the live worker should be serving the
+    /// port in-process but is not.
     InProcessServerDead,
 }
 
@@ -95,7 +95,7 @@ impl ZombieReason {
             ),
             ZombieReason::InProcessServerDead => format!(
                 "worker is running but 127.0.0.1:{} is not answering — an ft-owned \
-                 origin (static or hook) serves that port itself, an anomaly",
+                 origin (static, hook, or drop) serves that port itself, an anomaly",
                 svc.port
             ),
         }
@@ -202,10 +202,13 @@ fn plan(svc: &Service, worker_alive: Option<bool>, port_dead: Option<bool>) -> A
                 // the command exited — the same "upstream died" story as a
                 // proxy. Keep in sync if the kinds' zombie semantics diverge.
                 ServiceKind::Proxy | ServiceKind::Run => ZombieReason::UpstreamDead,
-                // A3 compile arm (semantically final): a Hook worker hosts its
-                // origin in-process exactly like a Static worker, so a dead
-                // port under a live worker is the same in-process anomaly.
-                ServiceKind::Static | ServiceKind::Hook => ZombieReason::InProcessServerDead,
+                // A3/A4 compile arms (semantically final): Hook and Drop
+                // workers host their ft-owned origins in-process exactly like
+                // a Static worker, so a dead port under a live worker is the
+                // same in-process anomaly.
+                ServiceKind::Static | ServiceKind::Hook | ServiceKind::Drop => {
+                    ZombieReason::InProcessServerDead
+                }
             },
         },
         _ => Action::Keep,

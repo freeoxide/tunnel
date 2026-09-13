@@ -8,6 +8,7 @@
 mod cli;
 mod cloudflared;
 mod cmd;
+mod drop_server;
 mod error;
 mod fsutil;
 mod hook_server;

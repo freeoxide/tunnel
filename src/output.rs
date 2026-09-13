@@ -52,6 +52,24 @@ pub fn print_started(service: &Service) {
     println!("Logs:    {}/", service.state_dir.display());
 }
 
+/// Print the drop bucket's access-token block, printed ONCE by a successful
+/// `ft drop` (background and foreground alike): the token is the write
+/// credential for the bucket, so the operator must walk away from the start
+/// command with it in hand (it also lives in the service's private token file
+/// and is shown by `ft detail`). The example embeds `example_origin` so the
+/// command line is copy-pasteable.
+pub fn print_drop_token(token: &str, example_origin: &str) {
+    println!();
+    println!("Token:   {token}");
+    println!();
+    println!("Uploads REQUIRE this token (POST/PUT; GET downloads are public), e.g.:");
+    println!(
+        "  curl -H \"Authorization: Bearer {token}\" --data-binary @file.txt \
+         {example_origin}/file.txt"
+    );
+    println!("Recover it later with `ft detail <name>`.");
+}
+
 /// Print the service list as a table, or `(no services)` when empty.
 ///
 /// Columns: `ID NAME STATUS PORT URL`. Status comes from `Service::status`;
@@ -94,12 +112,18 @@ pub fn print_list(services: &[Service]) {
 /// replaces `Directory:` with the `Upstream:` it fronts (the proxy's
 /// `local_url` IS the operator's server), a Run service renders its kind with
 /// no Directory row at all (its origin is the command ft spawned — the
-/// `Command PID:` row is the run-specific fact), and a Hook service renders
+/// `Command PID:` row is the run-specific fact), a Hook service renders
 /// its kind with no Directory/Upstream row (its origin is ft's own webhook
 /// receiver; the `Requests:` file in the Logs section is where the recorded
-/// requests live). A proxy, run, or hook service runs no traced static
-/// server, so the Logs section lists no `server.log` (a run's command output
-/// is teed into `worker.log`; a hook's request record is `requests.json`).
+/// requests live), and a Drop service renders its kind plus the upload
+/// target's `Directory:` row and a `Token:` row — the drop bucket's write
+/// credential, read back from the service's private token file (the token is
+/// deliberately NOT registry state, so the file read here is the only way
+/// `ft detail` can recover it for the operator; `-` when it cannot be read).
+/// A proxy, run, hook, or drop service runs no traced static server, so the
+/// Logs section lists no `server.log` (a run's command output is teed into
+/// `worker.log`; a hook's request record is `requests.json`; a drop's record
+/// is the bucket directory itself).
 pub fn print_detail(service: &Service) {
     let tunnel_pid = service
         .tunnel_pid
@@ -120,6 +144,16 @@ pub fn print_detail(service: &Service) {
         }
         ServiceKind::Run | ServiceKind::Hook => {
             println!("Mode:         {}", service.kind.as_str());
+        }
+        ServiceKind::Drop => {
+            println!("Mode:         {}", service.kind.as_str());
+            println!(
+                "Directory:    {}",
+                service
+                    .dir
+                    .as_deref()
+                    .map_or_else(|| "-".to_string(), |d| d.display().to_string())
+            );
         }
         ServiceKind::Static => {
             println!(
@@ -146,6 +180,17 @@ pub fn print_detail(service: &Service) {
     println!("Started:      {}", fmt_started(service));
     println!("Local URL:    {}", service.local_url);
     println!("Public URL:   {}", url_or_pending(service));
+    if service.kind == ServiceKind::Drop {
+        // The upload credential's durable home is the service's private token
+        // file; detail is where the operator recovers it (printed once at
+        // start, this is the second and last place it appears). A missing or
+        // unreadable file renders as `-` rather than failing the whole detail.
+        let token = crate::drop_server::read_token(&service.state_dir)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "-".to_string());
+        println!("Token:        {token}");
+    }
     println!();
     println!("Logs:");
     println!("  {}", service.state_dir.join("worker.log").display());

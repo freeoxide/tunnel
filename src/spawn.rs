@@ -49,14 +49,18 @@ fn worker_token() -> String {
 pub(crate) const PROXY_DIR_SENTINEL: &str = "/ft-proxy-has-no-directory";
 
 /// The `run-worker` argv prefix shared by the Unix and Windows spawn paths:
-/// the `--dir` value is the served directory, or [`PROXY_DIR_SENTINEL`] for a
-/// directory-less (proxy/run/hook) worker. `command` is the Run worker's child
-/// command, passed after a trailing `--` so flag-looking child arguments are
-/// never parsed as worker flags; it must be empty for every kind that spawns
-/// no child. `keep` is the Hook worker's retention (`--keep`); `None` for
-/// every other kind — all optional values ride the argv because the registry
-/// entry carries no fields for them (they are runtime configuration of the
-/// origin itself, not lifecycle state).
+/// the `--dir` value is the served directory (or the upload target for a
+/// DROP worker), or [`PROXY_DIR_SENTINEL`] for a directory-less (proxy/run/
+/// hook) worker. `command` is the Run worker's child command, passed after a
+/// trailing `--` so flag-looking child arguments are never parsed as worker
+/// flags; it must be empty for every kind that spawns no child. `keep` is the
+/// Hook worker's retention (`--keep`) and `max_size` the Drop worker's
+/// per-upload cap (`--max-size`); `None` for every other kind — all optional
+/// values ride the argv because the registry entry carries no fields for them
+/// (they are runtime configuration of the origin itself, not lifecycle
+/// state). The Drop worker's access token deliberately does NOT ride the
+/// argv: it is read from the service's private token file instead, so the
+/// secret never shows up in `ps`.
 fn run_worker_args(
     id: u64,
     name: &str,
@@ -64,6 +68,7 @@ fn run_worker_args(
     port: u16,
     command: &[OsString],
     keep: Option<u16>,
+    max_size: Option<u64>,
 ) -> Vec<OsString> {
     let dir_arg = dir
         .map(|d| d.to_string_lossy().into_owned())
@@ -83,6 +88,10 @@ fn run_worker_args(
         args.push("--keep".into());
         args.push(keep.to_string().into());
     }
+    if let Some(max_size) = max_size {
+        args.push("--max-size".into());
+        args.push(max_size.to_string().into());
+    }
     if !command.is_empty() {
         args.push("--".into());
         args.extend(command.iter().cloned());
@@ -97,14 +106,22 @@ fn run_worker_args(
 /// usual STATIC worker. See [`spawn_worker_with_command`] for the detachment
 /// contract; this wrapper covers the flows that never spawn a command child.
 pub fn spawn_worker(id: u64, name: &str, dir: Option<&Path>, port: u16) -> Result<u32> {
-    spawn_worker_full(id, name, dir, port, &[], None)
+    spawn_worker_full(id, name, dir, port, &[], None, None)
 }
 
 /// Spawn the detached `run-worker` child for a HOOK service and return its
 /// pid: directory-less (the hook origin has no served tree) and carrying the
 /// retention value the worker applies to its request store.
 pub fn spawn_hook_worker(id: u64, name: &str, port: u16, keep: u16) -> Result<u32> {
-    spawn_worker_full(id, name, None, port, &[], Some(keep))
+    spawn_worker_full(id, name, None, port, &[], Some(keep), None)
+}
+
+/// Spawn the detached `run-worker` child for a DROP service and return its
+/// pid: the argv carries the upload target directory (the worker re-resolves
+/// and re-checks it) and the per-upload cap, while the access token travels
+/// via the service's private token file — never the argv (`ps` visibility).
+pub fn spawn_drop_worker(id: u64, name: &str, dir: &Path, port: u16, max_size: u64) -> Result<u32> {
+    spawn_worker_full(id, name, Some(dir), port, &[], None, Some(max_size))
 }
 
 /// Spawn the detached `run-worker` child for a service and return its pid,
@@ -123,13 +140,13 @@ pub fn spawn_worker_with_command(
     port: u16,
     command: &[OsString],
 ) -> Result<u32> {
-    spawn_worker_full(id, name, dir, port, command, None)
+    spawn_worker_full(id, name, dir, port, command, None, None)
 }
 
-/// The single spawn path behind all three entry points: every public wrapper
-/// pins the optional values its flow does not use (`command` empty / `keep`
-/// None), so historical argv shapes stay byte-identical while the hook flow
-/// adds only its `--keep` flag.
+/// The single spawn path behind every entry point: each public wrapper pins
+/// the optional values its flow does not use (`command` empty / `keep` and
+/// `max_size` None), so historical argv shapes stay byte-identical while the
+/// hook flow adds only `--keep` and the drop flow only `--max-size`.
 #[cfg(unix)]
 fn spawn_worker_full(
     id: u64,
@@ -138,6 +155,7 @@ fn spawn_worker_full(
     port: u16,
     command: &[OsString],
     keep: Option<u16>,
+    max_size: Option<u64>,
 ) -> Result<u32> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -160,11 +178,13 @@ fn spawn_worker_full(
 
     let token = worker_token();
     let mut cmd = Command::new(exe);
-    cmd.args(run_worker_args(id, name, dir, port, command, keep))
-        .env("FT_WORKER_TOKEN", &token)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file));
+    cmd.args(run_worker_args(
+        id, name, dir, port, command, keep, max_size,
+    ))
+    .env("FT_WORKER_TOKEN", &token)
+    .stdin(Stdio::null())
+    .stdout(Stdio::from(stdout_file))
+    .stderr(Stdio::from(stderr_file));
 
     // New session via setsid(): the child becomes a session leader AND the
     // leader of a fresh process group whose id equals its pid — so a later
@@ -213,6 +233,7 @@ fn spawn_worker_full(
     port: u16,
     command: &[OsString],
     keep: Option<u16>,
+    max_size: Option<u64>,
 ) -> Result<u32> {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -237,12 +258,14 @@ fn spawn_worker_full(
 
     let token = worker_token();
     let mut cmd = Command::new(exe);
-    cmd.args(run_worker_args(id, name, dir, port, command, keep))
-        .env("FT_WORKER_TOKEN", &token)
-        .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file));
+    cmd.args(run_worker_args(
+        id, name, dir, port, command, keep, max_size,
+    ))
+    .env("FT_WORKER_TOKEN", &token)
+    .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS)
+    .stdin(Stdio::null())
+    .stdout(Stdio::from(stdout_file))
+    .stderr(Stdio::from(stderr_file));
 
     let pid = cmd
         .spawn()
@@ -265,7 +288,15 @@ mod tests {
 
     #[test]
     fn static_worker_passes_the_real_directory() {
-        let args = run_worker_args(7, "blog", Some(Path::new("/srv/blog")), 8000, &[], None);
+        let args = run_worker_args(
+            7,
+            "blog",
+            Some(Path::new("/srv/blog")),
+            8000,
+            &[],
+            None,
+            None,
+        );
         assert_eq!(
             args,
             os(&[
@@ -286,7 +317,7 @@ mod tests {
     fn proxy_worker_passes_the_sentinel_directory() {
         // A proxy worker has no directory: the mandatory `--dir` flag carries
         // the sentinel, and the worker takes its real spec from the registry.
-        let args = run_worker_args(9, "api", None, 3000, &[], None);
+        let args = run_worker_args(9, "api", None, 3000, &[], None, None);
         assert_eq!(
             args,
             os(&[
@@ -319,6 +350,7 @@ mod tests {
             3000,
             &os(&["npm", "run", "dev", "--verbose"]),
             None,
+            None,
         );
         assert_eq!(
             args,
@@ -347,7 +379,7 @@ mod tests {
         // it belongs to ft (parsed by run-worker's own clap definition), so it
         // must sit BEFORE the `--` separator — after it, everything belongs to
         // a run worker's command child.
-        let args = run_worker_args(12, "gh", None, 9000, &[], Some(50));
+        let args = run_worker_args(12, "gh", None, 9000, &[], Some(50), None);
         assert_eq!(
             args,
             os(&[
@@ -362,6 +394,40 @@ mod tests {
                 "9000",
                 "--keep",
                 "50",
+            ])
+        );
+    }
+
+    #[test]
+    fn drop_worker_carries_its_directory_and_cap_before_the_separator() {
+        // A drop worker's argv carries the REAL upload target (unlike the
+        // directory-less kinds) and `--max-size N` before the `--` separator.
+        // The access token deliberately appears NOWHERE in the argv: it is
+        // read from the service's private token file, so `ps` never shows the
+        // bucket's write credential.
+        let args = run_worker_args(
+            13,
+            "share",
+            Some(Path::new("/srv/inbox")),
+            9001,
+            &[],
+            None,
+            Some(4096),
+        );
+        assert_eq!(
+            args,
+            os(&[
+                "run-worker",
+                "--id",
+                "13",
+                "--name",
+                "share",
+                "--dir",
+                "/srv/inbox",
+                "--port",
+                "9001",
+                "--max-size",
+                "4096",
             ])
         );
     }

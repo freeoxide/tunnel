@@ -1099,6 +1099,243 @@ fn run_fixture_renders_in_ls_and_detail() {
     );
 }
 
+// --- `ft drop` (usage, pre-flights, seeded fixtures; no cloudflared) --------
+//
+// Like the hook section, only paths that stop BEFORE cloudflared is looked up
+// are driven here: `ft drop` is ft's own origin, so its pre-flights (upload
+// target resolution/sensitivity, occupied port, empty token) all run ahead of
+// that lookup, and everything past it would depend on whether this machine
+// has cloudflared. The origin itself (token auth, caps, sanitization,
+// confinement on the GET side) is covered by the drop_server unit tests
+// driving the Router directly with tower::oneshot.
+
+#[test]
+fn drop_help_documents_the_command() {
+    let dir = TempDir::new().unwrap();
+    let (ok, out) = run_ft(dir.path(), &["drop", "--help"]);
+    assert!(ok, "`ft drop --help` failed: {out}");
+    assert!(
+        out.contains("Usage: ft drop"),
+        "missing the usage line in: {out}"
+    );
+    assert!(
+        out.contains("<DIR>"),
+        "missing the DIR positional in: {out}"
+    );
+    assert!(out.contains("--port"), "missing --port in: {out}");
+    assert!(out.contains("--name"), "missing --name in: {out}");
+    assert!(
+        out.contains("--foreground"),
+        "missing --foreground in: {out}"
+    );
+    assert!(out.contains("--token"), "missing --token in: {out}");
+    assert!(out.contains("--max-size"), "missing --max-size in: {out}");
+    // The token is the bucket's write credential and its flag is the
+    // command's public surface: the help must explain that uploads REQUIRE
+    // it and that one is minted and printed when omitted.
+    assert!(
+        out.contains("token"),
+        "the help must mention the token in: {out}"
+    );
+    assert!(
+        out.to_lowercase().contains("printed"),
+        "the help must say the generated token is printed: {out}"
+    );
+}
+
+#[test]
+fn drop_usage_errors_and_preflight_refusals_leave_no_state() {
+    // Every rejected invocation must fail before the state tree exists: clap
+    // usage errors (missing positional, port/cap ranges) and the command's
+    // own pre-flights (nonexistent target, sensitive target, empty token)
+    // all precede any reservation or spawn.
+    let dir = TempDir::new().unwrap();
+    let missing = dir.path().join("does-not-exist");
+    let missing = missing.to_string_lossy().into_owned();
+    for (args, expected) in [
+        // clap: the DIR positional is required.
+        (&["drop"][..], "required arguments were not provided"),
+        (
+            &["drop", "inbox", "--port", "abc"][..],
+            "invalid digit found in string",
+        ),
+        (
+            &["drop", "inbox", "--port", "0"][..],
+            "0 is not in 1..=65535",
+        ),
+        (
+            &["drop", "inbox", "--max-size", "0"][..],
+            "0 is not in 1..=1073741824",
+        ),
+        (
+            &["drop", "inbox", "--max-size", "1073741825"][..],
+            "1073741825 is not in 1..=1073741824",
+        ),
+        // Runtime pre-flights (before any state): the target must exist, must
+        // not be sensitive, and an explicit token must be non-empty.
+        (&["drop", &missing][..], "does not exist"),
+        (&["drop", "/"][..], "sensitive directory"),
+        (
+            &["drop", "/tmp", "--token", ""][..],
+            "--token must be a non-empty secret",
+        ),
+    ] {
+        let (ok, out) = run_ft(dir.path(), args);
+        assert!(
+            !ok,
+            "expected a failure for `ft {}`, got: {out}",
+            args.join(" ")
+        );
+        assert!(
+            out.contains(expected),
+            "expected `{expected}` for `ft {}`, got: {out}",
+            args.join(" ")
+        );
+    }
+    assert!(
+        tree_paths(dir.path()).is_empty(),
+        "rejected drops must leave no state, found: {:?}",
+        tree_paths(dir.path())
+    );
+}
+
+#[test]
+fn drop_refuses_an_occupied_port_and_leaves_no_state() {
+    // The drop origin is ft's OWN server, so an occupied port fails the
+    // pre-flight — before cloudflared is looked up and before any state
+    // exists — with a message that names the port (same as `ft hook`, the
+    // inverse of `ft proxy`'s dead-upstream pre-flight).
+    let dir = TempDir::new().unwrap();
+    let bucket = TempDir::new().unwrap();
+    let bucket_arg = bucket.path().to_string_lossy().into_owned();
+    let listener =
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral loopback listener");
+    let port = listener.local_addr().expect("local addr").port();
+    let port_arg = port.to_string();
+
+    let (ok, out) = run_ft(
+        dir.path(),
+        &[
+            "drop",
+            &bucket_arg,
+            "--port",
+            &port_arg,
+            "--token",
+            "sekrit",
+        ],
+    );
+    // The listener must outlive the run: the probe happens inside it.
+    drop(listener);
+
+    assert!(!ok, "an occupied port must fail `ft drop`, got: {out}");
+    assert!(
+        out.contains(&format!("port {port} is already in use")),
+        "expected the occupied-port error naming the port, got: {out}"
+    );
+    assert!(
+        tree_paths(dir.path()).is_empty(),
+        "a refused drop must leave no state, found: {:?}",
+        tree_paths(dir.path())
+    );
+}
+
+#[test]
+fn drop_fixture_renders_in_ls_detail_and_kill() {
+    // A seeded `"kind": "drop"` entry (the on-disk shape `ft drop` reserves —
+    // note `dir` IS carried, like static, because the bucket is a real
+    // directory) must render through the same lifecycle commands as any other
+    // kind: kind-agnostic in `ls`, kind-aware in `detail` — Mode names the
+    // drop, the Directory row names the upload target, the Token row reads
+    // the service's private token file (here seeded so the display contract
+    // is pinned end-to-end), and the Logs list has no server.log (the drop
+    // origin's record is the bucket directory itself). kill stays
+    // kind-agnostic: a dead worker pid makes the entry stale and removable.
+    let dir = TempDir::new().unwrap();
+    // Anchor the service's state_dir inside the test's tempdir so the token
+    // file the detail command reads is private to this test.
+    let state_dir = dir.path().join("seed-drop-state");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(state_dir.join("drop-token"), "tok-seeded-abc\n").unwrap();
+    let state_dir_arg = state_dir.to_string_lossy().into_owned();
+    let body = format!(
+        r#"{{
+  "next_id": 3,
+  "services": [
+    {{
+      "id": 1,
+      "name": "seed-drop",
+      "kind": "drop",
+      "dir": "/tmp/seed-bucket",
+      "port": 9100,
+      "local_url": "http://127.0.0.1:9100",
+      "public_url": "https://x.trycloudflare.com",
+      "worker_pid": 4000000,
+      "tunnel_pid": null,
+      "created_at": "2026-07-21T00:00:00Z",
+      "state_dir": "{state_dir_arg}",
+      "foreground": false
+    }}
+  ]
+}}"#
+    );
+    seed_registry(dir.path(), &body);
+
+    let (ok_ls, out_ls) = run_ft(dir.path(), &["ls"]);
+    assert!(ok_ls, "`ft ls` on a drop registry failed: {out_ls}");
+    assert!(
+        out_ls.contains("seed-drop") && out_ls.contains("stale") && out_ls.contains("9100"),
+        "expected the drop entry listed with its recorded-but-dead worker status \
+         and port, got: {out_ls}"
+    );
+
+    let (ok, out) = run_ft(dir.path(), &["detail", "seed-drop"]);
+    assert!(ok, "`ft detail seed-drop` failed: {out}");
+    assert!(
+        out.contains("Mode:         drop"),
+        "expected the drop Mode row, got: {out}"
+    );
+    assert!(
+        out.contains("Directory:    /tmp/seed-bucket"),
+        "expected the bucket Directory row, got: {out}"
+    );
+    assert!(
+        out.contains("Token:        tok-seeded-abc"),
+        "expected the token row reading the private token file, got: {out}"
+    );
+    assert!(
+        !out.contains("Upstream:"),
+        "a drop entry is not a proxy and must not render an Upstream row: {out}"
+    );
+    assert!(
+        out.contains("worker.log") && out.contains("tunnel.log"),
+        "expected worker/tunnel logs listed, got: {out}"
+    );
+    assert!(
+        !out.contains("server.log"),
+        "a drop entry must not list server.log: {out}"
+    );
+    assert!(
+        out.contains("https://x.trycloudflare.com"),
+        "expected the seeded public url, got: {out}"
+    );
+
+    // kill is kind-agnostic (it targets pids): a recorded-but-dead worker pid
+    // makes the entry stale, and killing it reports the stale removal and
+    // persists the emptied registry.
+    let reg = registry_path(dir.path());
+    let (ok_kill, out_kill) = run_ft(dir.path(), &["kill", "seed-drop"]);
+    assert!(ok_kill, "`ft kill seed-drop` failed: {out_kill}");
+    assert!(
+        out_kill.contains("Removed stale service seed-drop."),
+        "expected the stale-removal message, got: {out_kill}"
+    );
+    let after = fs::read_to_string(&reg).unwrap();
+    assert!(
+        !after.contains("seed-drop"),
+        "kill should have removed the drop entry, but registry is: {after}"
+    );
+}
+
 // --- `ft doctor` (read-only diagnosis; no cloudflared needed) ---------------
 
 #[test]

@@ -464,11 +464,13 @@ fn service_checks(
                         hint: Some(hint),
                     });
                 }
-                // A3 compile arm (semantically final): a Hook worker also
-                // hosts its ft-owned origin in-process, so a live worker with
-                // a dead port contradicts the model exactly like Static — the
-                // "built-in server should be listening" anomaly, same wording.
-                ServiceKind::Static | ServiceKind::Hook => checks.push(Check {
+                // A3/A4 compile arms (semantically final): Hook and Drop
+                // workers also host their ft-owned origins in-process, so a
+                // live worker with a dead port contradicts the model exactly
+                // like Static — the "built-in server should be listening"
+                // anomaly, same wording. (command_probe stays Run-gated, so
+                // hook/drop entries are naturally probe-free.)
+                ServiceKind::Static | ServiceKind::Hook | ServiceKind::Drop => checks.push(Check {
                     name: format!("origin {}", svc.name),
                     status: CheckStatus::Warn,
                     detail: format!(

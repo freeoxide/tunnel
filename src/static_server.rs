@@ -289,8 +289,10 @@ fn href_base(candidate: &Path, root: &Path) -> String {
 
 /// Percent-encode a name for use in an href: keep the unreserved set plus the
 /// `/` separator, encode everything else (spaces, `?`, `#`, `%`, `&`, `<`,
-/// `:`, `[`, non-ASCII, ...).
-fn encode_href(name: &str) -> String {
+/// `:`, `[`, non-ASCII, ...). Shared with [`crate::drop_server`], whose
+/// listing renders upload names into the same page scaffold with the same
+/// encoding rules.
+pub(crate) fn encode_href(name: &str) -> String {
     const FRAGMENT: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
         .add(b' ')
         .add(b'"')
@@ -339,6 +341,11 @@ pub(crate) fn escape_html(s: &str) -> String {
 /// Confinement guard: deny dotfiles, reject `..` traversal, and refuse any
 /// path whose canonicalised target escapes the served root (symlink escape).
 ///
+/// Shared verbatim with [`crate::drop_server`] (visibility only, zero
+/// behaviour change — see the shared-helper rule in the module docs): the
+/// drop bucket's GET side must behave exactly like the static server's, so it
+/// layers this same middleware in front of the same `ServeDir` semantics.
+///
 /// We reconstruct the candidate path the same way `ServeDir` does (percent-
 /// decode, drop leading `/`, split on `/`, skip empty segments) and then
 /// canonicalise it. `canonicalize` follows symlinks all the way to the real
@@ -358,7 +365,7 @@ pub(crate) fn escape_html(s: &str) -> String {
 /// handler; for a dev tunneling tool the guard defeats the realistic threat
 /// (symlinks already present in the served tree) and keeps ServeDir's HTTP
 /// semantics (ranges, ETag, index.html).
-async fn confine(State(root): State<PathBuf>, request: Request, next: Next) -> Response {
+pub(crate) async fn confine(State(root): State<PathBuf>, request: Request, next: Next) -> Response {
     let raw = request.uri().path();
     let decoded = match percent_decode(raw.as_bytes()).decode_utf8() {
         Ok(s) => s,

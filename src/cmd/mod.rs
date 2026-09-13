@@ -7,6 +7,7 @@
 
 pub mod detail;
 pub mod doctor;
+pub mod drop;
 pub mod hook;
 pub mod kill;
 pub mod list;
@@ -54,6 +55,14 @@ pub async fn run(cli: Cli) -> Result<()> {
             foreground,
             keep,
         }) => hook::run(port, name, foreground, keep).await,
+        Some(Command::Drop {
+            dir,
+            port,
+            name,
+            foreground,
+            token,
+            max_size,
+        }) => drop::run(dir, port, name, foreground, token, max_size).await,
         Some(Command::Sanitize) => sanitize::run().await,
         Some(Command::RunWorker {
             id,
@@ -62,7 +71,8 @@ pub async fn run(cli: Cli) -> Result<()> {
             port,
             command,
             keep,
-        }) => crate::worker::run(id, name, dir, port, command, keep).await,
+            max_size,
+        }) => crate::worker::run(id, name, dir, port, command, keep, max_size).await,
         None => {
             let dir: PathBuf = cli.dir.unwrap_or_else(|| PathBuf::from("."));
             start::run(Some(dir), cli.name, cli.port, cli.foreground, cli.yes).await

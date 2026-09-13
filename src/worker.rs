@@ -1,10 +1,11 @@
 //! The detached worker process.
 //!
-//! Invoked as `ft run-worker --id --name --dir --port [--keep N] [-- <command>]`,
-//! this fronts the service's local origin with a `cloudflared` Quick Tunnel
-//! child, discovers the tunnel URL from cloudflared's output, records it on the
-//! registry entry, and stays alive until cloudflared exits, a terminating
-//! signal arrives, or (static and hook services) the server task ends.
+//! Invoked as `ft run-worker --id --name --dir --port [--keep N]
+//! [--max-size N] [-- <command>]`, this fronts the service's local origin
+//! with a `cloudflared` Quick Tunnel child, discovers the tunnel URL from
+//! cloudflared's output, records it on the registry entry, and stays alive
+//! until cloudflared exits, a terminating signal arrives, or (static, hook,
+//! and drop services) the server task ends.
 //!
 //! What to front is decided by the reserved registry entry's `kind`, not by
 //! the CLI args: a `Static` worker re-runs the START flow's directory safety
@@ -14,11 +15,16 @@
 //! on `http://127.0.0.1:<port>`; a `Run` worker spawns the operator's command
 //! (which fronts `http://127.0.0.1:<port>`) as a child of THIS process — same
 //! process-group discipline as cloudflared, so tunnel and command live and
-//! die together; and a `Hook` worker binds ft's own webhook receiver/inspector
+//! die together; a `Hook` worker binds ft's own webhook receiver/inspector
 //! on `127.0.0.1:<port>` (like `Static`, an ft-owned origin inside the
-//! worker), recording every request to the service's request store. cloudflared
-//! connects lazily, so a dead upstream is deliberately NOT a start-time
-//! failure here (a friendly pre-flight, if any, belongs to the CLI layer).
+//! worker), recording every request to the service's request store; and a
+//! `Drop` worker binds ft's own upload-receiver origin on `127.0.0.1:<port>`
+//! (an ft-owned origin like Static/Hook) after re-running the directory
+//! checks on the upload target and reading the access token back from the
+//! service's private token file — fail-fast on either, like the hook's
+//! request store. cloudflared connects lazily, so a dead upstream is
+//! deliberately NOT a start-time failure here (a friendly pre-flight, if
+//! any, belongs to the CLI layer).
 //!
 //! All registry writes go through [`Registry::update`] (an exclusive flock), so
 //! the parent's writes and ours never clobber each other.
@@ -35,6 +41,7 @@ use tokio::sync::Mutex;
 
 use crate::cloudflared;
 use crate::cmd::start::{is_sensitive_dir, resolve_dir};
+use crate::drop_server::{self, DropStore};
 use crate::error::Result;
 use crate::hook_server;
 use crate::hook_server::HookLog;
@@ -52,14 +59,16 @@ const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Run the worker to completion.
 ///
-/// `dir` is the `--dir` CLI value: the served directory for `Static` services,
-/// and [`crate::spawn::PROXY_DIR_SENTINEL`] for `Proxy`, `Run`, and `Hook`
+/// `dir` is the `--dir` CLI value: the served directory for `Static` workers,
+/// the upload target for `Drop` workers, and
+/// [`crate::spawn::PROXY_DIR_SENTINEL`] for `Proxy`, `Run`, and `Hook`
 /// services (which have no directory — clap rejects an empty `--dir` value, so
-/// the spawn path passes that deliberately non-existent stand-in path; see the
-/// module docs for why the kind comes from the reserved registry entry rather
-/// than the CLI). `command` is the Run worker's child command (everything the
-/// spawn path placed after `--`); it is empty and ignored for every other
-/// kind. `keep` is the Hook worker's retention (the `--keep` argv flag);
+/// the spawn path passes that deliberately non-existent stand-in path; see
+/// the module docs for why the kind comes from the reserved registry entry
+/// rather than the CLI). `command` is the Run worker's child command
+/// (everything the spawn path placed after `--`); it is empty and ignored for
+/// every other kind. `keep` is the Hook worker's retention and `max_size` the
+/// Drop worker's per-upload cap (their `--keep`/`--max-size` argv flags);
 /// `None` for every other kind.
 pub async fn run(
     id: u64,
@@ -68,6 +77,7 @@ pub async fn run(
     port: u16,
     command: Vec<OsString>,
     keep: Option<u16>,
+    max_size: Option<u64>,
 ) -> Result<()> {
     // Defense in depth against direct invocation: `run-worker` is an internal
     // command only ever launched by `spawn::spawn_worker`, which sets
@@ -150,14 +160,16 @@ pub async fn run(
 
     tracing::info!("worker starting: id={id} name={name:?} port={port}");
 
-    // SEC-1 / ARCH-05 / CLI-1 (Static only): re-run the START flow's directory
-    // safety checks here, inside the detached worker, *before* we bind a public
-    // tunnel to the directory. `FT_WORKER_TOKEN` above is only a presence check
-    // (defense in depth against direct `run-worker` invocation); it does not by
-    // itself enforce anything. A worker is non-interactive, so a sensitive
-    // directory is refused UNCONDITIONALLY — `--yes` cannot apply, and there is
-    // no way to confirm. This closes the foot-gun where `FT_WORKER_TOKEN=x ft
-    // run-worker --dir /etc` would publish `/etc` with zero confirmation.
+    // SEC-1 / ARCH-05 / CLI-1 (Static and Drop): re-run the START flow's
+    // directory safety checks here, inside the detached worker, *before* we
+    // bind a public tunnel to the directory. `FT_WORKER_TOKEN` above is only
+    // a presence check (defense in depth against direct `run-worker`
+    // invocation); it does not by itself enforce anything. A worker is
+    // non-interactive, so a sensitive directory is refused UNCONDITIONALLY —
+    // `--yes` cannot apply, and there is no way to confirm. This closes the
+    // foot-gun where `FT_WORKER_TOKEN=x ft run-worker --dir /etc` would
+    // publish `/etc` with zero confirmation (for a Drop worker, publish AND
+    // accept writes into).
     //
     // Proxy services skip these checks by construction: they publish no
     // directory at all — the tunnel fronts a port the operator chose to run.
@@ -180,6 +192,36 @@ pub async fn run(
             // request store) — no directory to resolve or confirm.
             tracing::info!("hook worker: recording requests behind the tunnel");
             None
+        }
+        ServiceKind::Drop => {
+            // The local origin is ft's own upload receiver (an ft-owned
+            // origin like static/hook) — but unlike hook it READS AND WRITES
+            // a directory: the upload target. So the START flow's directory
+            // safety checks are re-run here exactly like a Static worker's,
+            // with the sensitive-directory refusal applied unconditionally
+            // (a writable target is strictly more dangerous than a read-only
+            // publish, and a detached worker has no way to confirm).
+            let dir = match resolve_dir(&dir) {
+                Ok(d) => d,
+                Err(e) => {
+                    let _ = Registry::update(&state, |reg| {
+                        reg.remove(id);
+                    });
+                    return Err(e);
+                }
+            };
+            if is_sensitive_dir(&dir) {
+                let _ = Registry::update(&state, |reg| {
+                    reg.remove(id);
+                });
+                anyhow::bail!(
+                    "refusing to use sensitive directory {} as a drop bucket \
+                     from a detached worker (uploads write into it)",
+                    dir.display()
+                );
+            }
+            tracing::info!(dir = %dir.display(), "drop worker: accepting uploads into directory");
+            Some(dir)
         }
         ServiceKind::Static => {
             let dir = match resolve_dir(&dir) {
@@ -216,11 +258,11 @@ pub async fn run(
         }
     })?;
 
-    // Local origin. Static and Hook: bind the listener now (fail-fast) — if
-    // the port is taken, the worker exits immediately and the parent's poll
-    // detects the dead worker instead of waiting out the full timeout with a
-    // dead tunnel returning 502s. Proxy and Run: no server of our own to bind
-    // or run.
+    // Local origin. Static, Hook, and Drop: bind the listener now (fail-fast)
+    // — if the port is taken, the worker exits immediately and the parent's
+    // poll detects the dead worker instead of waiting out the full timeout
+    // with a dead tunnel returning 502s. Proxy and Run: no server of our own
+    // to bind or run.
     let (shutdown_tx, mut server_handle) = match kind {
         ServiceKind::Static => {
             let dir =
@@ -251,6 +293,44 @@ pub async fn run(
             tracing::info!("hook origin bound on 127.0.0.1:{port}");
 
             serve_origin(hook_server::router(hook_log), listener)
+        }
+        ServiceKind::Drop => {
+            // The drop origin reads its access token from the service's
+            // private token file (written by the parent between reserve and
+            // spawn) and opens the upload bucket — both before binding, so a
+            // missing token file or an unresolvable bucket fails the worker
+            // (and the start) immediately instead of serving a tunnel that
+            // cannot authenticate uploads. The token deliberately does not
+            // travel in the worker's argv (`ps` visibility).
+            let dir =
+                dir.expect("drop worker resolved its upload target above (kind match invariant)");
+            let token = match open_drop_token(&state, &name) {
+                Ok(token) => token,
+                Err(e) => {
+                    // Dying worker mustn't leave a permanent stale entry.
+                    let _ = Registry::update(&state, |reg| {
+                        reg.remove(id);
+                    });
+                    return Err(e);
+                }
+            };
+            let max_upload = max_size.unwrap_or(drop_server::DEFAULT_MAX_SIZE);
+            let store = match DropStore::open(&dir, token, max_upload, drop_server::MAX_TOTAL_STORE)
+            {
+                Ok(store) => store,
+                Err(e) => {
+                    // Dying worker mustn't leave a permanent stale entry.
+                    let _ = Registry::update(&state, |reg| {
+                        reg.remove(id);
+                    });
+                    return Err(e)
+                        .with_context(|| format!("opening the drop bucket at {}", dir.display()));
+                }
+            };
+            let listener = bind_loopback_fail_fast(&state, id, port).await?;
+            tracing::info!("drop origin bound on 127.0.0.1:{port}");
+
+            serve_origin(drop_server::router(store), listener)
         }
         ServiceKind::Proxy | ServiceKind::Run => no_server(),
     };
@@ -504,10 +584,10 @@ pub async fn run(
         let _ = task.await;
     }
 
-    // Drain in-flight requests (Static and Hook — a proxy/run worker's server
-    // slot is the [`no_server`] placeholder, which `stop_server` aborts
-    // outright): fire the shutdown signal and let axum finish what it's
-    // serving, with a bounded timeout so a stuck request can't hang the
+    // Drain in-flight requests (Static, Hook, and Drop — a proxy/run worker's
+    // server slot is the [`no_server`] placeholder, which `stop_server`
+    // aborts outright): fire the shutdown signal and let axum finish what
+    // it's serving, with a bounded timeout so a stuck request can't hang the
     // worker. If the drain doesn't complete in time, abort as a fallback.
     stop_server(kind, shutdown_tx, &mut server_handle).await;
 
@@ -520,7 +600,7 @@ pub async fn run(
 enum ReaderExit {
     /// cloudflared itself exited; it was reaped by the select's `wait()`.
     ChildExited,
-    /// The local origin server task ended (static and hook workers).
+    /// The local origin server task ended (static, hook, and drop workers).
     ServerEnded,
     /// The Run worker's command child exited — the origin is gone, so the
     /// worker follows it down instead of serving a 502-ing tunnel.
@@ -569,10 +649,30 @@ fn open_request_store(
     Ok(Arc::new(std::sync::Mutex::new(log)))
 }
 
+/// Read a drop service's access token back from its private token file (the
+/// parent wrote it between reserve and spawn). A MISSING file is the
+/// load-bearing failure: without the token the origin cannot authenticate a
+/// single upload, so it must not serve a public tunnel at all — fail fast at
+/// startup. A read ERROR is equally fatal (the file may be intact behind a
+/// permissions problem; silently serving without auth is never an option).
+fn open_drop_token(state: &StateDir, name: &str) -> Result<String> {
+    let dir = state.service_dir(name);
+    match drop_server::read_token(&dir) {
+        Ok(Some(token)) if !token.is_empty() => Ok(token),
+        Ok(_) => anyhow::bail!(
+            "the drop token file is missing or empty in {} — cannot serve an \
+             unauthenticated upload endpoint",
+            dir.display()
+        ),
+        Err(e) => Err(e).with_context(|| format!("reading the drop token in {}", dir.display())),
+    }
+}
+
 /// Spawn an origin's serve task with its graceful-shutdown channel: firing the
 /// sender later lets axum stop accepting and drain in-flight requests instead
 /// of aborting the server task (and dropping the requests) mid-flight. Shared
-/// by the static and hook arms, whose origins differ only in the router.
+/// by the static, hook, and drop arms, whose origins differ only in the
+/// router.
 fn serve_origin(
     router: axum::Router,
     listener: tokio::net::TcpListener,
@@ -622,19 +722,23 @@ fn no_server() -> (
 
 /// Stop the worker's local origin, if it runs one.
 ///
-/// `Static` and `Hook`: fire the graceful-shutdown signal and let axum finish
-/// what it's serving, bounded by [`SERVER_SHUTDOWN_TIMEOUT`] so a stuck request
-/// cannot hang the worker; on overrun the task is aborted as a fallback.
-/// `Proxy` and `Run`: there is no server — the handle is [`no_server`]'s
-/// placeholder, which never completes — so it is aborted outright rather than
-/// burning the timeout (a run's origin is the spawned command, torn down by
-/// [`crate::proc::shutdown_child_command`], not by this slot).
+/// `Static`, `Hook`, and `Drop`: fire the graceful-shutdown signal and let
+/// axum finish what it's serving, bounded by [`SERVER_SHUTDOWN_TIMEOUT`] so a
+/// stuck request cannot hang the worker; on overrun the task is aborted as a
+/// fallback. `Proxy` and `Run`: there is no server — the handle is
+/// [`no_server`]'s placeholder, which never completes — so it is aborted
+/// outright rather than burning the timeout (a run's origin is the spawned
+/// command, torn down by [`crate::proc::shutdown_child_command`], not by this
+/// slot).
 async fn stop_server(
     kind: ServiceKind,
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
     server_handle: &mut tokio::task::JoinHandle<crate::error::Result<()>>,
 ) {
-    if !matches!(kind, ServiceKind::Static | ServiceKind::Hook) {
+    if !matches!(
+        kind,
+        ServiceKind::Static | ServiceKind::Hook | ServiceKind::Drop
+    ) {
         server_handle.abort();
         return;
     }
@@ -1096,6 +1200,36 @@ mod tests {
         assert!(
             tokio::net::TcpStream::connect(addr).await.is_err(),
             "the hook origin must stop accepting after the drain"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_server_drains_a_drop_origin_like_a_static_one() {
+        // Same contract as the hook drain test, Drop flavour: a drop worker
+        // runs an ft-owned origin in-process, so its teardown must take the
+        // DRAIN path (an in-flight upload finishes writing) — pinning the
+        // Drop arm of stop_server's kind split. A kind split that forgot Drop
+        // would abort mid-upload instead.
+        let tmp = tempdir().expect("tempdir");
+        let store = crate::drop_server::DropStore::open(
+            tmp.path(),
+            "tok".to_string(),
+            crate::drop_server::DEFAULT_MAX_SIZE,
+            crate::drop_server::MAX_TOTAL_STORE,
+        )
+        .expect("open drop store");
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind ephemeral loopback listener");
+        let addr = listener.local_addr().expect("local addr");
+        let (shutdown_tx, mut server_handle) =
+            serve_origin(crate::drop_server::router(store), listener);
+        let started = std::time::Instant::now();
+        stop_server(ServiceKind::Drop, shutdown_tx, &mut server_handle).await;
+        assert!(started.elapsed() < SERVER_SHUTDOWN_TIMEOUT);
+        assert!(
+            tokio::net::TcpStream::connect(addr).await.is_err(),
+            "the drop origin must stop accepting after the drain"
         );
     }
 }

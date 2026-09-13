@@ -190,6 +190,59 @@ pub enum Command {
         keep: Option<u16>,
     },
 
+    /// Run an upload receiver ("drop bucket") and expose it through a tunnel.
+    ///
+    /// `ft` runs its own origin (like `ft <dir>`, the server lives inside the
+    /// worker) that accepts uploads into `DIR` and serves the stored files
+    /// back. Uploads are POST/PUT of a RAW body, named by the path
+    /// (`POST /file.txt`) or by `?filename=` on `/`; multipart is not parsed
+    /// and is stored as opaque bytes. Every upload MUST present the access
+    /// token (`Authorization: Bearer` or `?token=`); downloads (GET) are
+    /// public — anyone holding the tunnel URL can read what you drop.
+    /// Caps: per-upload `--max-size` (413 over it) and a fixed 1 GiB
+    /// total-store cap (507 over it). Uploads never overwrite; dotfiles,
+    /// separators, and traversal names are rejected. The service is
+    /// registered and managed like any other (`ls`, `detail`, `kill`, `logs`,
+    /// `open`, `prune`).
+    Drop {
+        /// Directory uploads are stored in. It must already exist; sensitive
+        /// directories (/, $HOME, /etc, ...) are refused — uploads WRITE
+        /// into this directory through the public tunnel.
+        #[arg(value_name = "DIR")]
+        dir: PathBuf,
+
+        /// Local port for ft's own drop origin (1-65535). Defaults to a free,
+        /// allocated port.
+        #[arg(long, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
+        port: Option<u16>,
+
+        /// Explicit service name. Defaults to `drop-<port>` (made unique).
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Run in the foreground instead of spawning a detached worker.
+        #[arg(long, short)]
+        foreground: bool,
+
+        /// Access token REQUIRED for every upload (POST/PUT) — sent as
+        /// `Authorization: Bearer <SECRET>` or `?token=<SECRET>` and compared
+        /// in constant time. When omitted, a crypto-random token is
+        /// generated, PRINTED ONCE here, stored in the service's private
+        /// state dir, and shown by `ft detail`. Downloads (GET) need no token.
+        #[arg(long, value_name = "SECRET")]
+        token: Option<String>,
+
+        /// Per-upload size cap in bytes, 1..=1073741824 (default 67108864 =
+        /// 64 MiB). Oversized uploads are rejected with 413; the total-store
+        /// cap is a fixed 1 GiB (507).
+        #[arg(
+            long,
+            value_name = "BYTES",
+            value_parser = clap::value_parser!(u64).range(1..=crate::drop_server::MAX_TOTAL_STORE)
+        )]
+        max_size: Option<u64>,
+    },
+
     /// Remove every dangling service — stale entries AND live tunnels whose
     /// local origin port is dead.
     ///
@@ -233,6 +286,13 @@ pub enum Command {
         /// command.
         #[arg(long)]
         keep: Option<u16>,
+        /// Per-upload size cap for a Drop worker (`--max-size`). `None` for
+        /// every other kind. Runtime configuration carried in the worker's
+        /// argv (like `--keep`), not registry state; the access token does
+        /// NOT ride the argv (visible in `ps`) — the worker reads it from the
+        /// service's private token file.
+        #[arg(long)]
+        max_size: Option<u64>,
     },
 }
 
@@ -627,6 +687,133 @@ mod tests {
         .expect("a run-worker argv carrying --keep must parse");
         match cli.command {
             Some(Command::RunWorker { keep, .. }) => assert_eq!(keep, Some(7)),
+            other => panic!("expected RunWorker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_minimal_form_is_just_the_directory() {
+        // `ft drop ~/inbox` must parse with every flag defaulted: the port is
+        // allocated later by the command (like `ft hook`), the name derives
+        // from the port, the token is generated at runtime, and the cap falls
+        // back to the documented default.
+        let cli = parse(&["drop", "inbox"]).expect("`ft drop inbox` must parse");
+        match cli.command {
+            Some(Command::Drop {
+                dir,
+                port,
+                name,
+                foreground,
+                token,
+                max_size,
+            }) => {
+                assert_eq!(dir, PathBuf::from("inbox"));
+                assert_eq!(port, None);
+                assert_eq!(name, None);
+                assert!(!foreground);
+                assert_eq!(token, None);
+                assert_eq!(max_size, None);
+            }
+            other => panic!("expected Drop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_flags_parse_and_reject_out_of_range_values() {
+        // Every flag of `ft drop` parses when in range — and the numeric ones
+        // are usage errors out of range, before any state is touched (port 0
+        // is the kernel's "assign me one" sentinel; the cap is bounded by the
+        // fixed 1 GiB total-store cap, so no single upload can be configured
+        // past what the bucket can hold).
+        let cli = parse(&[
+            "drop",
+            "/srv/inbox",
+            "--port",
+            "9000",
+            "--name",
+            "share",
+            "--foreground",
+            "--token",
+            "sekrit",
+            "--max-size",
+            "1048576",
+        ])
+        .expect("`ft drop` with all flags must parse");
+        match cli.command {
+            Some(Command::Drop {
+                dir,
+                port,
+                name,
+                foreground,
+                token,
+                max_size,
+            }) => {
+                assert_eq!(dir, PathBuf::from("/srv/inbox"));
+                assert_eq!(port, Some(9000));
+                assert_eq!(name.as_deref(), Some("share"));
+                assert!(foreground);
+                assert_eq!(token.as_deref(), Some("sekrit"));
+                assert_eq!(max_size, Some(1048576));
+            }
+            other => panic!("expected Drop, got {other:?}"),
+        }
+
+        assert!(
+            parse(&["drop", "inbox", "--port", "0"]).is_err(),
+            "port 0 must be rejected"
+        );
+        assert!(
+            parse(&["drop", "inbox", "--port", "70000"]).is_err(),
+            "ports beyond u16 must be rejected"
+        );
+        assert!(
+            parse(&["drop", "inbox", "--max-size", "0"]).is_err(),
+            "a zero cap must be rejected"
+        );
+        assert!(
+            parse(&["drop", "inbox", "--max-size", "1073741825"]).is_err(),
+            "a cap beyond the 1 GiB total-store bound must be rejected"
+        );
+    }
+
+    #[test]
+    fn run_worker_max_size_flag_is_optional() {
+        // The hidden run-worker gains the Drop cap flag: it must keep parsing
+        // WITHOUT it (every historical worker argv shape passes none) and
+        // carry it verbatim when a drop spawn passes `--max-size N`.
+        let cli = parse(&[
+            "run-worker",
+            "--id",
+            "3",
+            "--name",
+            "share",
+            "--dir",
+            "/srv/inbox",
+            "--port",
+            "9000",
+        ])
+        .expect("the historical run-worker argv shape must keep parsing");
+        match cli.command {
+            Some(Command::RunWorker { max_size, .. }) => assert_eq!(max_size, None),
+            other => panic!("expected RunWorker, got {other:?}"),
+        }
+
+        let cli = parse(&[
+            "run-worker",
+            "--id",
+            "4",
+            "--name",
+            "share",
+            "--dir",
+            "/srv/inbox",
+            "--port",
+            "9001",
+            "--max-size",
+            "4096",
+        ])
+        .expect("a run-worker argv carrying --max-size must parse");
+        match cli.command {
+            Some(Command::RunWorker { max_size, .. }) => assert_eq!(max_size, Some(4096)),
             other => panic!("expected RunWorker, got {other:?}"),
         }
     }
