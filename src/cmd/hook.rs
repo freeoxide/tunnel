@@ -97,10 +97,11 @@ fn open_hook_log(
 ) -> Result<Arc<std::sync::Mutex<HookLog>>> {
     state.ensure_service_dir(name)?;
     let path = state.service_dir(name).join(hook_server::REQUESTS_FILENAME);
-    Ok(Arc::new(std::sync::Mutex::new(HookLog::load(
-        path,
-        usize::from(keep),
-    ))))
+    // load fails fast on a non-NotFound read error (the store may be intact
+    // behind it) — surface the disk problem at startup, never rename over it.
+    let log = HookLog::load(path.clone(), usize::from(keep))
+        .with_context(|| format!("opening hook request store {}", path.display()))?;
+    Ok(Arc::new(std::sync::Mutex::new(log)))
 }
 
 /// Background flow: reserve the entry, spawn the detached HOOK worker (which

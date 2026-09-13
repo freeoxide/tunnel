@@ -562,7 +562,11 @@ fn open_request_store(
 ) -> Result<Arc<std::sync::Mutex<HookLog>>> {
     state.ensure_service_dir(name)?;
     let path = state.service_dir(name).join(hook_server::REQUESTS_FILENAME);
-    Ok(Arc::new(std::sync::Mutex::new(HookLog::load(path, keep))))
+    // load fails fast on a non-NotFound read error (the store may be intact
+    // behind it) — surface the disk problem at startup, never rename over it.
+    let log = HookLog::load(path.clone(), keep)
+        .with_context(|| format!("opening hook request store {}", path.display()))?;
+    Ok(Arc::new(std::sync::Mutex::new(log)))
 }
 
 /// Spawn an origin's serve task with its graceful-shutdown channel: firing the
@@ -1071,7 +1075,8 @@ mod tests {
         let store = crate::hook_server::HookLog::load(
             tmp.path().join("requests.json"),
             usize::from(crate::hook_server::DEFAULT_KEEP),
-        );
+        )
+        .expect("load");
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("bind ephemeral loopback listener");
