@@ -17,9 +17,12 @@
 //! its port. Doctor flags that orphan from the recorded `command_pid`:
 //! a plain existence probe (an operator command has no cmdline needle, so
 //! identity is best-effort) cross-checked against the run's own port, which
-//! a recycled pid almost never answers. The port-dead-but-pid-live case is
-//! reported with hedged wording naming both readings (a hung command, or a
-//! recycled pid). Doctor stays strictly diagnostic even here: `ft kill`'s
+//! a recycled pid almost never answers. Neither signal proves identity — a
+//! recycled pid can even coincide with an unrelated squatter holding the
+//! port — so the finding wording never attributes the listener (or the live
+//! process) to the recorded pid outright, and both branches share one
+//! verify-first hint ("check what pid N is and stop it if it is the
+//! command"). Doctor stays strictly diagnostic even here: `ft kill`'s
 //! group signal is identity-gated on the (dead) worker and will not reach
 //! the orphan, so the hint says to stop the pid by hand and lists `ft kill`
 //! for the registry cleanup it does perform.
@@ -226,14 +229,15 @@ struct CommandProbe {
     pid: u32,
     /// Plain existence probe of `pid`. Deliberately NOT an identity check:
     /// an operator command has no cmdline needle (unlike `run-worker` /
-    /// `cloudflared`), so a recycled pid reads alive — the stale,
-    /// port-dead branch's hedged wording exists exactly for that case.
+    /// `cloudflared`), so a recycled pid reads alive — both stale branches'
+    /// hedged wording and the shared verify-first hint exist for that case.
     alive: bool,
-    /// Whether the run's own port answers. Cross-checks `alive`: a recorded
-    /// pid that still listens on the run's port is the confident orphan
-    /// signature, while a recycled pid almost never answers there. Probed
-    /// unconditionally (a refused loopback connect is answered instantly),
-    /// so the field's meaning never depends on `alive`.
+    /// Whether the run's own port answers. Evidence for the orphan reading,
+    /// never proof of identity: a recycled pid almost never answers on the
+    /// run's port, but an unrelated squatter can hold any port, so the
+    /// wording still stops short of attributing the listener to `pid`.
+    /// Probed unconditionally (a refused loopback connect is answered
+    /// instantly), so the field's meaning never depends on `alive`.
     port_alive: bool,
 }
 
@@ -339,53 +343,48 @@ fn service_checks(
     // tearing the command down. Only a Stale worker can orphan anything — a
     // live worker owns its child (its monitor tears the command down on
     // exit), so for live workers the command's state is told by the origin
-    // arm below instead. The two live-input branches differ in confidence:
-    // pid alive AND the run's port still answering is the unambiguous
-    // "tunnel dead, command still running" orphan (a recycled pid almost
-    // never listens on the run's port), while pid alive on a dead port is
-    // either a hung survivor or a recycled pid — reported, but hedged.
-    // A dead pid adds nothing: the stale worker warning above already says
-    // the tunnel is gone, and the command died with it (the ordinary end).
+    // arm below instead. The pid is only existence-probed (no cmdline needle
+    // exists for an operator command), so NEITHER branch may attribute the
+    // live process — or the run's port — to the recorded pid outright: a
+    // recycled pid plus an unrelated port squatter would otherwise become a
+    // false orphan claim. The port answer only shifts the likelihood (a
+    // recycled pid rarely answers there); both details keep both readings
+    // open, and ONE shared verify-first hint serves the two, because the
+    // safe action is identical either way. A dead pid adds nothing: the
+    // stale worker warning above already says the tunnel is gone, and the
+    // command died with it (the ordinary end).
     if status == ServiceStatus::Stale
         && let Some(probe) = command
         && probe.alive
     {
-        let check = if probe.port_alive {
-            Check {
-                name: format!("command {}", svc.name),
-                status: CheckStatus::Warn,
-                detail: format!(
-                    "tunnel dead, command still running: pid {} is alive and \
-                     127.0.0.1:{} still answers — an orphaned process that \
-                     outlived its worker",
-                    probe.pid, svc.port
-                ),
-                hint: Some(format!(
-                    "stop the orphaned command (pid {}) by hand, then `ft kill \
-                     {}` to remove the stale entry (the kill cannot signal it: \
-                     the worker that owned the group is gone)",
-                    probe.pid, svc.name
-                )),
-            }
+        let detail = if probe.port_alive {
+            format!(
+                "tunnel dead, command still running: pid {} is alive and \
+                 127.0.0.1:{} still answers — most likely the command \
+                 outliving its worker, though the unverified pid could also \
+                 be a recycled one",
+                probe.pid, svc.port
+            )
         } else {
-            Check {
-                name: format!("command {}", svc.name),
-                status: CheckStatus::Warn,
-                detail: format!(
-                    "tunnel dead, command still running: a process exists at \
-                     the recorded pid {}, but nothing listens on 127.0.0.1:{} \
-                     — either the command survived without serving, or the pid \
-                     was recycled by an unrelated process",
-                    probe.pid, svc.port
-                ),
-                hint: Some(format!(
-                    "check what pid {} is and stop it if it is the command; \
-                     `ft kill {}` removes the stale entry",
-                    probe.pid, svc.name
-                )),
-            }
+            format!(
+                "tunnel dead, command still running: a process exists at \
+                 the recorded pid {}, but nothing listens on 127.0.0.1:{} \
+                 — either the command survived without serving, or the pid \
+                 was recycled by an unrelated process",
+                probe.pid, svc.port
+            )
         };
-        checks.push(check);
+        checks.push(Check {
+            name: format!("command {}", svc.name),
+            status: CheckStatus::Warn,
+            detail,
+            hint: Some(format!(
+                "check what pid {} is and stop it if it is the command; \
+                 `ft kill {}` removes the stale entry (the kill cannot \
+                 signal the command: the worker that owned the group is gone)",
+                probe.pid, svc.name
+            )),
+        });
     }
 
     // --- origin probe -----------------------------------------------------
@@ -779,7 +778,7 @@ mod tests {
     fn stale_run_with_a_live_listening_command_flags_the_orphan() {
         // THE orphan finding: the worker is dead (tunnel dead) but the
         // recorded command pid is alive AND still answers on the run's port
-        // — the confident signature, since a recycled pid almost never
+        // — the likelier-orphan reading, since a recycled pid almost never
         // listens there. It must be flagged as "tunnel dead, command still
         // running", name the pid and port, and hint the by-hand stop (ft
         // kill's group signal is identity-gated on the dead worker and
@@ -809,10 +808,30 @@ mod tests {
             "the finding must name the pid and the port, got: {}",
             command.detail
         );
+        // Judge round-2 fix: the port answer is evidence, not proof — a
+        // recycled pid plus an unrelated squatter would otherwise become a
+        // false orphan claim. The wording must not attribute orphanhood to
+        // the unverified pid outright and must keep the recycled reading
+        // open; the hint must carry the same verify-first caveat as the
+        // hedged sibling.
+        assert!(
+            !command.detail.contains("an orphaned process"),
+            "the detail must not claim orphanhood outright: {}",
+            command.detail
+        );
+        assert!(
+            command.detail.contains("recycled"),
+            "the detail must keep the recycled-pid reading open, got: {}",
+            command.detail
+        );
         let hint = command.hint.as_deref().unwrap_or_default();
         assert!(
             hint.contains("4242") && hint.contains("ft kill alpha"),
             "the hint must say how to stop the orphan and clean the entry, got: {hint}"
+        );
+        assert!(
+            hint.contains("if it is the command"),
+            "the hint must say to verify the pid first, got: {hint}"
         );
         // The stale worker warning stands on its own, and no origin check
         // accompanies a dead worker (unchanged contract).
@@ -855,8 +874,14 @@ mod tests {
                 .hint
                 .as_deref()
                 .unwrap_or_default()
-                .contains("ft kill alpha"),
-            "the entry cleanup hint must still be there"
+                .contains("ft kill alpha")
+                && command
+                    .hint
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("if it is the command"),
+            "the hint must be the shared verify-first cleanup hint, got: {:?}",
+            command.hint
         );
     }
 
