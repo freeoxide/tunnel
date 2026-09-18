@@ -329,6 +329,27 @@ fn dead_loopback_port() -> u16 {
     port
 }
 
+/// A loopback port left in TIME_WAIT by a just-stopped server.
+///
+/// Bind an ephemeral listener, connect a client, then close the SERVER side
+/// first (listener, then the accepted stream, while the client is still
+/// open): the active close leaves the server endpoint — bound to the returned
+/// port — held by FIN_WAIT/TIME_WAIT sockets instead of a listener. Loopback
+/// only, same accepted-risk note as [`dead_loopback_port`].
+fn time_wait_loopback_port() -> u16 {
+    let listener =
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral loopback listener");
+    let port = listener.local_addr().expect("local addr").port();
+    let client = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).expect("connect");
+    let accepted = listener.accept().expect("accept").0;
+    // Drop order is the point: the server closes while the client is still
+    // open, so the close is ACTIVE on the server endpoint.
+    drop(listener);
+    drop(accepted);
+    drop(client);
+    port
+}
+
 /// Every file AND directory under `root`, recursively; empty when `root` does
 /// not exist yet.
 ///
@@ -1006,6 +1027,49 @@ fn run_refuses_an_occupied_port_and_leaves_no_state() {
     assert!(
         tree_paths(dir.path()).is_empty(),
         "a refused run must leave no state, found: {:?}",
+        tree_paths(dir.path())
+    );
+}
+
+#[test]
+fn run_accepts_a_port_a_just_stopped_server_left_in_time_wait() {
+    // R3-2 end-to-end: `is_port_free` used to be a plain bind probe, so a
+    // port still held by TIME_WAIT sockets after a server-side close read as
+    // occupied and `ft run` refused the restart spuriously. Drive the real
+    // binary against such a port: the pre-flight must NOT refuse with
+    // "already in use".
+    //
+    // PATH is stripped so the run deterministically stops at the cloudflared
+    // lookup — the gate right after the port pre-flight — on every machine:
+    // with cloudflared installed, the run would otherwise proceed to spawn a
+    // real worker and tunnel. Stopping there (with zero state, since
+    // `ensure_installed` precedes `state.ensure`) proves the pre-flight let
+    // the TIME_WAIT port through.
+    let dir = TempDir::new().unwrap();
+    let port = time_wait_loopback_port();
+    let port_arg = port.to_string();
+
+    let output = Command::new(ft_bin())
+        .args(["run", "--port", &port_arg, "--", "sleep", "30"])
+        .env("XDG_STATE_HOME", dir.path())
+        .env("RUST_LOG", "")
+        .env("PATH", "")
+        .output()
+        .expect("spawning `ft` binary");
+    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+
+    assert!(
+        !output.status.success(),
+        "the run must stop at the cloudflared lookup, got: {combined}"
+    );
+    assert!(
+        !combined.contains(&format!("port {port} is already in use")),
+        "a TIME_WAIT-only port must not read as occupied, got: {combined}"
+    );
+    assert!(
+        tree_paths(dir.path()).is_empty(),
+        "a run stopped at the cloudflared lookup must leave no state, found: {:?}",
         tree_paths(dir.path())
     );
 }

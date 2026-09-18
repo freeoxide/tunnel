@@ -18,6 +18,9 @@
 //! — the detached worker owns a Job Object (`KILL_ON_JOB_CLOSE`, see
 //! `worker::run`), so terminating the worker cascades to its whole tree
 //! (cloudflared), giving the same whole-tree teardown as the Unix group kill.
+//! A spawned command child additionally leads its OWN process group (see
+//! `own_process_group`), so the worker's exit paths can tear the whole command
+//! subtree down with `killpg` without ever signalling the worker's group.
 
 #[cfg(unix)]
 use nix::sys::signal::{Signal, kill};
@@ -29,20 +32,27 @@ use tokio::process::{Child, Command};
 //
 // A `Run` service's local origin is a command `ft` itself spawns (the
 // operator's dev server). The detached worker and the foreground flow share
-// the spawn + teardown discipline below, deliberately mirroring how
-// cloudflared itself is handled: the child inherits the spawner's process
-// group (NO setsid, so a Unix group kill reaches it), Linux adds
-// PR_SET_PDEATHSIG against a SIGKILL'd spawner, and Windows relies on the
-// worker's KILL_ON_JOB_CLOSE Job Object (plus an explicit terminate on the
-// foreground paths, which run no job).
+// the spawn + teardown discipline below, mirroring how cloudflared itself is
+// handled where it is safe to do so: Linux adds PR_SET_PDEATHSIG against a
+// SIGKILL'd spawner, and Windows relies on the worker's KILL_ON_JOB_CLOSE Job
+// Object (plus an explicit terminate on the foreground paths, which run no
+// job). The one deliberate difference from cloudflared: the command child is
+// moved into its OWN process group at spawn (`own_process_group`), so
+// teardown can `killpg` the entire command subtree — the child plus every
+// grandchild it forks (`npm run dev` -> vite) — on every exit path, without
+// ever signalling the spawner's group (which in the detached-worker flow
+// contains the worker itself and cloudflared, and in the foreground flow is
+// the operator's shell's group; a group kill there would be suicide in the
+// first case and would kill the shell in the second).
 
 /// Spawn the user's command child with `PORT=port` exported, so well-behaved
 /// dev servers pick their port up from the environment instead of a flag.
 ///
 /// stdout/stderr are piped (the caller tees them into `worker.log`, which is
-/// what `ft logs` reads), stdin is null. Like `cloudflared::spawn`, the child
-/// deliberately stays in the spawner's process group — a `ft kill` group kill
-/// reaches it directly even if the worker can no longer relay a signal.
+/// what `ft logs` reads), stdin is null. On Unix the child is made the leader
+/// of its own process group (see [`own_process_group`]), which is what lets
+/// [`shutdown_child_command`] take the whole command subtree down on every
+/// spawner exit path — see the module-level discipline note above.
 pub(crate) fn spawn_command_child(
     command: &[std::ffi::OsString],
     port: u16,
@@ -61,6 +71,18 @@ pub(crate) fn spawn_command_child(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
+    // Process-group isolation (R3-1): without this the child inherits the
+    // spawner's group — the worker's own group when detached, the operator's
+    // SHELL's group in the foreground flow — and no safe group signal could
+    // ever reach the grandchildren. Made fatal rather than best-effort: if
+    // the child is not a group leader, killpg teardown would target a group
+    // that is not exclusively the command subtree's (or no group at all), so
+    // failing the spawn loudly is the only honest behavior.
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(own_process_group);
+    }
+
     // Best-effort: on Linux, SIGKILL the child if its parent (the worker or
     // foreground ft) dies — even via SIGKILL or OOM — so the command can never
     // outlive the process that owns its tunnel. Duplicated from
@@ -77,6 +99,21 @@ pub(crate) fn spawn_command_child(
         .spawn()
         .with_context(|| format!("failed to spawn command {:?}", bin))?;
     Ok(child)
+}
+
+/// Unix-only pre-exec hook: make the calling (pre-exec) child a process-group
+/// leader, so its pgid equals its pid and `killpg(child_pid)` later reaches
+/// exactly the command subtree — the child plus every grandchild it forks.
+/// The pre-exec window is the only safe place to do this: the choice belongs
+/// to ft (the child must not be left to inherit or change its group before we
+/// pin it), and the child has not yet exec'd into arbitrary operator code.
+#[cfg(unix)]
+fn own_process_group() -> Result<(), std::io::Error> {
+    // setpgid(0, 0) only moves this not-yet-exec'd child into a fresh process
+    // group of its own; nix wraps the raw syscall safely, so no unsafe block
+    // is needed here.
+    nix::unistd::setpgid(nix::unistd::Pid::from_raw(0), nix::unistd::Pid::from_raw(0))
+        .map_err(|e| std::io::Error::other(format!("setpgid failed: {e}")))
 }
 
 /// Linux-only pre-exec hook: request SIGKILL on parent death and refuse to
@@ -144,12 +181,18 @@ pub(crate) fn command_monitor_placeholder() -> tokio::task::JoinHandle<()> {
 ///
 /// With a pid: a finished monitor means the child already exited and was
 /// reaped — nothing to signal, nothing left to reap. Otherwise Unix signals
-/// the child pid (SIGTERM, bounded wait, SIGKILL); when the grace elapses the
-/// SIGKILL is followed by one await of the still-pending monitor so the reap
-/// completes before the caller proceeds. Windows terminates by pid — sound
-/// without an identity needle because the monitor's open `Child` handle pins
-/// the pid against reuse until this call aborts it — and the worker's Job
-/// Object additionally guarantees whole-tree teardown when the flow exits.
+/// the child's WHOLE process group (SIGTERM, bounded wait, SIGKILL): the
+/// child was made a group leader at spawn ([`own_process_group`]), so the
+/// negative pid covers the entire command subtree — the direct child AND the
+/// grandchildren it forked (`npm run dev` -> vite), which a direct-pid signal
+/// never reached (R3-1). The pgid is pinned against reuse the same way the
+/// Windows pid path is: the monitor's open `Child` handle means the child has
+/// not been reaped, so a dead leader's group still exists (groups survive
+/// their leader while members remain) and cannot have been recycled.
+/// Windows terminates by pid — sound without an identity needle because the
+/// monitor's open `Child` handle pins the pid against reuse until this call
+/// aborts it — and the worker's Job Object additionally guarantees whole-tree
+/// teardown when the flow exits.
 pub(crate) async fn shutdown_child_command(
     pid: Option<u32>,
     monitor: &mut tokio::task::JoinHandle<()>,
@@ -170,7 +213,14 @@ pub(crate) async fn shutdown_child_command(
     {
         use nix::sys::signal::{Signal, kill};
         use nix::unistd::Pid;
-        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+        // Negative pid = whole process group. Safe to include the direct
+        // child and every descendant: the group was created for this command
+        // subtree alone at spawn time (own_process_group) and is guarded
+        // against pid reuse by the not-yet-reaped monitor's open handle (the
+        // is_finished guard above). Members already gone return ESRCH, which
+        // is ignored.
+        let group = Pid::from_raw(-(pid as i32));
+        let _ = kill(group, Signal::SIGTERM);
         if tokio::time::timeout(CHILD_SHUTDOWN_GRACE, &mut *monitor)
             .await
             .is_err()
@@ -179,7 +229,7 @@ pub(crate) async fn shutdown_child_command(
             // monitor is guaranteed still pending here (the timeout only
             // elapses when the monitor did NOT complete), so this await is
             // bounded and safe.
-            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+            let _ = kill(group, Signal::SIGKILL);
             let _ = (&mut *monitor).await;
         }
         // On the Ok arm the timeout's await already observed the child's
@@ -730,6 +780,90 @@ mod command_child_tests {
         assert!(
             monitor.is_finished(),
             "the monitor must have observed (and reaped) the child"
+        );
+    }
+
+    /// Liveness probe for a pid we do NOT own (a grandchild cannot be
+    /// wait()ed by this process): signal 0 succeeds while the pid exists —
+    /// INCLUDING as an unreaped zombie, which is what a reparented
+    /// grandchild becomes when this environment's init is slow to reap. A
+    /// /proc state of `Z` is therefore read as dead on Linux; elsewhere the
+    /// signal probe alone is used (launchd/init reap orphans promptly).
+    fn probe_alive(pid: u32) -> bool {
+        if kill(Pid::from_raw(pid as i32), None).is_err() {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // /proc/<pid>/stat is "pid (comm) state ..." and comm may contain
+            // spaces and parens, so parse from after the LAST ')'.
+            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                && let Some(close) = stat.rfind(')')
+                && let Some(state) = stat[close + 1..].trim().chars().next()
+            {
+                return state != 'Z';
+            }
+        }
+        true
+    }
+
+    /// R3-1 regression against a REAL child that forks a grandchild — the
+    /// `npm run dev` -> vite shape: the worker's exit paths funnel into
+    /// `shutdown_child_command`, which used to signal the DIRECT child pid
+    /// only, so the grandchild (the process actually holding the port)
+    /// survived every worker exit. The child here is a shell that starts
+    /// `sleep` in the background, prints its pid, and stays alive in `wait`;
+    /// teardown must reach BOTH.
+    #[tokio::test]
+    async fn shutdown_child_command_kills_the_whole_group_including_a_grandchild() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let mut child = spawn_command_child(
+            &[
+                OsString::from("sh"),
+                OsString::from("-c"),
+                OsString::from("sleep 30 & echo $!; wait"),
+            ],
+            port,
+        )
+        .expect("spawn shell child");
+        let pid = child.id();
+        let stdout = child.stdout.take().expect("stdout is piped");
+        let mut monitor = spawn_wait_monitor(child);
+
+        // Read the grandchild's pid from the pipe, bounded so a broken pipe
+        // can never hang the suite.
+        use tokio::io::AsyncBufReadExt;
+        let grandchild_pid: u32 = {
+            let mut lines = tokio::io::BufReader::new(stdout).lines();
+            let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+                .await
+                .expect("the grandchild pid line must arrive within 5s")
+                .expect("the child's stdout must not close before the pid line")
+                .expect("the pid line must be present");
+            line.trim()
+                .parse()
+                .expect("the grandchild pid must be numeric")
+        };
+        assert!(
+            probe_alive(grandchild_pid),
+            "the grandchild (pid {grandchild_pid}) must be running before teardown"
+        );
+
+        shutdown_child_command(pid, &mut monitor).await;
+
+        // The group teardown must reach the grandchild too — and it does so
+        // even though the shell (the group leader) dies first, because a
+        // process group survives its leader while members remain.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while probe_alive(grandchild_pid) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            !probe_alive(grandchild_pid),
+            "the group teardown must kill the grandchild (pid {grandchild_pid}), \
+             not just the direct child"
         );
     }
 }

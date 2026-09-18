@@ -13,9 +13,10 @@
 //! cannot be bound), and tunnels it; a `Proxy` worker runs no server of its
 //! own — it points cloudflared straight at the operator's existing upstream
 //! on `http://127.0.0.1:<port>`; a `Run` worker spawns the operator's command
-//! (which fronts `http://127.0.0.1:<port>`) as a child of THIS process — same
-//! process-group discipline as cloudflared, so tunnel and command live and
-//! die together; a `Hook` worker binds ft's own webhook receiver/inspector
+//! (which fronts `http://127.0.0.1:<port>`) as a child of THIS process —
+//! group-isolated at spawn (see `proc::spawn_command_child`) so this worker's
+//! exit teardown takes the whole command subtree down with the tunnel; a
+//! `Hook` worker binds ft's own webhook receiver/inspector
 //! on `127.0.0.1:<port>` (like `Static`, an ft-owned origin inside the
 //! worker), recording every request to the service's request store; and a
 //! `Drop` worker binds ft's own upload-receiver origin on `127.0.0.1:<port>`
@@ -370,10 +371,13 @@ pub async fn run(
 
     // Run only: spawn the operator's command as THIS worker's child. It is
     // the local origin cloudflared will front, so it exists before the tunnel
-    // does, and it inherits the worker's process group (see
-    // `proc::spawn_command_child`) — a `ft kill` group kill takes tunnel and
-    // command down together. The monitor owns the child handle (exit observed
-    // + zombie reaped); the worker keeps the bare pid for registry + teardown.
+    // does. The child leads its own process group (see
+    // `proc::spawn_command_child`), so this worker's own exit paths — the two
+    // `shutdown_child_command` calls below — tear the WHOLE command subtree
+    // down (child + grandchildren like vite) via `killpg`, without ever
+    // signalling this worker's group (cloudflared lives there and is torn
+    // down separately). The monitor owns the child handle (exit observed +
+    // zombie reaped); the worker keeps the bare pid for registry + teardown.
     let (command_pid, mut command_monitor, command_out) = match kind {
         ServiceKind::Run => match crate::proc::spawn_command_child(&command, port) {
             Ok(mut c) => {
@@ -443,8 +447,8 @@ pub async fn run(
         Err(e) => {
             tracing::error!(%e, "failed to spawn cloudflared");
             // The command child must not outlive a tunnel that never came to
-            // be; the monitor handles the teardown (graceful SIGTERM → KILL
-            // on Unix, terminate + job close on Windows).
+            // be; the monitor handles the teardown (graceful group SIGTERM →
+            // KILL on Unix, terminate + job close on Windows).
             crate::proc::shutdown_child_command(command_pid, &mut command_monitor).await;
             stop_server(kind, shutdown_tx, &mut server_handle).await;
             // Dying worker mustn't leave a permanent stale entry.
@@ -572,8 +576,10 @@ pub async fn run(
     // The command child must NEVER outlive the worker's ownership of the
     // tunnel — including the cloudflared-exited path (ReaderExit::ChildExited),
     // where cloudflared is already reaped but a Run worker's command may still
-    // be running. A no-op for other kinds (pending placeholder) and whenever
-    // the monitor already observed the child's exit.
+    // be running. The teardown covers the command's whole process GROUP (the
+    // grandchildren a direct-pid signal never reached). A no-op for other
+    // kinds (pending placeholder) and whenever the monitor already observed
+    // the child's exit.
     crate::proc::shutdown_child_command(command_pid, &mut command_monitor).await;
 
     // Abort the reader tasks AND await them. Aborting alone only schedules

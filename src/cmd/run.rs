@@ -14,8 +14,9 @@
 //! upstream). The reason is the same one that motivates PROXY's pre-flight: a
 //! friendly "server never came up" — surfacing the command's captured output —
 //! beats a tunnel that comes up happily and then 502s every request. On
-//! timeout the worker's process group is torn down (worker + cloudflared +
-//! command child together), so a failed run leaves nothing running.
+//! timeout the worker's process group is torn down (worker + cloudflared; the
+//! worker's own teardown relays to the command's group, which the child leads
+//! — see `proc::spawn_command_child`), so a failed run leaves nothing running.
 //!
 //! Unlike START there is no directory to resolve or confirm — the operator
 //! explicitly named the command to publish — so there is no `--yes` flag, and
@@ -285,12 +286,13 @@ async fn run_background(port: u16, name: Option<String>, command: &[OsString]) -
         tokio::time::sleep(POLL_INTERVAL).await;
     }
     // Timed out. The worker + cloudflared + command may still be alive and the
-    // entry is still active, so tear them all down (the group kill reaches the
-    // command child — same group discipline as cloudflared) before bailing.
-    // The message depends on WHICH half never arrived: a dead origin gets the
-    // command's captured output — a friendly "server never came up" beats a
-    // tunnel that would have 502'd every request (same reasoning as PROXY's
-    // pre-flight).
+    // entry is still active, so tear them all down: the group kill takes the
+    // worker and cloudflared down directly, and the worker's own teardown
+    // relays to the command child's group (the child leads its own group —
+    // `proc::spawn_command_child`) before exiting. The message depends on
+    // WHICH half never arrived: a dead origin gets the command's captured
+    // output — a friendly "server never came up" beats a tunnel that would
+    // have 502'd every request (same reasoning as PROXY's pre-flight).
     proc::shutdown_process_group(worker_pid).await;
     if let Err(cleanup_err) = Registry::update(&state, |reg| {
         reg.remove(id);
@@ -311,10 +313,11 @@ async fn run_background(port: u16, name: Option<String>, command: &[OsString]) -
 
 /// Tear the just-started service down and fail: shared by the poll loop's
 /// fail-fast arms (worker death, vanished entry). Shuts the worker's process
-/// group down (which reaches cloudflared AND the command child — the group
-/// discipline that makes run's teardown orphan-free), removes the registry
-/// entry, and surfaces the best log line, which for a run service is usually
-/// the command's own captured output.
+/// group down (which reaches cloudflared directly, while the worker's own
+/// teardown relays to the command child's group — the group discipline that
+/// makes run's teardown orphan-free), removes the registry entry, and
+/// surfaces the best log line, which for a run service is usually the
+/// command's own captured output.
 async fn fail_start(
     state: &StateDir,
     id: &u64,
