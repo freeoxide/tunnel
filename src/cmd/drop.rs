@@ -17,8 +17,10 @@
 //! detached worker could not confirm anyway.
 //!
 //! The access token is resolved before any state is touched: `--token` (which
-//! must be non-empty) or a freshly minted one ([`drop_server::generate_token`]
-//! — OS CSPRNG). The token is written into the service's private state dir
+//! must be non-empty after trimming — it is trimmed once at this boundary and
+//! the trimmed value is what gets stored, printed, and compared) or a freshly
+//! minted one ([`drop_server::generate_token`] — OS CSPRNG). The token is
+//! written into the service's private state dir
 //! ([`drop_server::store_token`], 0600) after the entry is reserved and
 //! before the worker is spawned (the worker reads it back at startup — same
 //! fail-fast window as the hook's request store), printed once on success,
@@ -116,14 +118,15 @@ pub async fn run(
     };
 
     // The token is resolved up front so every refusal above and below happens
-    // before any state exists. An explicitly EMPTY token would authenticate
-    // nothing; refuse it rather than silently minting one (the operator asked
-    // for a specific secret).
-    let token = match token {
-        Some(t) if !t.trim().is_empty() => t,
-        Some(_) => bail!("--token must be a non-empty secret"),
-        None => drop_server::generate_token().context("generating an upload token")?,
-    };
+    // before any state exists. An explicitly EMPTY (or whitespace-only) token
+    // would authenticate nothing; refuse it rather than silently minting one
+    // (the operator asked for a specific secret). Resolved TRIMMED ONCE, HERE:
+    // the value [`resolve_token`] returns is the single binding every consumer
+    // downstream sees — the token file, the printed credential, and the
+    // origin's in-memory token — so a shell-quoted token with edge whitespace
+    // cannot end up stored untrimmed and 401 every upload while the operator
+    // pastes the trimmed one.
+    let token = resolve_token(token)?;
     // Bounds the per-upload cap; the total-store cap is the fixed
     // drop_server::MAX_TOTAL_STORE (documented single-knob contract).
     let max_size = max_size.unwrap_or(drop_server::DEFAULT_MAX_SIZE);
@@ -132,6 +135,23 @@ pub async fn run(
         run_foreground(dir, port, name, token, max_size).await
     } else {
         run_background(dir, port, name, token, max_size).await
+    }
+}
+
+/// Resolve the drop access token: the operator's `--token` trimmed ONCE (the
+/// trim is the point — validation, the stored token file, the printed
+/// credential, and the origin's comparison value must all be the SAME string,
+/// so an edge-whitespace shell quote cannot produce a stored secret that
+/// 401s its own pasted twin), refused when whitespace-only, or a freshly
+/// minted one ([`drop_server::generate_token`], OS CSPRNG) when omitted.
+fn resolve_token(token: Option<String>) -> Result<String> {
+    match token {
+        Some(t) => {
+            let t = t.trim();
+            ensure!(!t.is_empty(), "--token must be a non-empty secret");
+            Ok(t.to_string())
+        }
+        None => drop_server::generate_token().context("generating an upload token"),
     }
 }
 
@@ -779,6 +799,46 @@ mod tests {
             next_id: services.len() as u64 + 1,
             services,
         }
+    }
+
+    #[test]
+    fn resolve_token_trims_once_and_refuses_whitespace_only() {
+        // R3-9: --token was validated via `t.trim()` but STORED and PRINTED
+        // untrimmed, so a token with edge whitespace 401'd every background
+        // upload (the pasted/trimmed form never matched the stored one) while
+        // the foreground flow worked. The resolved value is the single
+        // binding every consumer sees — token file, printed credential, and
+        // the origin's comparison value — so it must BE the trimmed secret.
+        assert_eq!(
+            resolve_token(Some("  sekrit  ".to_string())).expect("padded token"),
+            "sekrit",
+            "edge whitespace must be trimmed exactly once, at this boundary"
+        );
+        assert_eq!(
+            resolve_token(Some("tok".to_string())).expect("clean token"),
+            "tok",
+            "a clean token passes through unchanged"
+        );
+        let err = resolve_token(Some("   ".to_string()))
+            .expect_err("a whitespace-only token authenticates nothing");
+        assert!(
+            err.to_string()
+                .contains("--token must be a non-empty secret"),
+            "the refusal must name the rule, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_token_mints_when_omitted() {
+        // None ⇒ a freshly minted CSPRNG token: 64 lowercase hex chars — the
+        // printed-once default the help documents.
+        let minted = resolve_token(None).expect("minted token");
+        assert_eq!(minted.len(), 64);
+        assert!(
+            minted
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
     }
 
     #[test]

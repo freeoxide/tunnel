@@ -127,7 +127,13 @@ fn confirm_sensitive(dir: &Path, yes: bool) -> Result<()> {
 /// - any **ancestor** of `$HOME` (e.g. `ft ~..`, `ft /home`, `ft /Users`,
 ///   `ft C:\Users`) — publishing it would expose every user's home non-dotfile
 ///   contents;
-/// - `$HOME` itself.
+/// - `$HOME` itself;
+/// - any directory **overlapping ft's own state tree** (`$XDG_STATE_HOME/
+///   freeoxide/tunnel`, i.e. the root itself, a subtree like `services/`, or
+///   an ancestor that contains it). The state tree is full of secrets a
+///   non-dotfile GET or a WRITE-touching drop bucket would expose publicly —
+///   `registry.json`, worker/tunnel logs, hook request records, and every
+///   service's `drop-token` file — so no part of it may be served.
 ///
 /// Both sides are canonicalised so a symlink alias of `$HOME` (e.g.
 /// `ft ~/house` where `house -> $HOME`) cannot slip past the prompt; if the
@@ -163,13 +169,37 @@ pub(crate) fn is_sensitive_dir(dir: &Path) -> bool {
     // containers or systemd units with no Environment=), fail CLOSED: treat
     // the directory as sensitive so the user must pass --yes rather than us
     // silently publishing something we couldn't reason about.
-    match directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()) {
+    let home_overlapped = match directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()) {
         Some(home) => {
             let home = std::fs::canonicalize(&home).unwrap_or(home);
             home.starts_with(&dir)
         }
         None => true,
-    }
+    };
+
+    // ft's own state tree joins the denylist (shared with the drop callers):
+    // it holds registry.json, worker/tunnel logs, hook request records, and
+    // per-service `drop-token` files — none dotfile-hidden, so serving ANY of
+    // it publicly leaks secrets. The overlap is three-way on purpose: the
+    // root itself, a subtree (`services/`, a per-service dir — drops WRITE
+    // there, and GETs serve the token files), and ancestors (`ft drop
+    // ~/.local/state` would serve registry.json via the `freeoxide/tunnel`
+    // subpath). The root is resolved the same way as `dir` above; when it
+    // does not exist yet it cannot be canonicalised and the lexical absolute
+    // path is compared instead (a fresh machine has no state tree to leak,
+    // but a drop bucket placed where it WILL live would write uploads into
+    // it). If the state root cannot even be determined, fail CLOSED —
+    // matching the $HOME fallback's posture for broken environments.
+    let state_overlapped = match crate::state::StateDir::new() {
+        Ok(state) => {
+            let root =
+                std::fs::canonicalize(state.root()).unwrap_or_else(|_| state.root().to_path_buf());
+            dir == root || dir.starts_with(&root) || root.starts_with(&dir)
+        }
+        Err(_) => true,
+    };
+
+    home_overlapped || state_overlapped
 }
 
 /// Resolve a directory to an absolute, existing, readable path.

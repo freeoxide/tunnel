@@ -125,9 +125,21 @@ pub(crate) const DEFAULT_MAX_SIZE: u64 = 64 * 1024 * 1024;
 /// the worst-case disk footprint of any drop service is a documented constant.
 pub(crate) const MAX_TOTAL_STORE: u64 = 1024 * 1024 * 1024;
 
-/// Longest upload name accepted: the common minimum across the filesystems
-/// this tool targets, and plenty for a dev drop bucket.
-const MAX_NAME_BYTES: usize = 255;
+/// Extra bytes the publish path's temp-name scheme (`.{name}.part-<tag8>`)
+/// adds around the name: the leading dot, the `.part-` marker, and the ≤ 8
+/// byte token tag (see [`DropStore::temp_path`]).
+const TEMP_NAME_OVERHEAD: usize = 1 + ".part-".len() + 8;
+
+/// Longest upload name accepted. This is a BUDGET, not the raw filesystem
+/// limit: the common NAME_MAX across the filesystems this tool targets is 255
+/// bytes, but a name is stored as the dot-prefixed temp file FIRST (see
+/// [`TEMP_NAME_OVERHEAD`]), so a name near 255 B would hit ENAMETOOLONG at the
+/// temp open inside `spawn_blocking` and surface as a generic 500 — even
+/// though the final name would have fit. Capping at 255 minus the exact temp
+/// overhead means every name that passes [`sanitize_filename`] stores cleanly
+/// on any of those filesystems (the publish path itself is never the thing
+/// that fails).
+const MAX_NAME_BYTES: usize = 255 - TEMP_NAME_OVERHEAD;
 
 /// Name of the file (inside the service's private state dir) holding the
 /// drop origin's access token — the same value printed once at start and
@@ -164,8 +176,9 @@ fn fill_random(buf: &mut [u8]) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         // The `Win32_Security_Cryptography` feature gate on windows-sys (see
-        // Cargo.toml) exposes these bindings; the flags const is the crate's
-        // own `BCRYPTGENRANDOM_FLAGS` newtype, not a bare u32.
+        // Cargo.toml) exposes these bindings; `BCRYPTGENRANDOM_FLAGS` is a
+        // plain `u32` type alias in windows-sys 0.59 (not a newtype), so the
+        // flag const below passes as a bare u32.
         use windows_sys::Win32::Security::Cryptography::{
             BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
         };
@@ -196,18 +209,27 @@ fn fill_random(buf: &mut [u8]) -> std::io::Result<()> {
     }
 }
 
-/// Constant-time token comparison: the decision folds XOR over every byte, so
-/// it never early-returns on the first mismatching byte. Length is compared
-/// first (the token is fixed-length hex minted by [`generate_token`], so the
-/// length itself carries no secret).
+/// Constant-time token comparison: the decision folds XOR over every byte AND
+/// the length difference into one accumulator, so it never early-returns on
+/// the first mismatching byte — or on a length mismatch. The drop token is not
+/// necessarily the fixed-length hex minted by [`generate_token`]: the operator
+/// may pass an arbitrary `--token`, whose length is worth not advertising (the
+/// static origin's `static_server::tokens_match` twin folds the same way —
+/// keep the two in sync). The total work still scales with the longer input,
+/// so a length *class* is inferable from timing, as with any looped compare.
+/// An empty expected token matches nothing: an empty secret must never open
+/// the bucket (the CLI refuses one; this is the server-side backstop for a
+/// hand-built store).
 fn tokens_match(provided: &str, expected: &str) -> bool {
-    let (a, b) = (provided.as_bytes(), expected.as_bytes());
-    if a.len() != b.len() {
+    if expected.is_empty() {
         return false;
     }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b) {
-        diff |= x ^ y;
+    let (a, b) = (provided.as_bytes(), expected.as_bytes());
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= usize::from(x ^ y);
     }
     diff == 0
 }
@@ -327,10 +349,30 @@ impl DropStore {
     /// unreachable through the API from both sides.
     fn temp_path(&self, name: &str) -> PathBuf {
         // The token is ≥ 64 hex chars in production (generate_token); tests
-        // use short tokens, hence the clamp.
-        let tag = &self.token[..self.token.len().min(8)];
+        // and operator `--token`s may be anything, hence the boundary-safe cut
+        // (see [`token_tag`]).
+        let tag = token_tag(&self.token);
         self.root.join(format!(".{name}.part-{tag}"))
     }
+}
+
+/// First ≤ 8 bytes of `token`, cut at a char boundary. WHY not plain byte
+/// slicing (`&token[..token.len().min(8)]`): byte 8 can split a multibyte
+/// char of an operator-chosen `--token`, and slicing then panics — the panic
+/// lands inside `spawn_blocking`, turning EVERY upload into a 500. Walking
+/// back to the nearest boundary keeps the tag a valid, stable prefix (never
+/// longer than 8 bytes, so the [`TEMP_NAME_OVERHEAD`] budget holds); the
+/// scoping it provides stays prefix-based, exactly as before for ASCII tokens.
+fn token_tag(token: &str) -> &str {
+    let end = token.len().min(8);
+    if token.is_char_boundary(end) {
+        return &token[..end];
+    }
+    let mut end = end;
+    while end > 0 && !token.is_char_boundary(end) {
+        end -= 1;
+    }
+    &token[..end]
 }
 
 /// Sum the byte size of every regular file under `root`, best-effort.
@@ -843,15 +885,81 @@ mod tests {
     }
 
     #[test]
-    fn tokens_match_is_exact_and_never_length_leaky() {
+    fn token_tag_cuts_at_char_boundaries_and_stays_within_eight_bytes() {
+        // R3-11: the old byte-slice `&token[..len.min(8)]` panicked on a
+        // multibyte operator --token (byte 8 splitting a char), and the panic
+        // surfaced as a 500 for every upload. The tag must stay a valid
+        // prefix of at most 8 bytes for ANY token, and unchanged for plain
+        // ASCII.
+        assert_eq!(token_tag("tok-abc123"), "tok-abc1", "ASCII: first 8 bytes");
+        assert_eq!(token_tag("ab"), "ab", "short tokens are used whole");
+        assert_eq!(token_tag(""), "", "an empty token yields an empty tag");
+        // 3-byte chars: byte 8 splits the third char, so the cut walks back
+        // to the boundary at 6 (two full chars, 6 bytes).
+        assert_eq!(token_tag("日本語テスト"), "日本");
+        // 4-byte chars: byte 8 lands on a boundary (4 + 4), two full chars.
+        assert_eq!(token_tag("😀😀😀"), "😀😀");
+        // Invariant over arbitrary shapes: a prefix cut on a boundary, never
+        // longer than 8 bytes.
+        for token in ["aé🎉b", "🎉", "🎉🎉🎉🎉🎉", "日本", "x"] {
+            let tag = token_tag(token);
+            assert!(token.starts_with(tag), "prefix of {token:?}");
+            assert!(
+                token.is_char_boundary(tag.len()),
+                "boundary cut of {token:?}"
+            );
+            assert!(tag.len() <= 8, "≤ 8 bytes for {token:?}");
+        }
+    }
+
+    #[test]
+    fn temp_names_for_maximal_names_stay_within_name_max() {
+        // The MAX_NAME_BYTES budget's reason to exist: any name sanitize
+        // accepts must produce a temp file name (dot + name + ".part-" + an
+        // ≤ 8-byte tag) that fits the common 255-byte NAME_MAX — ASCII and
+        // multibyte alike — so the publish path itself never fails.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = DropStore::open(tmp.path(), "tok-abc123".to_string(), 1024, MAX_TOTAL_STORE)
+            .expect("open store");
+        let max_ascii = "a".repeat(MAX_NAME_BYTES);
+        // "é" is 2 bytes: exactly MAX_NAME_BYTES bytes, half the char count.
+        let max_multibyte = "é".repeat(MAX_NAME_BYTES / 2);
+        assert_eq!(max_multibyte.len(), MAX_NAME_BYTES, "byte budget met");
+        for name in [max_ascii, max_multibyte] {
+            assert!(
+                sanitize_filename(&name).is_ok(),
+                "a name at the budget must be accepted"
+            );
+            let file_name = store
+                .temp_path(&name)
+                .file_name()
+                .expect("file name")
+                .to_string_lossy()
+                .into_owned();
+            assert!(
+                file_name.len() <= 255,
+                "temp name must fit NAME_MAX: {} bytes for a {}-byte name",
+                file_name.len(),
+                name.len()
+            );
+        }
+    }
+
+    #[test]
+    fn tokens_match_is_exact_never_length_leaky_and_empty_matches_nothing() {
         // Correctness first; the differing-only-in-last-byte case is the one
         // a naive early-return comparison would get right too — pinning it
-        // documents that the XOR fold covers the WHOLE token either way.
+        // documents that the XOR fold covers the WHOLE token either way. The
+        // length difference folds into the same accumulator (an operator's
+        // arbitrary --token must not leak its length by timing), and an empty
+        // token matches nothing — not even an empty expected one, because an
+        // empty secret must never open the bucket.
         assert!(tokens_match("aaaa", "aaaa"));
         assert!(!tokens_match("aaab", "aaaa"));
         assert!(!tokens_match("aaa", "aaaa"));
         assert!(!tokens_match("", "aaaa"));
-        assert!(tokens_match("", ""));
+        assert!(!tokens_match("aaaa", ""));
+        assert!(!tokens_match("", ""), "empty vs empty must match nothing");
     }
 
     // --- token file ----------------------------------------------------------
@@ -1051,6 +1159,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn names_over_the_temp_budget_get_a_precise_400_and_at_the_budget_store() {
+        // R3-10: a name in the gap between the old 255-byte sanitize cap and
+        // what the publish path's temp name could hold passed sanitize and
+        // then died ENAMETOOLONG at the temp open inside spawn_blocking — a
+        // generic 500 with nothing stored. The budget cap rejects such names
+        // up front with a 400 naming the rule, while a name exactly AT the
+        // budget stores cleanly (the whole write path holds).
+        let (_tmp, store) = test_store(MAX_TOTAL_STORE);
+        let app = router(store.clone());
+        // 241 bytes: under the old 255-byte cap, over the 240-byte budget.
+        let over = "a".repeat(MAX_NAME_BYTES + 1);
+        let resp = app
+            .clone()
+            .oneshot(req("POST", &format!("/{over}?token=tok-abc123"), &[], b"x"))
+            .await
+            .expect("oneshot");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "an over-budget name must be a precise 400, never a 500"
+        );
+        let body = String::from_utf8(body_of(resp).await).expect("utf-8 body");
+        assert!(
+            body.contains("longer than") && body.contains("bytes"),
+            "the 400 must name the length rule: {body}"
+        );
+        assert!(
+            !store.root.join(&over).exists() && !store.temp_path(&over).exists(),
+            "a rejected name must leave no file and no temp"
+        );
+
+        // Exactly at the budget: the write path holds end to end.
+        let at = "b".repeat(MAX_NAME_BYTES);
+        let resp = router(store.clone())
+            .oneshot(req("POST", &format!("/{at}?token=tok-abc123"), &[], b"x"))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::CREATED, "at-budget name");
+        assert!(store.root.join(&at).exists(), "the at-budget name stored");
+    }
+
+    #[tokio::test]
     async fn stale_temp_linked_to_the_stored_file_cannot_corrupt_it() {
         // Regression (judge fix round 3): a crash between the publish's
         // hard_link and its unlink leaves the temp path hard-linked to the
@@ -1195,6 +1345,61 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert!(name.starts_with('.'), "temp must be a dotfile: {name}");
+    }
+
+    #[tokio::test]
+    async fn multibyte_operator_token_uploads_and_temp_names_stay_sane() {
+        // R3-11 end-to-end over the router: with the old byte-sliced temp
+        // tag, an operator --token whose 8th byte falls mid-char panicked in
+        // temp_path inside spawn_blocking — every upload answered 500. The
+        // boundary-safe tag lets the multibyte token authenticate AND store,
+        // and the temp path stays a valid, dot-prefixed component that
+        // publish consumes. The token rides ?token= percent-encoded ON
+        // PURPOSE: a Bearer header value cannot carry UTF-8
+        // (HeaderValue::to_str rejects it), so the query is the only wire
+        // shape a multibyte operator token can actually travel by — and its
+        // percent-decoded value is exactly what used to panic in temp_path.
+        // (The token's 8th byte sits inside 日 — the shape that used to
+        // panic.)
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let token = "鍵🔑日本語";
+        let store = DropStore::open(tmp.path(), token.to_string(), 1024, MAX_TOTAL_STORE)
+            .expect("open store");
+        let resp = router(store.clone())
+            .oneshot(req(
+                "POST",
+                "/upload.bin?token=%E9%8D%B5%F0%9F%94%91%E6%97%A5%E6%9C%AC%E8%AA%9E",
+                &[],
+                b"multibyte",
+            ))
+            .await
+            .expect("oneshot");
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a multibyte --token must not break uploads"
+        );
+        assert_eq!(
+            std::fs::read(store.root.join("upload.bin")).expect("read back"),
+            b"multibyte".to_vec()
+        );
+        // The temp scheme stayed sane: a valid UTF-8, dot-prefixed component
+        // carrying the part marker, consumed by the publish.
+        let temp = store.temp_path("upload.bin");
+        let file_name = temp
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            file_name.starts_with('.'),
+            "temp must stay a dotfile: {file_name}"
+        );
+        assert!(
+            file_name.contains(".part-"),
+            "temp must keep the part marker: {file_name}"
+        );
+        assert!(!temp.exists(), "publish must consume the temp file");
     }
 
     #[cfg(unix)]

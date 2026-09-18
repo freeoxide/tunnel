@@ -1216,6 +1216,13 @@ fn drop_usage_errors_and_preflight_refusals_leave_no_state() {
     let dir = TempDir::new().unwrap();
     let missing = dir.path().join("does-not-exist");
     let missing = missing.to_string_lossy().into_owned();
+    // A neutral EXISTING directory for the token-refusal cases: it must not
+    // be an ancestor of ft's state root (pinned under `dir`), because serving
+    // an ancestor of the state tree would expose registry.json via subpaths
+    // and is — correctly — refused as sensitive (R3-7). A second tempdir is
+    // a sibling, not an ancestor.
+    let neutral = TempDir::new().unwrap();
+    let neutral_arg = neutral.path().to_string_lossy().into_owned();
     for (args, expected) in [
         // clap: the DIR positional is required.
         (&["drop"][..], "required arguments were not provided"),
@@ -1240,7 +1247,14 @@ fn drop_usage_errors_and_preflight_refusals_leave_no_state() {
         (&["drop", &missing][..], "does not exist"),
         (&["drop", "/"][..], "sensitive directory"),
         (
-            &["drop", "/tmp", "--token", ""][..],
+            &["drop", &neutral_arg, "--token", ""][..],
+            "--token must be a non-empty secret",
+        ),
+        // R3-9's flip side at the CLI boundary: a WHITESPACE-ONLY token is
+        // refused (not silently accepted untrimmed) — the trim happens once,
+        // at token resolution, before anything is stored or printed.
+        (
+            &["drop", &neutral_arg, "--token", "   "][..],
             "--token must be a non-empty secret",
         ),
     ] {
@@ -1300,6 +1314,84 @@ fn drop_refuses_an_occupied_port_and_leaves_no_state() {
         tree_paths(dir.path()).is_empty(),
         "a refused drop must leave no state, found: {:?}",
         tree_paths(dir.path())
+    );
+}
+
+#[test]
+fn drop_refuses_fts_own_state_tree_in_every_overlap() {
+    // R3-7: ft's state root ($XDG_STATE_HOME/freeoxide/tunnel) holds
+    // registry.json, worker/tunnel logs, hook request records, and every
+    // service's drop-token file — all non-dotfile, so a drop bucket placed ON
+    // the state root made them publicly readable via unauthenticated GETs
+    // (and a bucket WRITE-touches the tree on top of that). The shared
+    // sensitive-dir check must refuse every overlap with the state tree: the
+    // root itself, a subtree (services/ — the token files live there), and an
+    // ancestor (which would serve the tree via subpaths) — before any state
+    // is touched. The plain-bucket counterpart
+    // (`drop_refuses_an_occupied_port_and_leaves_no_state`) already pins that
+    // a NON-state dir still passes this pre-flight and fails later, at the
+    // port check.
+    let dir = TempDir::new().unwrap();
+    let state_root = dir.path().join("freeoxide").join("tunnel");
+    let services = state_root.join("services");
+    let ancestor = dir.path().join("freeoxide");
+    fs::create_dir_all(&services).unwrap();
+
+    // The bucket argument accepts any of the three overlap shapes; each must
+    // be refused with the sensitive-directory message.
+    for bucket in [state_root.clone(), services.clone(), ancestor.clone()] {
+        let arg = bucket.to_string_lossy().into_owned();
+        let (ok, out) = run_ft(dir.path(), &["drop", &arg]);
+        assert!(
+            !ok,
+            "dropping onto ft's state tree at {} must be refused: {out}",
+            bucket.display()
+        );
+        assert!(
+            out.contains("sensitive directory"),
+            "expected the sensitive-dir refusal for {}, got: {out}",
+            bucket.display()
+        );
+    }
+
+    // Refusal happened before any state: no registry, and the pre-created
+    // (test-fixture) services dir gained nothing.
+    assert!(
+        !registry_path(dir.path()).exists(),
+        "a refused drop must not create a registry"
+    );
+    assert!(
+        tree_paths(&services).is_empty(),
+        "a refused drop must not touch the state tree, found: {:?}",
+        tree_paths(&services)
+    );
+}
+
+#[test]
+fn start_refuses_fts_own_state_dir_noninteractively() {
+    // R3-7 tightens the START caller too (the check is shared): `ft <state-
+    // dir>` without --yes and without a TTY must refuse with the sensitive-
+    // directory error, like $HOME does. (--yes keeps its existing
+    // confirmed-sensitive override semantics, as for $HOME itself — the fix
+    // is the denylist entry, not a new refusal class.)
+    let dir = TempDir::new().unwrap();
+    let state_root = dir.path().join("freeoxide").join("tunnel");
+    fs::create_dir_all(&state_root).unwrap();
+    let arg = state_root.to_string_lossy().into_owned();
+
+    let (ok, out) = run_ft(dir.path(), &[arg.as_str()]);
+
+    assert!(
+        !ok,
+        "starting a tunnel on ft's own state dir must be refused: {out}"
+    );
+    assert!(
+        out.contains("refusing to publish a sensitive directory"),
+        "expected the non-interactive sensitive-dir refusal, got: {out}"
+    );
+    assert!(
+        !registry_path(dir.path()).exists(),
+        "a refused start must not create a registry"
     );
 }
 
