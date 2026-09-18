@@ -34,14 +34,13 @@ pub fn allocate_free_port() -> Result<u16> {
 /// unix-only `setsockopt(SO_REUSEADDR)` bind probe because:
 ///
 /// - TIME_WAIT: a just-stopped server leaves its port held by TIME_WAIT
-///   sockets for up to a minute, and on macOS, Windows, and older Linux
-///   kernels a bind WITHOUT `SO_REUSEADDR` refuses that window with
-///   `EADDRINUSE` — so the old bind probe made `ft run` reject a perfectly
-///   restartable port (current Linux happens to tolerate such binds, which is
-///   precisely the kind of kernel-version dependence this probe removes).
-///   Nothing accepts connections on a TIME_WAIT-only port, so the connect
-///   probe correctly reads it free, and a dev server (which virtually always
-///   sets `SO_REUSEADDR` itself) can rebind it.
+///   sockets for up to a minute, and a plain bind WITHOUT `SO_REUSEADDR` is
+///   NOT reliably rebindable through that window — it can fail with
+///   `EADDRINUSE` while nothing is actually serving the port — so the old
+///   bind probe made `ft run` reject a perfectly restartable port. Nothing
+///   accepts connections on a TIME_WAIT-only port, so the connect probe
+///   correctly reads it free, and a dev server (which virtually always sets
+///   `SO_REUSEADDR` itself) can rebind it.
 /// - Portability: `SO_REUSEADDR` on Windows is a different, dangerous
 ///   contract (it permits binding over a LIVE listener — a hijack hazard),
 ///   so the setsockopt route would need a platform split; a loopback connect
@@ -114,11 +113,10 @@ mod tests {
         drop(client);
 
         // The contract under fix: nothing ACCEPTS on the port any more, so a
-        // restart against it must be allowed. (Whether a plain bind also
-        // succeeds here is kernel-dependent — current Linux tolerates
-        // TIME_WAIT-only binds while macOS/Windows and older kernels refuse
-        // them with EADDRINUSE — which is exactly why the probe was switched
-        // to the portable connect-based check rather than a setsockopt bind.)
+        // restart against it must be allowed. A plain bind is NOT reliably
+        // rebindable through a TIME_WAIT window (EADDRINUSE despite no
+        // listener) — exactly why the probe is connect-based, where "refused"
+        // is the platform-independent truth about "nothing is serving here".
         assert!(is_port_free(port), "a TIME_WAIT-only port must read free");
     }
 
