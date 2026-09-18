@@ -241,7 +241,15 @@ impl HookLog {
         // just from the next append.
         requests.sort_by_key(|r| std::cmp::Reverse(r.seq));
         requests.truncate(keep);
-        let next_seq = requests.first().map(|r| r.seq + 1).unwrap_or(1);
+        // Saturate rather than `+ 1`: a hand-edited store can carry
+        // seq = u64::MAX, where the raw add trips the debug overflow check
+        // (panicking the origin at startup) and wraps to 0 in release,
+        // stamping the next record as the oldest — corrupting the
+        // newest-first order this counter exists to define.
+        let next_seq = requests
+            .first()
+            .map(|r| r.seq.saturating_add(1))
+            .unwrap_or(1);
         Ok(Self {
             path,
             keep,
@@ -628,6 +636,43 @@ mod tests {
     }
 
     #[test]
+    fn load_saturates_a_hand_edited_max_seq_counter_and_still_appends() {
+        // A hand-edited store can carry seq = u64::MAX; the reload must
+        // saturate the counter there, because the old `r.seq + 1` panicked
+        // in debug builds (the overflow check acting as a debug_assert) and
+        // silently wrapped to 0 in release — stamping the next record as
+        // the OLDEST and corrupting newest-first ordering. The saturated
+        // value is what the test observes (release-mode semantics); the
+        // append is explicitly seq-stamped at u64::MAX because
+        // `next_seq()`'s own increment would still overflow in debug at
+        // MAX, and that method is outside this fix's scope.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("requests.json");
+        {
+            let mut log = HookLog::load(path.clone(), 5).expect("seed load");
+            let head = parts("POST", "/seed", &[]);
+            log.record(RecordedRequest::capture(u64::MAX, &head, b"seed"))
+                .expect("seed record");
+        }
+        // The reload below is the line the old `r.seq + 1` panicked on.
+        let mut log = HookLog::load(path.clone(), 5).expect("reload at MAX seq");
+        assert_eq!(
+            log.next_seq,
+            u64::MAX,
+            "the reloaded counter must saturate at u64::MAX, not wrap to 0"
+        );
+        // Append through the store's own record path and confirm it
+        // persists and round-trips without a panic.
+        let head = parts("POST", "/after", &[]);
+        log.record(RecordedRequest::capture(u64::MAX, &head, b"after"))
+            .expect("record at MAX seq");
+        assert_eq!(log.len(), 2);
+        let reloaded = HookLog::load(path, 5).expect("reload after the append");
+        let paths: Vec<String> = reloaded.snapshot().into_iter().map(|r| r.path).collect();
+        assert_eq!(paths, vec!["/after", "/seed"]);
+    }
+
+    #[test]
     fn hook_log_survives_a_corrupt_store() {
         // A corrupt store must degrade to empty (with the origin still
         // usable), never brick the service or panic on load.
@@ -844,6 +889,37 @@ mod tests {
             lock(&log).snapshot().len(),
             0,
             "inspection views must not be recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_get_on_the_inspect_paths_is_405_and_unrecorded() {
+        // The module docs promise that non-GET methods on the inspection
+        // endpoints are answered 405 unrecorded; this pins the axum
+        // method-routing contract behind that promise — `get(...)` routes
+        // reject other methods themselves, so the request never reaches the
+        // recording fallback and an inspection probe can never land in the
+        // store — guarding that behavior against axum upgrades.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let log = Arc::new(Mutex::new(
+            HookLog::load(tmp.path().join("requests.json"), usize::from(DEFAULT_KEEP))
+                .expect("load"),
+        ));
+        for path in [INSPECT_PATH, JSON_PATH] {
+            let resp = router(log.clone())
+                .oneshot(req("POST", path, b""))
+                .await
+                .expect("oneshot");
+            assert_eq!(
+                resp.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "POST {path} must be method-rejected"
+            );
+        }
+        assert_eq!(
+            lock(&log).snapshot().len(),
+            0,
+            "a 405'd inspect probe must not be recorded"
         );
     }
 
