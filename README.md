@@ -158,21 +158,30 @@ also exported to the command's environment as `PORT`, so well-behaved tools pick
 without a flag. An already-occupied port is refused before anything is created — the command
 ft spawns has to be able to bind it.
 
-The detached worker owns the command it spawns: the child stays in the worker's process group
-(on Linux a `PR_SET_PDEATHSIG` ties it to the worker's life; on Windows the worker's Job
-Object covers it), so `ft kill` tears the tunnel AND the command down together — no orphans.
-The child's output is teed into the service's `worker.log`, which is what `ft logs` reads.
-Doctor knows about the one failure mode this can still leave: a worker that died without
-taking its command down is flagged "tunnel dead, command still running" (see Diagnosing
-problems). Flags: `--name <name>` (defaults to `run-<port>`), `--foreground` / `-f`. The
-command itself goes after `--`; everything after the separator reaches it verbatim, including
-flag-looking arguments.
+The detached worker owns the command it spawns: the child is made the leader of its own
+process group at spawn, and the worker tears that whole group down — the command plus
+everything it forked (`npm run dev`'s vite, say) — on every exit path, SIGTERM first and
+SIGKILL after a short grace (on Linux a `PR_SET_PDEATHSIG` additionally kills the child if
+the worker itself is hard-killed, and on Windows the worker's Job Object covers the whole
+tree). So `ft kill` stops the tunnel AND the command together, and a well-behaved command
+leaves no orphans — the known edges are a command that ignores SIGTERM (ft's SIGKILL
+escalation can be cut short by `ft kill`'s own stop deadline) and a grandchild that outlives
+a child which exited on its own. The child's output is teed into the service's `worker.log`,
+which is what `ft logs` reads. Doctor knows about the failure mode hard kills can still
+leave: a worker that died without taking its command down is flagged "tunnel dead, command
+still running" — an unverified pid that could equally be a recycled one, since an operator
+command carries no identity marker and nothing ties the port's listener to the recorded pid
+(see Diagnosing problems). Flags: `--name <name>` (defaults to `run-<port>`), `--foreground`
+/ `-f`. The command itself goes after `--`; everything after the separator reaches it
+verbatim, including flag-looking arguments.
 
 ### Hook: record and inspect webhooks
 
 `ft hook` exposes an ft-built origin that answers `200 OK` to every request and records it —
 method, path, query, a small allowlist of headers, and the body up to 64 KiB (larger bodies
-are rejected with 413) — into a private per-service store. Credential-looking headers
+are rejected with 413) — into a private per-service store. One exception: the inspection
+paths `/__inspect` and `/__inspect.json` accept GET only, so a non-GET there is answered
+405 and not recorded. Credential-looking headers
 (Authorization, Cookie, signature headers) are never recorded. Inspect the records through
 the tunnel itself: `GET /__inspect` renders an HTML view in your browser, `GET
 /__inspect.json` returns the same records as a JSON array for scripts, both newest first.
@@ -219,11 +228,13 @@ Run `ft doctor` when a tunnel misbehaves, or to sanity-check the setup. It check
   is left for its own terminal);
 - for a `ft run` service whose worker died, whether its recorded command child died with
   it. If a process is still alive at the recorded pid — and the run's port still answers —
-  doctor reports "tunnel dead, command still running". The pid is existence-probed only
-  (an operator command has no reliable identity marker), so the wording stays hedged and
-  the hint tells you to check what the pid is before stopping it by hand: `ft kill` removes
-  the stale entry, but it cannot signal the command, because the worker that owned its
-  process group is gone;
+  doctor reports "tunnel dead, command still running". Neither signal proves identity: the
+  pid is existence-probed only (an operator command has no reliable identity marker), so it
+  may be a recycled, unrelated process, and the listener on the run's port cannot be tied to
+  the recorded pid either — the port answering is supporting evidence, not proof. The hint
+  therefore tells you to check what the pid is before stopping it by hand; `ft kill` removes
+  the stale entry, but it cannot signal the command, because the worker that tore the
+  command's group down is gone;
 - each service's state directory (where its logs live) still exists.
 
 `ft doctor` is strictly read-only: it never mutates the registry, signals processes, or
@@ -303,10 +314,10 @@ and is cleaned up like any stale entry.
 
 `ft run --port 3000 -- <command>` is the managed variant: `ft` itself spawns the command
 (with `PORT` exported into its environment), waits for the port to come up, and tunnels it.
-The difference from `ft proxy` is ownership — the worker is the command's parent, keeps it
-in its own process group (Linux adds a `PR_SET_PDEATHSIG`; Windows relies on the worker's
-Job Object), and tears it down on every exit path, so a stopped tunnel never leaves the dev
-server running behind it. `ft hook` and `ft drop` go one step further and bring their own
+The difference from `ft proxy` is ownership — the worker is the command's parent, gives the
+child its own process group at spawn (Linux adds a `PR_SET_PDEATHSIG` on the child; Windows
+relies on the worker's Job Object), and tears that whole group down on every exit path, so
+a stopped tunnel takes the dev server down with it. `ft hook` and `ft drop` go one step further and bring their own
 origin: the worker runs an axum server of ft's own (the same shape as the static server),
 so nothing external besides cloudflared is involved.
 

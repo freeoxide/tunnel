@@ -65,11 +65,17 @@ upload token — accept the secret as `Authorization: Bearer <secret>` **or** as
 string ends up in shell history and in client and intermediary proxy logs.
 For the static origin there is one ft-owned sink on top of that: it is the
 only origin whose worker opens a `server.log` at all (the hook and drop
-origins run no request tracing, so they keep no per-request log), and — if
-request tracing is ever raised there (`RUST_LOG=tower_http=trace`) — a
-`?token=` query lands in it. That file is mode `0600` and the default log
-level records no request spans, but a secret sent via `?token=` should be
-treated as exposed to every log that keeps URLs. Relatedly, the query form is
+origins run no request tracing, so they keep no per-request log). As shipped,
+that file keeps no request URLs at all: the worker hardcodes both tracing
+filters as literal strings (`EnvFilter::new` never consults `RUST_LOG`, so
+there is no environment knob to raise the level), and the hardcoded
+`tower_http=info` floor sits above the debug level of tower-http's default
+request spans and started/finished events — nothing per-request passes the
+filter. The only tower-http event that can is the error-level "response
+failed" line, and it carries no URL. `server.log` is still created mode `0600`
+(defense in depth), but the real exposure of a `?token=` secret is every log
+outside ft that keeps URLs — shell history, client and intermediary proxy
+logs. Relatedly, the query form is
 percent-decoded, so a secret containing `%` or `+` authenticates in its written
 form only via the header.
 

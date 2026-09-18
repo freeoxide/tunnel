@@ -95,10 +95,14 @@ pub struct StaticFlags {
     /// `--cors`: stamp permissive CORS headers (`Access-Control-Allow-Origin:
     /// *`, methods GET/HEAD/OPTIONS, wildcard request headers) on every
     /// response of the static origin. Preflight OPTIONS requests are
-    /// deliberately NOT answered with a success status — the origin is
-    /// GET/HEAD-only, both of which are CORS-"simple" requests that browsers
-    /// send without a preflight, so any request that would preflight is one
-    /// this origin would 405 anyway.
+    /// deliberately NOT answered with a success status: only a CORS-simple
+    /// request skips the preflight (a GET/HEAD whose headers are all
+    /// safelisted), while a GET/HEAD carrying a non-safelisted header such as
+    /// `Authorization` DOES preflight — and this origin 405s every OPTIONS
+    /// like any non-GET/HEAD, so the browser never sends that request.
+    /// Consequence of combining with `--token`: a cross-origin BROWSER can
+    /// never complete a Bearer-authenticated request here (it falls back to
+    /// `?token=`); same-origin pages and non-browser clients are unaffected.
     pub cors: bool,
     /// `--token <secret>`: require this operator-chosen secret on EVERY
     /// request (GET/HEAD included — the static origin's entire value is its

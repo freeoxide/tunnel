@@ -41,10 +41,14 @@
 //! - **`--cors`** — permissive CORS headers (`Access-Control-Allow-Origin: *`,
 //!   methods GET/HEAD/OPTIONS, wildcard request headers) stamped on every
 //!   response via `SetResponseHeaderLayer`, errors included. Preflight OPTIONS
-//!   is deliberately NOT answered with a success status: GET/HEAD are
-//!   CORS-simple requests that browsers make without a preflight, so anything
-//!   that would preflight is a non-GET/HEAD request this origin 405s anyway —
-//!   the stamped 405 documents that rather than faking an allowance.
+//!   is deliberately NOT answered with a success status. The trade-off, stated
+//!   exactly: only a CORS-simple request skips the preflight — a GET/HEAD whose
+//!   headers are all CORS-safelisted — while a GET/HEAD carrying a
+//!   non-safelisted header (e.g. `Authorization`) DOES preflight, and since
+//!   this origin 405s every OPTIONS like any non-GET/HEAD, the browser never
+//!   fires that authenticated request. So with `--token` (below), cross-origin
+//!   Bearer auth can never work; the unanswered preflight is preferred to
+//!   faking an allowance.
 //! - **`--token`** — the [`require_token`] guard answers 401 for EVERY request
 //!   (GET/HEAD included — unlike the drop bucket's mutation-only gate, the
 //!   static origin's whole value is its content, so there is no safe
@@ -644,12 +648,12 @@ fn query_param(query: &str, key: &str) -> Option<String> {
 /// Constant-time token comparison for the operator-chosen static secret: the
 /// decision folds XOR over every byte AND the length difference into one
 /// accumulator, so it never early-returns on the first mismatching byte — or
-/// on a length mismatch (unlike the drop bucket's fixed-length generated hex,
-/// an operator-chosen secret's length is worth not advertising). The total
-/// work still scales with the longer input, so a length *class* is inferable
-/// from timing, as with any looped compare. An empty configured token matches
-/// nothing (the CLI refuses one, and an empty secret must never open the
-/// origin).
+/// on a length mismatch (the drop bucket's `tokens_match` folds the length the
+/// same way now that its token may be an arbitrary operator `--token` too;
+/// keep the two twins in sync). The total work still scales with the longer
+/// input, so a length *class* is inferable from timing, as with any looped
+/// compare. An empty configured token matches nothing (the CLI refuses one,
+/// and an empty secret must never open the origin).
 fn tokens_match(provided: &str, expected: &str) -> bool {
     if expected.is_empty() {
         return false;

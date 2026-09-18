@@ -899,26 +899,31 @@ fn publish_url(ctx: &ReaderCtx, url: String) -> Result<()> {
     })
 }
 
-/// Initialise `tracing`: tower_http request traces go to `server.log` — when
-/// the caller passes one; only a Static worker has a server to trace, so a
-/// Proxy worker passes `None` and no file is created — while worker/ft traces
-/// go to `worker.log`. Fire-once; a no-op if a subscriber is already installed.
+/// Initialise `tracing`: the tower_http request-trace layer writes to
+/// `server.log` — when the caller passes one; only a Static worker has a
+/// server to trace, so a Proxy worker passes `None` and no file is created —
+/// while worker/ft traces go to `worker.log`. Fire-once; a no-op if a
+/// subscriber is already installed.
 fn init_tracing(worker_log: &Path, server_log: Option<&Path>) {
     use std::sync::Mutex;
     use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
     // tower_http request traces -> server.log; everything else -> worker.log.
     // Each layer is Option-wrapped so a failure to open one log file just drops
-    // that sink rather than aborting tracing setup. Mode 0600 on Unix (server.log
-    // can carry request URIs); plain create on Windows via the cross-platform
-    // helper.
+    // that sink rather than aborting tracing setup. Mode 0600 on Unix (the sink
+    // that would carry request URIs if its filter were ever raised); plain
+    // create on Windows via the cross-platform helper.
     //
-    // PERF-3: gate the request layer at `info` (request span open/close) rather
-    // than `trace` (one event per proxied request body chunk). server.log is
-    // opened once in append mode and never rotated, so a `trace` filter would
-    // grow it without bound on a busy tunnel. `info` keeps the per-request span
-    // without the per-event flood; raise the level via `RUST_LOG=tower_http=trace`
-    // when debugging a specific request.
+    // PERF-3: both filters are hardcoded literals — `EnvFilter::new` parses the
+    // string it is given and never consults `RUST_LOG`, so there is deliberately
+    // no environment knob. At the hardcoded `tower_http=info` floor,
+    // tower-http's default request span and its started/finished events (all
+    // emitted at debug) are filtered out, so server.log receives no per-request
+    // lines and no request URIs at all; the only tower_http output that can
+    // pass is the error-level "response failed" event, which carries no URL.
+    // A lower floor would feed per-request spans into an append-mode,
+    // never-rotated file — exactly what PERF-3 avoids — so raising the level
+    // is a source change, on purpose.
     let server_layer = server_log
         .and_then(|path| crate::fsutil::open_private_append(path).ok())
         .map(|f| {
