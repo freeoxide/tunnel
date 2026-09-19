@@ -220,6 +220,11 @@ fn sanitize_filename(raw: &str) -> Result<String, String> {
     if raw.chars().any(char::is_control) {
         return Err("control characters are not allowed".to_string());
     }
+    // ':' is NTFS alternate-data-stream syntax and illegal in Windows
+    // filenames — refused under the same portability contract as the devices.
+    if raw.contains(':') {
+        return Err("colons are not allowed (Windows filenames cannot contain them)".to_string());
+    }
     if raw.ends_with('.') || raw.ends_with(' ') {
         return Err("trailing dots/spaces are not allowed (Windows strips them)".to_string());
     }
@@ -819,6 +824,17 @@ mod tests {
         for bad in ["con", "NUL", "Com1.txt", "lpt9", "aux", "name.", "name "] {
             assert!(sanitize_filename(bad).is_err(), "{bad} must be rejected");
         }
+    }
+
+    #[test]
+    fn sanitize_filename_rejects_colons() {
+        // ':' is NTFS alternate-data-stream syntax and illegal in Windows
+        // filenames — same Windows-portability contract as the device names.
+        for bad in ["a:b", "2026-09-19T10:30:00.log", ":"] {
+            assert!(sanitize_filename(bad).is_err(), "{bad} must be rejected");
+        }
+        let err = sanitize_filename("a:b").expect_err("colons must be rejected");
+        assert!(err.contains("colons"), "the 400 must name the rule: {err}");
     }
 
     #[test]
