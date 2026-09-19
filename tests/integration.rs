@@ -313,6 +313,26 @@ fn run_ft(xdg_root: &std::path::Path, args: &[&str]) -> (bool, String) {
     (output.status.success(), combined)
 }
 
+/// `run_ft` with extra env pairs for the subprocess (same isolation rules:
+/// nothing is mutated on the test process).
+fn run_ft_with_env(
+    xdg_root: &std::path::Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (bool, String) {
+    let mut cmd = Command::new(ft_bin());
+    cmd.args(args)
+        .env("XDG_STATE_HOME", xdg_root)
+        .env("RUST_LOG", "");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let output = cmd.output().expect("spawning `ft` binary");
+    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    (output.status.success(), combined)
+}
+
 /// A loopback port with nothing listening on it.
 ///
 /// Bind an ephemeral listener, note its port, then drop it: the port is closed
@@ -1192,6 +1212,11 @@ fn drop_help_documents_the_command() {
     );
     assert!(out.contains("--token"), "missing --token in: {out}");
     assert!(out.contains("--max-size"), "missing --max-size in: {out}");
+    // The token also reads FT_TOKEN (help must advertise the env channel).
+    assert!(
+        out.contains("[env: FT_TOKEN]"),
+        "missing the FT_TOKEN env pin in: {out}"
+    );
     // The token is the bucket's write credential: the help must explain that
     // uploads REQUIRE it and that one is minted and printed when omitted.
     assert!(
@@ -2051,6 +2076,65 @@ fn start_help_documents_the_static_origin_flags() {
     assert!(out.contains("--spa"), "missing --spa in: {out}");
     assert!(out.contains("--cors"), "missing --cors in: {out}");
     assert!(out.contains("--token"), "missing --token in: {out}");
+    // The token also reads FT_TOKEN (help must advertise the env channel).
+    assert!(
+        out.contains("[env: FT_TOKEN]"),
+        "missing the FT_TOKEN env pin in: {out}"
+    );
+}
+
+#[test]
+fn token_flags_read_the_ft_token_env() {
+    // Both --token args (the implicit START's static origin and DROP's
+    // bucket) fall back to FT_TOKEN: a whitespace-only env value is refused
+    // exactly like a whitespace-only --token would be.
+    let dir = TempDir::new().unwrap();
+    let site = dir.path().join("site");
+    fs::create_dir_all(&site).unwrap();
+    let inbox = dir.path().join("inbox");
+    fs::create_dir_all(&inbox).unwrap();
+    let site = site.to_string_lossy().into_owned();
+    let inbox = inbox.to_string_lossy().into_owned();
+
+    let (ok, out) = run_ft_with_env(dir.path(), &[&site], &[("FT_TOKEN", "   ")]);
+    assert!(
+        !ok,
+        "a whitespace-only FT_TOKEN must fail the static start: {out}"
+    );
+    assert!(
+        out.contains("--token must be a non-empty secret"),
+        "the static origin must surface the env-fed token refusal, got: {out}"
+    );
+
+    let (ok, out) = run_ft_with_env(dir.path(), &["drop", &inbox], &[("FT_TOKEN", "   ")]);
+    assert!(
+        !ok,
+        "a whitespace-only FT_TOKEN must fail the drop start: {out}"
+    );
+    assert!(
+        out.contains("--token must be a non-empty secret"),
+        "the drop origin must surface the env-fed token refusal, got: {out}"
+    );
+
+    // argv beats env (clap's documented precedence): the whitespace-only
+    // --token WINS over a perfectly valid FT_TOKEN, so the refusal still
+    // fires — had env won, the start would have sailed past the token check.
+    for args in [
+        vec![&site, "--token", "  "],
+        vec!["drop", &inbox, "--token", "  "],
+    ] {
+        let (ok, out) = run_ft_with_env(dir.path(), &args, &[("FT_TOKEN", "a-valid-env-secret")]);
+        assert!(
+            !ok,
+            "the argv --token must take precedence over FT_TOKEN for `ft {}`: {out}",
+            args.join(" ")
+        );
+        assert!(
+            out.contains("--token must be a non-empty secret"),
+            "expected the argv value (not the env one) to be checked for `ft {}`, got: {out}",
+            args.join(" ")
+        );
+    }
 }
 
 #[test]

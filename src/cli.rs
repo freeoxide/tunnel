@@ -71,7 +71,9 @@ pub struct Cli {
     /// compared in constant time; anything else is 401 before the tree can
     /// be probed. You choose the value (never auto-generated); it is stored
     /// in the service's registry entry and shown again by `ft detail`.
-    #[arg(long, value_name = "SECRET")]
+    /// Also read from `FT_TOKEN` (argv wins when both are set), so the
+    /// secret need not ride the process list (`ps`).
+    #[arg(long, value_name = "SECRET", env = "FT_TOKEN", hide_env_values = true)]
     pub token: Option<String>,
 }
 
@@ -240,7 +242,9 @@ pub enum Command {
         /// in constant time. When omitted, a crypto-random token is
         /// generated, PRINTED ONCE here, stored in the service's private
         /// state dir, and shown by `ft detail`. Downloads (GET) need no token.
-        #[arg(long, value_name = "SECRET")]
+        /// Also read from `FT_TOKEN` (argv wins when both are set), so the
+        /// secret need not ride the process list (`ps`).
+        #[arg(long, value_name = "SECRET", env = "FT_TOKEN", hide_env_values = true)]
         token: Option<String>,
 
         /// Per-upload size cap in bytes, 1..=1073741824 (default 67108864 =
