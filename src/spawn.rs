@@ -1,17 +1,11 @@
 //! Detached worker process spawning.
 //!
-//! The background start flows (static `ft <dir>` and proxy `ft proxy <port>`)
-//! do not run the worker in-process; instead they re-invoke the current binary
-//! as `ft run-worker ...` in a new session so that the worker (and its
-//! `cloudflared` child) survive the parent `ft` process exiting. The worker's
-//! stdout/stderr are redirected to its `worker.log` so the parent can return
-//! immediately and the user can inspect output later via `ft logs`.
-//!
-//! Spawning follows the standard Unix detach pattern via `process_group(0)`
-//! plus a `setsid()` `pre_exec`: the child becomes its own session leader and
-//! the leader of a fresh process group whose id equals its pid. That lets
-//! `kill_process_group(worker_pid)` later reach the worker and everything it
-//! spawned.
+//! The background start flows re-invoke the current binary as
+//! `ft run-worker ...` in a new session, so the worker (and its `cloudflared`
+//! child) survive the parent `ft` exiting. The worker's stdout/stderr are
+//! redirected to its `worker.log` (readable later via `ft logs`). On Unix the
+//! child is made a session/process-group leader via a `setsid()` `pre_exec`,
+//! so `kill(-worker_pid)` later reaches the worker and everything it spawned.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -20,11 +14,9 @@ use crate::error::Result;
 use crate::state::StateDir;
 
 /// A best-effort handshake value handed to the spawned worker via its
-/// environment. The worker refuses to run without it ([`crate::worker::run`]),
-/// so `ft run-worker` cannot be invoked directly to bypass the START command's
-/// input validation and sensitive-directory confirmation. This is a local
-/// handshake (not a network secret): the value only needs to be *set* by
-/// `spawn_worker`, never guessed.
+/// environment: the worker refuses to run without it, so `ft run-worker`
+/// cannot be invoked directly to bypass START's validation. A local handshake,
+/// not a network secret — it only needs to be *set*, never guessed.
 fn worker_token() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -35,32 +27,21 @@ fn worker_token() -> String {
 }
 
 /// Stand-in value for the mandatory `--dir` flag when spawning a worker that
-/// has no directory — a PROXY worker (fronts the operator's upstream), a RUN
-/// worker (fronts the command `ft` itself spawns), and a HOOK worker (records
-/// requests into its state dir; it serves no directory) alike.
-///
-/// clap rejects empty flag values (`--dir ""` fails to parse), so such a
-/// worker passes this deliberately non-existent path instead. The worker never
-/// reads it for proxy/run services (their spec comes from the reserved
-/// registry entry; see [`crate::worker::run`]), and even a hand-crafted direct
-/// invocation against a mis-tagged `Static` registry entry fails closed on it:
-/// `resolve_dir` refuses the non-existent path and `is_sensitive_dir`
-/// fail-closes on the un-resolvable one.
+/// has no directory (proxy/run/hook). clap rejects empty flag values, so such
+/// workers pass this deliberately non-existent path; the worker never reads it
+/// for those kinds (their spec comes from the registry entry), and a
+/// hand-crafted direct invocation against a mis-tagged `Static` entry fails
+/// closed: `resolve_dir` refuses the path, `is_sensitive_dir` fail-closes on
+/// the unresolvable one.
 pub(crate) const PROXY_DIR_SENTINEL: &str = "/ft-proxy-has-no-directory";
 
 /// The `run-worker` argv prefix shared by the Unix and Windows spawn paths:
-/// the `--dir` value is the served directory (or the upload target for a
-/// DROP worker), or [`PROXY_DIR_SENTINEL`] for a directory-less (proxy/run/
-/// hook) worker. `command` is the Run worker's child command, passed after a
-/// trailing `--` so flag-looking child arguments are never parsed as worker
-/// flags; it must be empty for every kind that spawns no child. `keep` is the
-/// Hook worker's retention (`--keep`) and `max_size` the Drop worker's
-/// per-upload cap (`--max-size`); `None` for every other kind — all optional
-/// values ride the argv because the registry entry carries no fields for them
-/// (they are runtime configuration of the origin itself, not lifecycle
-/// state). The Drop worker's access token deliberately does NOT ride the
-/// argv: it is read from the service's private token file instead, so the
-/// secret never shows up in `ps`.
+/// `--dir` is the served/upload-target directory or [`PROXY_DIR_SENTINEL`];
+/// the Run worker's `command` rides after a trailing `--` (flag-looking child
+/// args are never parsed as worker flags); `keep`/`max_size` are the Hook/Drop
+/// runtime knobs (`None` for other kinds — the registry carries no fields for
+/// them). The Drop token deliberately does NOT ride the argv (`ps`
+/// visibility): the worker reads it from the service's private token file.
 fn run_worker_args(
     id: u64,
     name: &str,
@@ -125,14 +106,10 @@ pub fn spawn_drop_worker(id: u64, name: &str, dir: &Path, port: u16, max_size: u
 }
 
 /// Spawn the detached `run-worker` child for a service and return its pid,
-/// passing `command` (the `ft run -- <command>` child) to the worker.
-///
-/// The child is given a fresh process group and session, its stdin is wired
-/// to `/dev/null`, and its stdout + stderr are both pointed at the service's
-/// `worker.log` (opened in append mode so restarts accumulate rather than
-/// clobber). The child is intentionally *not* awaited and `kill_on_drop` is
-/// left disabled so it keeps running after this function returns and after
-/// the parent process exits.
+/// passing `command` (the `ft run -- <command>` child) to the worker. Fresh
+/// process group and session; stdin `/dev/null`; stdout+stderr appended to
+/// the service's `worker.log`. Not awaited and no `kill_on_drop`, so it keeps
+/// running after the parent exits.
 pub fn spawn_worker_with_command(
     id: u64,
     name: &str,
@@ -144,13 +121,12 @@ pub fn spawn_worker_with_command(
 }
 
 /// The platform-neutral setup behind every spawn: open the worker log twice
-/// (stdout and stderr each get an owned handle that the child can dup; append
-/// and create so restarts are additive — mode 0600 on Unix, since the worker
-/// log can contain request/paths detail), resolve the current executable, and
-/// wire the `run-worker` argv, the `FT_WORKER_TOKEN` handshake env, and the
-/// stdio. The platform-specific detachment — `setsid` pre_exec on Unix,
-/// creation flags on Windows — is layered on by the two `spawn_worker_full`
-/// variants, which share this builder so their setup cannot drift apart.
+/// (owned stdout/stderr handles, append+create so restarts are additive, 0600
+/// on Unix — the log can carry request/paths detail), resolve the current
+/// executable, and wire the argv, the `FT_WORKER_TOKEN` handshake env, and
+/// the stdio. The platform-specific detachment is layered on by the
+/// `spawn_worker_full` variants, which share this builder so their setup
+/// cannot drift apart.
 fn worker_command(
     id: u64,
     name: &str,
@@ -207,14 +183,11 @@ fn spawn_worker_full(
 
     let mut cmd = worker_command(id, name, dir, port, command, keep, max_size)?;
 
-    // New session via setsid(): the child becomes a session leader AND the
-    // leader of a fresh process group whose id equals its pid — so a later
-    // kill(-worker_pid) reaches the whole tree, including cloudflared and a
-    // run worker's command child, which inherit this group. We deliberately
-    // do NOT also call process_group(0): std applies that (via setpgid)
-    // before pre_exec, which would make the child a group leader first and
-    // cause setsid() to fail with EPERM. The error is propagated rather than
-    // swallowed so a failure to detach is loud.
+    // New session via setsid(): the child becomes a session/group leader
+    // (pgid = pid), so a later kill(-worker_pid) reaches the whole tree.
+    // NO process_group(0) as well: std applies that (setpgid) before
+    // pre_exec, which would make the child a group leader first and make
+    // setsid() fail with EPERM. Errors propagate so a failed detach is loud.
     unsafe {
         cmd.pre_exec(|| {
             nix::unistd::setsid()
@@ -227,25 +200,21 @@ fn spawn_worker_full(
         .spawn()
         .with_context(|| format!("spawning worker for service '{name}'"))?;
 
-    // Intentionally do NOT wait, and do NOT set kill_on_drop: the worker must
-    // outlive this process. Return the child's pid for the registry. On Unix a
-    // freshly spawned child always has a pid.
+    // Intentionally no wait and no kill_on_drop: the worker must outlive this
+    // process. On Unix a freshly spawned child always has a pid.
     let pid = child.id();
 
-    // Drop without reaping so the worker is not killed when this handle goes
-    // away; the child keeps running in its own session/process group.
+    // Drop without reaping: the child keeps running in its own session.
     std::mem::forget(child);
 
     Ok(pid)
 }
 
 /// Windows: spawn the `run-worker` child detached, in its own process group
-/// with no console, so it survives the parent `ft` exiting. Its stdout/stderr
-/// are pointed at the service's `worker.log` (append, mode-inherited). The
-/// worker assigns itself to a Job Object (see [`crate::worker::run`]), so
-/// `kill`-the-worker cascades to cloudflared and a run worker's command child,
-/// and a hard-killed worker still reaps its tree. `dir: None` spawns a
-/// directory-less (proxy/run/hook) worker (see the Unix variant).
+/// with no console, so it survives the parent `ft` exiting; stdout/stderr go
+/// to the service's `worker.log`. The worker assigns itself to a Job Object
+/// (see [`crate::worker::run`]), so killing the worker cascades to its tree
+/// and a hard-killed worker still reaps it.
 #[cfg(windows)]
 fn spawn_worker_full(
     id: u64,
@@ -260,9 +229,8 @@ fn spawn_worker_full(
 
     use anyhow::Context;
 
-    // CREATE_NEW_PROCESS_GROUP: the worker gets its own group so Ctrl-C in the
-    // parent's console does not reach it (it must outlive the parent).
-    // DETACHED_PROCESS: the worker does not inherit (or create) a console.
+    // Own group so Ctrl-C in the parent's console cannot reach it; no
+    // inherited/created console.
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const DETACHED_PROCESS: u32 = 0x0000_0004;
 
@@ -341,10 +309,8 @@ mod tests {
 
     #[test]
     fn run_worker_carries_the_child_command_after_a_separator() {
-        // A run worker's argv ends with `-- <command...>`: the separator is
-        // load-bearing, because a child argument that looks like a flag (e.g.
-        // `--verbose`) must reach the child verbatim instead of being parsed
-        // as a worker flag by the run-worker's own clap definition.
+        // The separator is load-bearing: flag-looking child args must reach
+        // the child verbatim, not run-worker's own clap definition.
         let args = run_worker_args(
             11,
             "dev",
@@ -377,10 +343,8 @@ mod tests {
 
     #[test]
     fn hook_worker_carries_its_retention_flag_before_the_separator() {
-        // A hook worker's argv carries `--keep N` as an ordinary worker flag:
-        // it belongs to ft (parsed by run-worker's own clap definition), so it
-        // must sit BEFORE the `--` separator — after it, everything belongs to
-        // a run worker's command child.
+        // `--keep` belongs to run-worker's own clap definition, so it sits
+        // BEFORE the `--` separator (after it, everything is the child's).
         let args = run_worker_args(12, "gh", None, 9000, &[], Some(50), None);
         assert_eq!(
             args,
@@ -402,11 +366,8 @@ mod tests {
 
     #[test]
     fn drop_worker_carries_its_directory_and_cap_before_the_separator() {
-        // A drop worker's argv carries the REAL upload target (unlike the
-        // directory-less kinds) and `--max-size N` before the `--` separator.
-        // The access token deliberately appears NOWHERE in the argv: it is
-        // read from the service's private token file, so `ps` never shows the
-        // bucket's write credential.
+        // The REAL upload target (unlike the directory-less kinds) and the
+        // cap flag before `--`; the access token appears NOWHERE in the argv.
         let args = run_worker_args(
             13,
             "share",

@@ -7,28 +7,20 @@
 //! until cloudflared exits, a terminating signal arrives, or (static, hook,
 //! and drop services) the server task ends.
 //!
-//! What to front is decided by the reserved registry entry's `kind`, not by
-//! the CLI args: a `Static` worker re-runs the START flow's directory safety
-//! checks, binds ft's own static server on `127.0.0.1` (fail-fast if the port
-//! cannot be bound), and tunnels it; a `Proxy` worker runs no server of its
-//! own — it points cloudflared straight at the operator's existing upstream
-//! on `http://127.0.0.1:<port>`; a `Run` worker spawns the operator's command
-//! (which fronts `http://127.0.0.1:<port>`) as a child of THIS process —
-//! group-isolated at spawn (see `proc::spawn_command_child`) so this worker's
-//! exit teardown takes the whole command subtree down with the tunnel; a
-//! `Hook` worker binds ft's own webhook receiver/inspector
-//! on `127.0.0.1:<port>` (like `Static`, an ft-owned origin inside the
-//! worker), recording every request to the service's request store; and a
-//! `Drop` worker binds ft's own upload-receiver origin on `127.0.0.1:<port>`
-//! (an ft-owned origin like Static/Hook) after re-running the directory
-//! checks on the upload target and reading the access token back from the
-//! service's private token file — fail-fast on either, like the hook's
-//! request store. cloudflared connects lazily, so a dead upstream is
-//! deliberately NOT a start-time failure here (a friendly pre-flight, if
-//! any, belongs to the CLI layer).
-//!
-//! All registry writes go through [`Registry::update`] (an exclusive flock), so
-//! the parent's writes and ours never clobber each other.
+//! What to front is decided by the reserved registry entry's `kind`, not the
+//! CLI args: `Static` re-runs the START directory checks and binds ft's own
+//! static server (fail-fast on bind); `Proxy` runs no server, pointing
+//! cloudflared straight at the operator's upstream; `Run` spawns the
+//! operator's command as a group-isolated child of THIS process (see
+//! `proc::spawn_command_child`) so exit teardown takes the whole command
+//! subtree down; `Hook` binds ft's own webhook receiver, recording requests
+//! to the service's store; `Drop` binds ft's own upload receiver after
+//! re-running the directory checks and reading the access token from the
+//! service's private token file (fail-fast on either). cloudflared connects
+//! lazily, so a dead upstream is deliberately NOT a start-time failure here
+//! (a friendly pre-flight belongs to the CLI layer). All registry writes go
+//! through [`Registry::update`] (an exclusive flock), so the parent's writes
+//! and ours never clobber each other.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -60,17 +52,12 @@ const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Run the worker to completion.
 ///
-/// `dir` is the `--dir` CLI value: the served directory for `Static` workers,
-/// the upload target for `Drop` workers, and
-/// [`crate::spawn::PROXY_DIR_SENTINEL`] for `Proxy`, `Run`, and `Hook`
-/// services (which have no directory — clap rejects an empty `--dir` value, so
-/// the spawn path passes that deliberately non-existent stand-in path; see
-/// the module docs for why the kind comes from the reserved registry entry
-/// rather than the CLI). `command` is the Run worker's child command
-/// (everything the spawn path placed after `--`); it is empty and ignored for
-/// every other kind. `keep` is the Hook worker's retention and `max_size` the
-/// Drop worker's per-upload cap (their `--keep`/`--max-size` argv flags);
-/// `None` for every other kind.
+/// `dir` is the `--dir` CLI value: the served directory for `Static`, the
+/// upload target for `Drop`, and [`crate::spawn::PROXY_DIR_SENTINEL`] for the
+/// directory-less kinds (see the module docs for why the kind comes from the
+/// registry entry, not the CLI). `command` is the Run worker's child command,
+/// `keep` the Hook retention, `max_size` the Drop per-upload cap — empty/`None`
+/// for every other kind.
 pub async fn run(
     id: u64,
     name: String,
@@ -80,12 +67,10 @@ pub async fn run(
     keep: Option<u16>,
     max_size: Option<u64>,
 ) -> Result<()> {
-    // Defense in depth against direct invocation: `run-worker` is an internal
-    // command only ever launched by `spawn::spawn_worker`, which sets
-    // `FT_WORKER_TOKEN`; reject anything without a non-empty value. This is a
+    // Defense in depth against direct invocation: `run-worker` is only ever
+    // launched by `spawn::spawn_worker`, which sets `FT_WORKER_TOKEN`. A
     // presence check only — the load-bearing safety checks (resolve_dir /
-    // is_sensitive_dir / port) are re-run below, inside this non-interactive
-    // worker, so neither direct invocation NOR any future caller can bypass them.
+    // is_sensitive_dir / port) are re-run below.
     if std::env::var_os("FT_WORKER_TOKEN")
         .map(|v| v.is_empty())
         .unwrap_or(true)
@@ -95,11 +80,9 @@ pub async fn run(
         );
     }
 
-    // Windows: place ourselves in a Job Object with KILL_ON_JOB_CLOSE, held for
-    // the lifetime of `run`. When the worker exits for any reason (graceful, ft
-    // kill, OOM, crash) the OS closes the handle and kills the whole tree
-    // (cloudflared) — the PR_SET_PDEATHSIG equivalent. On Unix this is a no-op
-    // (Linux uses PR_SET_PDEATHSIG in cloudflared::spawn).
+    // Windows: a KILL_ON_JOB_CLOSE Job Object held for the lifetime of `run`
+    // — when the worker exits for any reason, the OS kills the whole tree.
+    // The PR_SET_PDEATHSIG equivalent; no-op on Unix.
     #[cfg(windows)]
     let _job_guard = crate::proc::create_kill_on_close_job();
 
@@ -108,10 +91,9 @@ pub async fn run(
     let server_log = state.server_log(&name);
     let tunnel_log = state.tunnel_log(&name);
 
-    // Kind-agnostic port guard. A `Static` worker would otherwise bind a
-    // kernel-assigned port that mismatches the one the parent reserved and
-    // advertised; a `Proxy` worker's port IS the operator's upstream, where 0
-    // is never valid either.
+    // Kind-agnostic port guard: 0 would bind a kernel-assigned port that
+    // mismatches the reserved one (Static) or front an invalid upstream
+    // (Proxy).
     if port == 0 {
         let _ = Registry::update(&state, |reg| {
             reg.remove(id);
@@ -119,11 +101,9 @@ pub async fn run(
         anyhow::bail!("port 0 is reserved; the worker needs an explicit port");
     }
 
-    // Recover our registry entry (parent race). The parent reserves the entry
-    // before spawning us, but there is a window before the atomic save lands.
-    // Look up by id, not name: if a stale worker is still draining while the
-    // parent reuses this name for a new service, a name lookup would bind us to
-    // the wrong entry. The id is unique and stable.
+    // Recover our registry entry (the parent's atomic save may not have
+    // landed yet). Look up by id, not name: a name reused for a fresh service
+    // while a stale worker drains would bind us to the wrong entry.
     let deadline = std::time::Instant::now() + REGISTRY_LOOKUP_TIMEOUT;
     if !await_entry(&state, id, deadline).await? {
         // Dying worker mustn't leave a permanent stale entry; clear ours by id.
@@ -133,8 +113,7 @@ pub async fn run(
         anyhow::bail!("registry entry for service id={id} never appeared");
     }
 
-    // What this worker fronts comes from the reserved entry — the parent wrote
-    // the kind (and, for Static, the directory) before spawning us. A miss here
+    // What this worker fronts comes from the reserved entry. A miss here
     // means the entry vanished between the probe and this load (a concurrent
     // `ft kill`): exit rather than serve an untracked tunnel.
     let Some(entry) = Registry::load(&state)?.find(&id.to_string()).cloned() else {
@@ -144,20 +123,17 @@ pub async fn run(
         anyhow::bail!("registry entry for service id={id} vanished before start");
     };
     let kind = entry.kind;
-    // The static-origin flags (`--spa`/`--cors`/`--token`) were persisted on
-    // the reserved entry by the parent, so the detached worker re-applies
-    // exactly what the operator asked for — no flag rides the worker argv
-    // (which would duplicate this state and leak the token secret into `ps`).
-    // Meaningless for non-Static kinds, which never read it.
+    // The static-origin flags were persisted on the reserved entry by the
+    // parent, so the worker re-applies exactly what the operator asked for
+    // (no flag rides the argv — that would duplicate state and leak the token
+    // into `ps`). Meaningless for non-Static kinds, which never read it.
     let static_flags = entry.static_flags;
 
-    // Tracing setup sits AFTER the kind read rather than at the top of `run`:
-    // the server.log sink exists to receive tower_http request traces, which
-    // only a Static worker (the one that runs the static server) can ever
-    // emit — opening it for a Proxy worker would create a permanently empty
-    // file. Nothing is lost by the later init: the only pre-kind exits (the
-    // port guard and the entry wait) fail via `?`/bail to stderr, which the
-    // spawning parent already redirects into worker.log.
+    // Tracing sits AFTER the kind read: the server.log sink receives
+    // tower_http request traces, which only a Static worker can emit —
+    // opening it for a Proxy worker would create a permanently empty file.
+    // The pre-kind exits fail to stderr, which the parent redirects into
+    // worker.log anyway.
     init_tracing(
         &worker_log,
         (kind == ServiceKind::Static).then_some(server_log.as_path()),
@@ -165,47 +141,34 @@ pub async fn run(
 
     tracing::info!("worker starting: id={id} name={name:?} port={port}");
 
-    // SEC-1 / ARCH-05 / CLI-1 (Static and Drop): re-run the START flow's
-    // directory safety checks here, inside the detached worker, *before* we
-    // bind a public tunnel to the directory. `FT_WORKER_TOKEN` above is only
-    // a presence check (defense in depth against direct `run-worker`
-    // invocation); it does not by itself enforce anything. A worker is
-    // non-interactive, so a sensitive directory is refused UNCONDITIONALLY —
-    // `--yes` cannot apply, and there is no way to confirm. This closes the
+    // Static and Drop: re-run the START flow's directory safety checks here,
+    // inside the detached worker, *before* binding a public tunnel to the
+    // directory. A worker is non-interactive, so a sensitive directory is
+    // refused UNCONDITIONALLY (`--yes` cannot apply) — this closes the
     // foot-gun where `FT_WORKER_TOKEN=x ft run-worker --dir /etc` would
-    // publish `/etc` with zero confirmation (for a Drop worker, publish AND
-    // accept writes into).
-    //
-    // Proxy services skip these checks by construction: they publish no
-    // directory at all — the tunnel fronts a port the operator chose to run.
+    // publish `/etc` with zero confirmation. Proxy/Run/Hook publish no
+    // directory (the tunnel fronts a port/origin the operator chose).
     let dir = match kind {
         ServiceKind::Proxy => {
             tracing::info!("proxy worker: fronting existing upstream http://127.0.0.1:{port}");
             None
         }
         ServiceKind::Run => {
-            // The local origin is the command this worker is about to spawn
-            // (same process, same process group) — there is no directory to
-            // resolve or confirm: the operator explicitly asked for this
-            // command to be published, mirroring proxy's rationale.
+            // The origin is the command this worker is about to spawn — no
+            // directory to resolve or confirm.
             tracing::info!("run worker: will spawn the command as the local origin");
             None
         }
         ServiceKind::Hook => {
-            // The local origin is ft's own webhook receiver (an ft-owned
-            // origin like the static server, recording into the service's
-            // request store) — no directory to resolve or confirm.
+            // ft's own webhook receiver — no directory to resolve or confirm.
             tracing::info!("hook worker: recording requests behind the tunnel");
             None
         }
         ServiceKind::Drop => {
-            // The local origin is ft's own upload receiver (an ft-owned
-            // origin like static/hook) — but unlike hook it READS AND WRITES
-            // a directory: the upload target. So the START flow's directory
-            // safety checks are re-run here exactly like a Static worker's,
-            // with the sensitive-directory refusal applied unconditionally
-            // (a writable target is strictly more dangerous than a read-only
-            // publish, and a detached worker has no way to confirm).
+            // An ft-owned origin like static/hook, but it READS AND WRITES a
+            // directory: the checks run exactly like a Static worker's, with
+            // the sensitive-directory refusal unconditional (a writable
+            // target is strictly more dangerous than a read-only publish).
             let dir = match resolve_dir(&dir) {
                 Ok(d) => d,
                 Err(e) => {
@@ -252,9 +215,8 @@ pub async fn run(
         }
     };
 
-    // Self-register our pid once (the parent records it normally, but if it died
-    // between spawn and recording this keeps `ft kill` able to reach us). A
-    // single locked write — the probe loop above was read-only.
+    // Self-register our pid once (the parent records it normally, but if it
+    // died between spawn and record this keeps `ft kill` able to reach us).
     Registry::update(&state, |reg| {
         if let Some(svc) = reg.find_mut(&id.to_string())
             && svc.worker_pid == 0
@@ -263,11 +225,10 @@ pub async fn run(
         }
     })?;
 
-    // Local origin. Static, Hook, and Drop: bind the listener now (fail-fast)
-    // — if the port is taken, the worker exits immediately and the parent's
-    // poll detects the dead worker instead of waiting out the full timeout
-    // with a dead tunnel returning 502s. Proxy and Run: no server of our own
-    // to bind or run.
+    // Local origin. Static, Hook, and Drop: bind the listener now (fail-fast
+    // on a taken port) so the parent's poll detects a dead worker instead of
+    // waiting out the full timeout with a 502-ing tunnel. Proxy and Run run
+    // no server of their own.
     let (shutdown_tx, mut server_handle) = match kind {
         ServiceKind::Static => {
             let dir =
@@ -279,10 +240,9 @@ pub async fn run(
             serve_origin(router, listener)
         }
         ServiceKind::Hook => {
-            // The hook origin records into the service's request store;
-            // open it before binding so a broken service dir fails the
-            // worker (and the start) immediately instead of 500-ing every
-            // webhook once the tunnel is up.
+            // Open the request store before binding so a broken service dir
+            // fails the worker immediately instead of 500-ing every webhook
+            // once the tunnel is up.
             let keep = usize::from(keep.unwrap_or(hook_server::DEFAULT_KEEP));
             let hook_log = match open_request_store(&state, &name, keep) {
                 Ok(log) => log,
@@ -300,13 +260,11 @@ pub async fn run(
             serve_origin(hook_server::router(hook_log), listener)
         }
         ServiceKind::Drop => {
-            // The drop origin reads its access token from the service's
-            // private token file (written by the parent between reserve and
-            // spawn) and opens the upload bucket — both before binding, so a
-            // missing token file or an unresolvable bucket fails the worker
-            // (and the start) immediately instead of serving a tunnel that
-            // cannot authenticate uploads. The token deliberately does not
-            // travel in the worker's argv (`ps` visibility).
+            // Read the access token from the service's private token file
+            // (written by the parent between reserve and spawn) and open the
+            // bucket — both before binding, so a missing token or an
+            // unresolvable bucket fails the worker immediately instead of
+            // serving a tunnel that cannot authenticate uploads.
             let dir =
                 dir.expect("drop worker resolved its upload target above (kind match invariant)");
             let token = match open_drop_token(&state, &name) {
@@ -354,11 +312,9 @@ pub async fn run(
     }
 
     // Run only: open the command's log sink BEFORE spawning the child, so a
-    // failure to open worker.log can never orphan an already-running command.
-    // The command's output is teed into worker.log — the log `ft logs` already
-    // reads — so a run service's origin output stays visible without a fourth
-    // log file. Nothing is extracted from these lines: tunnel URLs come only
-    // from cloudflared's streams.
+    // failure can never orphan an already-running command. The output is teed
+    // into worker.log (the log `ft logs` already reads); nothing is extracted
+    // from these lines — tunnel URLs come only from cloudflared's streams.
     let command_log_writer = match kind {
         ServiceKind::Run => match crate::fsutil::open_private_append_async(&worker_log).await {
             Ok(f) => Some(Arc::new(Mutex::new(f))),
@@ -377,22 +333,16 @@ pub async fn run(
         _ => None,
     };
 
-    // Run only: spawn the operator's command as THIS worker's child. It is
-    // the local origin cloudflared will front, so it exists before the tunnel
-    // does. The child leads its own process group (see
-    // `proc::spawn_command_child`), so this worker's own exit paths — the two
-    // `shutdown_child_command` calls below — tear the WHOLE command subtree
-    // down (child + grandchildren like vite) via `killpg`, without ever
-    // signalling this worker's group (cloudflared lives there and is torn
-    // down separately). The monitor owns the child handle (exit observed +
-    // zombie reaped); the worker keeps the bare pid for registry + teardown.
+    // Run only: spawn the operator's command as THIS worker's child, before
+    // the tunnel exists. The child leads its own process group, so the exit
+    // paths below tear the WHOLE command subtree down (child + grandchildren
+    // like vite) via `killpg`, without ever signalling this worker's group
+    // (cloudflared lives there, torn down separately). The monitor owns the
+    // handle; the worker keeps the bare pid.
     let (command_pid, mut command_monitor, command_out) = match kind {
         ServiceKind::Run => match crate::proc::spawn_command_child(&command, port) {
             Ok(mut c) => {
-                // A freshly spawned, unreaped child always reports its pid
-                // (tokio's id() is only None after wait() reaped it, which
-                // cannot have happened yet — the monitor below is the first
-                // waiter).
+                // A freshly spawned, unreaped child always reports its pid.
                 let pid = c.id();
                 let stdout = c.stdout.take();
                 let stderr = c.stderr.take();
@@ -416,13 +366,10 @@ pub async fn run(
         ),
     };
 
-    // Record the command child's pid under the lock (Run only — the field the
-    // future orphan detection reads). Best-effort, NOT `?`: with the child
-    // already running, a registry-write failure here must not abort the
-    // worker and orphan it — the pid just stays unrecorded, and the
-    // keep-alive loop still tears everything down on exit like any other
-    // worker. A vanished entry (concurrent `ft kill` won the race) is handled
-    // by the normal channels.
+    // Record the command child's pid under the lock (Run only). Best-effort,
+    // NOT `?`: with the child already running, a registry-write failure must
+    // not abort the worker and orphan it — the exit paths still tear
+    // everything down.
     if let Some(pid) = command_pid
         && let Err(e) = Registry::update(&state, |reg| {
             if let Some(svc) = reg.find_mut(&id.to_string()) {
@@ -474,16 +421,14 @@ pub async fn run(
     let log_writer = match crate::fsutil::open_private_append_async(&tunnel_log).await {
         Ok(f) => Arc::new(Mutex::new(f)),
         Err(e) => {
-            // cloudflared is ALREADY live here (unlike the spawn-failure
-            // sibling above), and the tunnel may be publishing by now. Tear
-            // everything down in the normal-exit order — cloudflared first
-            // (SIGTERM → grace → SIGKILL + reap via the shared shutdown), then
-            // the command child's group, the server slot, and the registry
-            // entry. Without this, on macOS neither PR_SET_PDEATHSIG (Linux)
-            // nor the Job Object (Windows) exists to reap the children, so a
-            // bare `?` would orphan BOTH — and since publish_url never ran,
-            // tunnel_pid is unpublished, so prune/sanitize could never find
-            // the orphaned public tunnel to reap it either.
+            // cloudflared is ALREADY live here (unlike the spawn-failure arm
+            // above), so a bare `?` would orphan it: on macOS neither
+            // PR_SET_PDEATHSIG (Linux) nor the Job Object (Windows) exists
+            // to reap it, and publish_url never ran, so tunnel_pid is
+            // unpublished and prune/sanitize could never find the orphaned
+            // public tunnel either. Tear everything down in the normal-exit
+            // order: cloudflared, the command child's group, the server
+            // slot, the registry entry.
             tracing::error!(%e, "failed to open the tunnel log");
             cloudflared::shutdown(tunnel_pid, &mut child).await;
             crate::proc::shutdown_child_command(command_pid, &mut command_monitor).await;
@@ -517,20 +462,13 @@ pub async fn run(
 
     // Keep alive until cloudflared exits, the server task ends, the command
     // child (Run only) exits, or we're signalled. Polling server_handle
-    // ensures a serve failure (post-bind) is observed rather than silently
-    // lost. For a proxy worker the server slot holds [`no_server`]'s
-    // never-completing placeholder, so the server arm below can never fire —
-    // exactly the intent: the only local origin is the operator's, which this
-    // worker does not own and cannot observe. For a Run worker the command
-    // slot holds the monitor of the spawned child (its exit is the origin
-    // dying — the worker must tear the tunnel down instead of serving 502s
-    // forever), and for static/proxy workers a never-completing placeholder,
-    // mirroring the server slot trick.
-    //
-    // The signal arms are platform-split: on Unix we install explicit
-    // SIGTERM/SIGINT handlers (tokio::signal::unix); on Windows we fall back to
-    // ctrl_c(). Both arms are reachable — the background worker runs on every
-    // platform (Unix detaches via setsid, Windows via a Job Object).
+    // ensures a post-bind serve failure is observed. Proxy workers hold
+    // [`no_server`]'s never-completing placeholder in the server slot (the
+    // only origin is the operator's, which this worker cannot observe); Run
+    // workers hold the spawned child's monitor in the command slot (its exit
+    // is the origin dying — tear the tunnel down, not serve 502s forever).
+    // Unix installs explicit SIGTERM/SIGINT handlers; Windows falls back to
+    // ctrl_c().
     #[cfg(unix)]
     {
         let mut sig_term =
@@ -601,31 +539,24 @@ pub async fn run(
     }
 
     // The command child must NEVER outlive the worker's ownership of the
-    // tunnel — including the cloudflared-exited path (ReaderExit::ChildExited),
-    // where cloudflared is already reaped but a Run worker's command may still
-    // be running. The teardown covers the command's whole process GROUP (the
-    // grandchildren a direct-pid signal never reached). A no-op for other
-    // kinds (pending placeholder) and whenever the monitor already observed
-    // the child's exit.
+    // tunnel — including the cloudflared-exited path, where cloudflared is
+    // already reaped but a Run worker's command may still be running. Covers
+    // the command's whole process GROUP; a no-op for other kinds.
     crate::proc::shutdown_child_command(command_pid, &mut command_monitor).await;
 
-    // Abort the reader tasks AND await them. Aborting alone only schedules
-    // cancellation at the next `.await`; if a reader is mid-way through the
-    // synchronous `publish_url` -> `Registry::update` (fs2 lock_exclusive wait)
-    // it keeps running until that call returns, so a late publish_url could
-    // race the registry entry being removed by teardown. Awaiting the handle
-    // guarantees the task is actually gone (and surfaces any panic) before we
-    // proceed to drain the server.
+    // Abort the reader tasks AND await them: aborting only schedules
+    // cancellation at the next `.await`, and a reader mid-way through the
+    // synchronous `publish_url` -> `Registry::update` (fs2 lock wait) could
+    // otherwise race the entry being removed by teardown. Awaiting proves
+    // the task is gone (and surfaces panics).
     for task in reader_tasks {
         task.abort();
         let _ = task.await;
     }
 
-    // Drain in-flight requests (Static, Hook, and Drop — a proxy/run worker's
-    // server slot is the [`no_server`] placeholder, which `stop_server`
-    // aborts outright): fire the shutdown signal and let axum finish what
-    // it's serving, with a bounded timeout so a stuck request can't hang the
-    // worker. If the drain doesn't complete in time, abort as a fallback.
+    // Drain in-flight requests (Static/Hook/Drop; a proxy/run worker's
+    // placeholder is aborted outright): bounded so a stuck request cannot
+    // hang the worker, aborting on overrun.
     stop_server(kind, shutdown_tx, &mut server_handle).await;
 
     tracing::info!("worker exiting");
@@ -648,9 +579,8 @@ enum ReaderExit {
 
 /// Bind the local origin's listener on `127.0.0.1:port`, fail-fast: a bind
 /// failure removes the reserved entry and kills the worker, so the parent's
-/// poll detects the dead worker instead of waiting out the full timeout with
-/// a dead tunnel returning 502s. Loopback-only by construction — only the
-/// local cloudflared tunnel process can reach this server.
+/// poll sees it instead of waiting out the full timeout. Loopback-only by
+/// construction — only the local cloudflared process can reach this server.
 async fn bind_loopback_fail_fast(
     state: &StateDir,
     id: u64,
@@ -668,10 +598,9 @@ async fn bind_loopback_fail_fast(
     }
 }
 
-/// Open a hook service's request store (creating its service dir if needed).
-/// The dir exists since the reserve step, but the worker re-ensures it: a
-/// store that cannot live on disk would turn every recorded webhook into a
-/// 500 once the tunnel is up, so the failure belongs at startup.
+/// Open a hook service's request store (re-ensuring its service dir): a
+/// store that cannot live on disk would 500 every webhook once the tunnel is
+/// up, so the failure belongs at startup.
 fn open_request_store(
     state: &StateDir,
     name: &str,
@@ -687,11 +616,9 @@ fn open_request_store(
 }
 
 /// Read a drop service's access token back from its private token file (the
-/// parent wrote it between reserve and spawn). A MISSING file is the
-/// load-bearing failure: without the token the origin cannot authenticate a
-/// single upload, so it must not serve a public tunnel at all — fail fast at
-/// startup. A read ERROR is equally fatal (the file may be intact behind a
-/// permissions problem; silently serving without auth is never an option).
+/// parent wrote it between reserve and spawn). A MISSING file or a read
+/// ERROR is fatal: without the token the origin cannot authenticate a single
+/// upload, so it must never serve a public tunnel — fail fast at startup.
 fn open_drop_token(state: &StateDir, name: &str) -> Result<String> {
     let dir = state.service_dir(name);
     match drop_server::read_token(&dir) {
@@ -705,11 +632,9 @@ fn open_drop_token(state: &StateDir, name: &str) -> Result<String> {
     }
 }
 
-/// Spawn an origin's serve task with its graceful-shutdown channel: firing the
-/// sender later lets axum stop accepting and drain in-flight requests instead
-/// of aborting the server task (and dropping the requests) mid-flight. Shared
-/// by the static, hook, and drop arms, whose origins differ only in the
-/// router.
+/// Spawn an origin's serve task with its graceful-shutdown channel: firing
+/// the sender later lets axum stop accepting and drain in-flight requests
+/// instead of aborting mid-flight. Shared by the static/hook/drop arms.
 fn serve_origin(
     router: axum::Router,
     listener: tokio::net::TcpListener,
@@ -728,24 +653,18 @@ fn serve_origin(
 }
 
 /// Pure decision: should teardown actively signal/reap cloudflared for this
-/// exit reason? On `ChildExited` the select's `wait()` already reaped the child,
-/// so there is nothing to do. On every other reason cloudflared may still be
-/// alive and must be torn down. Extracted so the branching is unit-testable
-/// without a real child process.
+/// exit reason? On `ChildExited` the select's `wait()` already reaped it.
+/// Extracted so the branching is unit-testable without a real child.
 fn teardown_should_signal(exit_reason: &ReaderExit) -> bool {
     !matches!(exit_reason, ReaderExit::ChildExited)
 }
 
-/// The local-origin stand-in for workers that run no static server of their
-/// own — a proxy worker fronts the operator's existing upstream directly, and
-/// a run worker's origin is the spawned command child.
-///
-/// The keep-alive `select!` in [`run`] is written against a server task handle,
-/// so such workers park a never-completing task in that slot (the server arm
-/// can then never fire) together with a shutdown sender whose receiver is
-/// dropped, which makes sending on it a harmless no-op. [`stop_server`] aborts
-/// the placeholder instead of waiting out [`SERVER_SHUTDOWN_TIMEOUT`] on
-/// nothing.
+/// The local-origin stand-in for workers that run no server of their own
+/// (proxy fronts the operator's upstream; run's origin is the spawned
+/// command): a never-completing task in the `select!`'s server slot (the
+/// server arm can never fire) plus a shutdown sender whose dropped receiver
+/// makes sending a no-op. [`stop_server`] aborts the placeholder instead of
+/// waiting out [`SERVER_SHUTDOWN_TIMEOUT`] on nothing.
 fn no_server() -> (
     tokio::sync::oneshot::Sender<()>,
     tokio::task::JoinHandle<crate::error::Result<()>>,
@@ -757,16 +676,12 @@ fn no_server() -> (
     )
 }
 
-/// Stop the worker's local origin, if it runs one.
-///
-/// `Static`, `Hook`, and `Drop`: fire the graceful-shutdown signal and let
-/// axum finish what it's serving, bounded by [`SERVER_SHUTDOWN_TIMEOUT`] so a
-/// stuck request cannot hang the worker; on overrun the task is aborted as a
-/// fallback. `Proxy` and `Run`: there is no server — the handle is
-/// [`no_server`]'s placeholder, which never completes — so it is aborted
-/// outright rather than burning the timeout (a run's origin is the spawned
-/// command, torn down by [`crate::proc::shutdown_child_command`], not by this
-/// slot).
+/// Stop the worker's local origin, if it runs one. `Static`/`Hook`/`Drop`:
+/// fire the graceful-shutdown signal and drain, bounded by
+/// [`SERVER_SHUTDOWN_TIMEOUT`] (abort on overrun). `Proxy`/`Run`: no server —
+/// the [`no_server`] placeholder is aborted outright rather than burning the
+/// timeout (a run's origin is torn down by
+/// [`crate::proc::shutdown_child_command`], not this slot).
 async fn stop_server(
     kind: ServiceKind,
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
@@ -795,10 +710,9 @@ async fn stop_server(
 }
 
 /// Poll the registry read-only until our entry (by id) appears, or `deadline`
-/// passes. Takes NO advisory lock and does NOT rewrite the registry — an earlier
-/// revision used `Registry::update` here, which contended with the parent's
-/// pid-record and every concurrent `ft` command by rewriting all of
-/// registry.json every 100ms. Returns `false` if the entry never landed.
+/// passes. Takes NO advisory lock and does NOT rewrite the registry — an
+/// `Registry::update` here would contend with the parent's pid-record and
+/// every concurrent `ft` command. Returns `false` if the entry never landed.
 async fn await_entry(state: &StateDir, id: u64, deadline: std::time::Instant) -> Result<bool> {
     while std::time::Instant::now() < deadline {
         if Registry::load(state)?.find(&id.to_string()).is_some() {
@@ -809,10 +723,8 @@ async fn await_entry(state: &StateDir, id: u64, deadline: std::time::Instant) ->
     Ok(false)
 }
 
-/// If cloudflared may still be alive, shut it down and reap it — the actual
-/// signal/escalation/reap sequence lives in [`cloudflared::shutdown`], shared
-/// with the foreground flow. On `ChildExited` the select's `wait()` already
-/// reaped it, so nothing to do.
+/// If cloudflared may still be alive, shut it down and reap it via
+/// [`cloudflared::shutdown`] (shared with the foreground flow).
 async fn teardown_on_exit(
     exit_reason: ReaderExit,
     tunnel_pid: Option<u32>,
@@ -848,13 +760,10 @@ where
     loop {
         match lines.next_line().await {
             Ok(Some(line)) => {
-                // Coalesce the line + newline into one buffer and take the lock
-                // once for a single write_all. Append mode already makes each
-                // write_all atomic, so the per-line `flush().await` is dropped
-                // from the hot path (the OS flushes on close; tokio::fs also
-                // buffers). This cuts three awaits-under-lock down to one and
-                // removes the per-line fsync-flush that contended the two
-                // reader tasks (stdout + stderr).
+                // Coalesce line + newline into one buffer and take the lock
+                // once for a single write_all: append mode already makes each
+                // write atomic, so no per-line flush is needed on the hot
+                // path (which also stops the two reader tasks contending).
                 let mut buf = line.as_bytes().to_vec();
                 buf.push(b'\n');
                 {
@@ -882,9 +791,8 @@ where
 }
 
 /// Read a command child's output stream line by line, teeing each line into
-/// worker.log so `ft logs` shows the origin's own output. Unlike the
-/// cloudflared readers there is nothing to extract from these lines — tunnel
-/// URLs come only from cloudflared.
+/// worker.log so `ft logs` shows the origin's own output. Nothing is
+/// extracted from these lines — tunnel URLs come only from cloudflared.
 async fn pipe_command_stream<R>(reader: BufReader<R>, log_writer: Arc<Mutex<tokio::fs::File>>)
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -927,30 +835,26 @@ fn publish_url(ctx: &ReaderCtx, url: String) -> Result<()> {
 }
 
 /// Initialise `tracing`: the tower_http request-trace layer writes to
-/// `server.log` — when the caller passes one; only a Static worker has a
-/// server to trace, so a Proxy worker passes `None` and no file is created —
-/// while worker/ft traces go to `worker.log`. Fire-once; a no-op if a
-/// subscriber is already installed.
+/// `server.log` (only a Static worker has a server to trace, so others pass
+/// `None` and no file is created); worker/ft traces go to `worker.log`.
+/// Fire-once; a no-op if a subscriber is installed.
 fn init_tracing(worker_log: &Path, server_log: Option<&Path>) {
     use std::sync::Mutex;
     use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
     // tower_http request traces -> server.log; everything else -> worker.log.
-    // Each layer is Option-wrapped so a failure to open one log file just drops
-    // that sink rather than aborting tracing setup. Mode 0600 on Unix (the sink
-    // that would carry request URIs if its filter were ever raised); plain
-    // create on Windows via the cross-platform helper.
+    // Each layer is Option-wrapped so a failure to open one log file just
+    // drops that sink; 0600 on Unix (the sink that would carry request URIs
+    // if its filter were ever raised).
     //
-    // PERF-3: both filters are hardcoded literals — `EnvFilter::new` parses the
-    // string it is given and never consults `RUST_LOG`, so there is deliberately
-    // no environment knob. At the hardcoded `tower_http=info` floor,
-    // tower-http's default request span and its started/finished events (all
-    // emitted at debug) are filtered out, so server.log receives no per-request
-    // lines and no request URIs at all; the only tower_http output that can
-    // pass is the error-level "response failed" event, which carries no URL.
-    // A lower floor would feed per-request spans into an append-mode,
-    // never-rotated file — exactly what PERF-3 avoids — so raising the level
-    // is a source change, on purpose.
+    // PERF-3: both filters are hardcoded literals — `EnvFilter::new` never
+    // consults `RUST_LOG`, so there is deliberately no environment knob. At
+    // the `tower_http=info` floor the per-request spans/events (all debug)
+    // are filtered out, so server.log receives no request URIs at all — only
+    // the error-level "response failed" event can pass, which carries no
+    // URL. A lower floor would feed per-request spans into an append-mode,
+    // never-rotated file, so raising the level is a source change, on
+    // purpose.
     let server_layer = server_log
         .and_then(|path| crate::fsutil::open_private_append(path).ok())
         .map(|f| {
@@ -1004,12 +908,10 @@ mod tests {
     }
 
     /// A throwaway reader context: `publish_url` only reads `id`, `name`,
-    /// `state`, and `tunnel_pid`, so `log_writer`/`url_found` are best-effort.
-    /// The log file is opened from a std handle (we never write to it in these
-    /// tests) so construction is synchronous and non-flaky.
+    /// `state`, and `tunnel_pid`; the log file is never written to here.
     async fn reader_ctx(state: StateDir, id: u64, tunnel_pid: Option<u32>) -> ReaderCtx {
-        // ensure_service_dir creates the parent of tunnel.log so the open below
-        // succeeds; publish_url never writes to it.
+        // ensure_service_dir creates the parent of tunnel.log so the open
+        // below succeeds.
         state
             .ensure_service_dir("test-svc")
             .expect("ensure service dir");
@@ -1061,8 +963,8 @@ mod tests {
         let state = StateDir::new_at(tmp.path().to_path_buf());
         state.ensure().expect("ensure state dir");
 
-        // Pre-existing tunnel_pid must NOT be overwritten (race between two
-        // readers: only the first wins).
+        // Pre-existing tunnel_pid must NOT be overwritten (two-reader race:
+        // only the first wins).
         Registry::update(&state, |reg| {
             let mut svc = seed_service(9, "svc");
             svc.tunnel_pid = Some(1111);
@@ -1085,9 +987,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_url_is_a_noop_for_a_vanished_id() {
-        // A vanished id (e.g. parent already removed our entry) must NOT panic
-        // and must NOT create a stray entry — publish_url only mutates in the
-        // Some(svc) branch.
+        // A vanished id must not panic and must not create a stray entry.
         let tmp = tempdir().expect("state dir");
         let state = StateDir::new_at(tmp.path().to_path_buf());
         state.ensure().expect("ensure state dir");
@@ -1123,18 +1023,15 @@ mod tests {
         let state = StateDir::new_at(tmp.path().to_path_buf());
         state.ensure().expect("ensure state dir");
 
-        // Seed a *different* id so the loop actually loads the registry and
-        // searches — an empty registry would make "not found" trivially true
-        // without ever exercising the poll path.
+        // Seed a *different* id so the loop actually loads and searches; a
+        // deadline one poll-interval out runs the body once (load -> search
+        // -> sleep) before timing out (a past deadline would skip the body
+        // entirely, making the test vacuous).
         Registry::update(&state, |reg| {
             reg.services.push(seed_service(11, "alpha"));
         })
         .expect("seed");
 
-        // A deadline one poll-interval in the future: the loop runs its body
-        // once (load -> search -> sleep), finds id 5 absent, then times out
-        // and returns false. (A past deadline would skip the body entirely,
-        // making the test vacuous.)
         let deadline = std::time::Instant::now() + REGISTRY_LOOKUP_INTERVAL;
         let found = await_entry(&state, 5, deadline).await.expect("no io error");
         assert!(!found);
@@ -1142,8 +1039,8 @@ mod tests {
 
     #[tokio::test]
     async fn await_entry_finds_by_id_not_name() {
-        // If a name is reused for a fresh service while a stale worker drains,
-        // the id lookup must bind to OUR entry, not a name collision.
+        // A name reused while a stale worker drains must not confuse the id
+        // lookup.
         let tmp = tempdir().expect("state dir");
         let state = StateDir::new_at(tmp.path().to_path_buf());
         state.ensure().expect("ensure state dir");
@@ -1163,12 +1060,11 @@ mod tests {
 
     #[test]
     fn teardown_should_signal_only_on_signal_or_server_ended() {
-        // ChildExited: the select already reaped cloudflared, so teardown is a
-        // no-op.
+        // ChildExited: the select already reaped cloudflared.
         assert!(!teardown_should_signal(&ReaderExit::ChildExited));
-        // Signal / ServerEnded / CommandExited: cloudflared may still be alive
-        // -> must signal. (A dead command child is itself a teardown trigger:
-        // the origin is gone, so the tunnel must follow it down.)
+        // Everything else: cloudflared may still be alive -> must signal. (A
+        // dead command child is itself a teardown trigger: the origin is
+        // gone, so the tunnel must follow it down.)
         assert!(teardown_should_signal(&ReaderExit::Signal));
         assert!(teardown_should_signal(&ReaderExit::ServerEnded));
         assert!(teardown_should_signal(&ReaderExit::CommandExited));
@@ -1176,16 +1072,12 @@ mod tests {
 
     #[tokio::test]
     async fn stop_server_aborts_proxy_placeholder_without_waiting_out_the_timeout() {
-        // A proxy worker owns no server: stop_server must abort the parked
-        // placeholder immediately. Waiting out SERVER_SHUTDOWN_TIMEOUT here
-        // would hang every proxy worker teardown by that much.
+        // A proxy worker owns no server: the placeholder must be aborted
+        // immediately, not waited out.
         let (shutdown_tx, mut server_handle) = no_server();
         let started = std::time::Instant::now();
         stop_server(ServiceKind::Proxy, shutdown_tx, &mut server_handle).await;
 
-        // The placeholder is gone: awaiting it resolves right away as
-        // cancelled (it would otherwise stay pending forever), and the whole
-        // call stayed well under the drain bound.
         let err = server_handle
             .await
             .expect_err("proxy placeholder must be aborted, still pending");
@@ -1195,11 +1087,8 @@ mod tests {
 
     #[tokio::test]
     async fn stop_server_aborts_a_run_placeholder_without_waiting_out_the_timeout() {
-        // Same contract as the proxy worker, Run flavour: a run worker's
-        // origin is the spawned command child (torn down elsewhere), so its
-        // parked server placeholder must be aborted immediately — a
-        // kind-matched guard that forgot Run would silently add the full
-        // drain timeout to every run worker's exit.
+        // Same contract, Run flavour: a kind guard that forgot Run would
+        // silently add the full drain timeout to every run worker's exit.
         let (shutdown_tx, mut server_handle) = no_server();
         let started = std::time::Instant::now();
         stop_server(ServiceKind::Run, shutdown_tx, &mut server_handle).await;
@@ -1213,11 +1102,9 @@ mod tests {
 
     #[tokio::test]
     async fn stop_server_drains_a_hook_origin_like_a_static_one() {
-        // A hook worker runs an ft-owned origin in-process (like static), so
-        // its teardown must take the DRAIN path — firing the shutdown signal
-        // and awaiting a bounded graceful exit — not an abort: the drain lets
-        // an in-flight recording finish writing instead of dropping it
-        // mid-append. This pins the Hook arm of stop_server's kind split.
+        // A hook worker runs an ft-owned origin in-process, so its teardown
+        // must DRAIN (an in-flight recording finishes writing) rather than
+        // abort — pins the Hook arm of the kind split.
         let tmp = tempdir().expect("tempdir");
         let store = crate::hook_server::HookLog::load(
             tmp.path().join("requests.json"),
@@ -1236,10 +1123,10 @@ mod tests {
         stop_server(ServiceKind::Hook, shutdown_tx, &mut server_handle).await;
         assert!(started.elapsed() < SERVER_SHUTDOWN_TIMEOUT);
 
-        // The origin is gone for real: the drained listener no longer accepts
-        // connections. (The JoinHandle is deliberately NOT awaited again —
-        // stop_server's bounded await may already have driven the serve task
-        // to completion, and polling a completed JoinHandle panics.)
+        // The origin is gone for real: the drained listener no longer
+        // accepts connections. (The JoinHandle is deliberately NOT awaited
+        // again — stop_server's bounded await may already have driven the
+        // task to completion, and polling a completed JoinHandle panics.)
         assert!(
             tokio::net::TcpStream::connect(addr).await.is_err(),
             "the hook origin must stop accepting after the drain"
@@ -1248,11 +1135,8 @@ mod tests {
 
     #[tokio::test]
     async fn stop_server_drains_a_drop_origin_like_a_static_one() {
-        // Same contract as the hook drain test, Drop flavour: a drop worker
-        // runs an ft-owned origin in-process, so its teardown must take the
-        // DRAIN path (an in-flight upload finishes writing) — pinning the
-        // Drop arm of stop_server's kind split. A kind split that forgot Drop
-        // would abort mid-upload instead.
+        // Same contract, Drop flavour: DRAIN so an in-flight upload finishes
+        // writing — pins the Drop arm of the kind split.
         let tmp = tempdir().expect("tempdir");
         let store = crate::drop_server::DropStore::open(
             tmp.path(),
