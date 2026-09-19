@@ -75,6 +75,9 @@ impl ServiceKind {
 /// put the `token` secret in `ps` output. Meaningless for non-Static kinds
 /// (the CLI only accepts them on the implicit START; `ft proxy` structurally
 /// has none).
+///
+/// See also `static_server`'s module docs — the normative semantics for
+/// `--spa`/`--cors`/`--token` (this doc and the CLI help summarize them).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StaticFlags {

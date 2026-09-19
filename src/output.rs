@@ -19,7 +19,8 @@ pub fn reset_sigpipe() {
     #[cfg(unix)]
     {
         use nix::sys::signal::{SigHandler, Signal, signal};
-        // Once, before any threads/tasks exist: no signal-safety concerns.
+        // Before any ft task or printing exists; sigaction is process-wide
+        // and thread-safe, so tokio's already-running workers are no concern.
         let _ = unsafe { signal(Signal::SIGPIPE, SigHandler::SigDfl) };
     }
 }
