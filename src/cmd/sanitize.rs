@@ -1,56 +1,40 @@
 //! The `sanitize` command: remove every dangling service, not just stale ones.
 //!
-//! `ft prune` reconciles the registry with the *worker* processes it records:
-//! an entry whose worker died is dropped. But with `ft proxy <port>` the
-//! tunnel fronts a server the OPERATOR runs, and that server can die while
-//! the worker and `cloudflared` stay up. The registry then lists a
-//! healthy-looking service (worker alive, URL published) whose tunnel 502s
-//! every request — and prune's rule never fires, because as far as it can
-//! see the worker is fine. `ft sanitize` removes ALL dangling services:
+//! `ft prune` reconciles the registry with the *worker* processes it records.
+//! But with `ft proxy <port>` the tunnel fronts a server the OPERATOR runs,
+//! and that server can die while the worker and `cloudflared` stay up — the
+//! registry then lists a healthy-looking service whose tunnel 502s every
+//! request, and prune's rule never fires. `ft sanitize` removes ALL dangling
+//! services:
 //!
 //! - **Stale entries** — exactly prune's rule (see `classify` in
 //!   `cmd/prune.rs`): the recorded worker no longer runs (background: the
 //!   cmdline-aware `pid_alive`; foreground: `pid_matches(pid,
 //!   "--foreground")` — never `Service::status`'s plain `process_exists`,
 //!   which a recycled pid satisfies), or a pid-0 reservation whose
-//!   `START_GRACE` expired. Fresh pid-0 reservations inside the grace
-//!   window are KEPT (a start is in progress), and orphaned `cloudflared`
-//!   children of stale entries are best-effort reaped, gated on a cmdline
-//!   identity check.
-//! - **Zombie-upstream entries** — the worker is alive and the service is
-//!   Running (public URL discovered), but nothing answers on
-//!   `127.0.0.1:<service.port>`. For `kind == Proxy` this is the headline
-//!   case: the operator's upstream died and the tunnel 502s every request.
-//!   For `kind == Static` the worker hosts the server in-process, so a live
-//!   worker with a dead port is an anomaly — cleaned too, with wording that
-//!   says so. A port only counts as dead after failing a DOUBLE probe
-//!   (probe, wait ~750 ms, probe again), so a dev server that is mid-restart
-//!   is not reaped; services still `Starting` with a live worker are left
-//!   alone (their port may not be bound yet).
+//!   `START_GRACE` expired. Fresh pid-0 reservations are KEPT, and orphaned
+//!   `cloudflared` children of stale entries are best-effort reaped, gated on
+//!   a cmdline identity check.
+//! - **Zombie-upstream entries** — worker alive, service Running, but nothing
+//!   answers on `127.0.0.1:<port>`. The headline case is `kind == Proxy`
+//!   (the operator's upstream died); Static/Hook/Drop workers host the origin
+//!   in-process, so a live worker with a dead port is an anomaly — cleaned
+//!   too, with wording that says so. A port only counts as dead after a
+//!   DOUBLE probe (probe, wait ~750 ms, probe again) so a mid-restart dev
+//!   server is not reaped; still-Starting services with a live worker are
+//!   left alone.
 //!
-//! Safety rules (mirroring `cmd/kill.rs`, the other command that signals
-//! live workers):
-//!
-//! - All port probing happens BEFORE the registry lock is taken — a dead
-//!   double-probe can take ~1.75 s worst case, and the lock must never be
-//!   held that long. Inside `Registry::update`, each candidate is re-verified
-//!   against the freshly loaded registry (same id AND same `worker_pid`)
-//!   before it is removed: a concurrent `ft kill` / `ft start` may have
-//!   removed the entry or recorded a different pid between the snapshot and
-//!   the lock.
-//! - All signalling happens OUTSIDE the lock, and only for processes
-//!   confirmed ours via cmdline identity. A zombie's background worker tree
-//!   is torn down with kill.rs's `TeardownKind::BackgroundGroup` semantics:
-//!   `shutdown_process_group(worker_pid)` only when the worker still matches
-//!   `run-worker` or its tunnel still matches `cloudflared` (cloudflared
-//!   lives in the worker's group). Stale entries get prune's best-effort
-//!   orphan reap, gated on `pid_matches(tpid, "cloudflared")`.
-//! - A FOREGROUND service is never killed by sanitize: its worker is an
-//!   `ft` process attached to the operator's own terminal, so an
-//!   upstream-dead foreground service is reported as skipped ("stop it with
-//!   Ctrl-C in its terminal") instead of removed. Foreground entries that
-//!   are merely stale follow the stale rule exactly like prune (no live
-//!   signalling is involved beyond the orphan-reap gate).
+//! Safety rules (mirroring `cmd/kill.rs`): all port probing happens BEFORE
+//! the registry lock (a dead double-probe can take ~1.75 s); inside
+//! `Registry::update` each candidate is re-verified against the freshly
+//! loaded registry (same id AND same `worker_pid`) before removal, so a
+//! concurrent `ft kill`/`ft start` wins; all signalling happens OUTSIDE the
+//! lock and only for processes confirmed ours via cmdline identity
+//! (`shutdown_process_group(worker_pid)` only when the worker still matches
+//! `run-worker` or its tunnel still matches `cloudflared`; stale entries get
+//! prune's orphan-reap gate). A FOREGROUND service is never killed by
+//! sanitize — an upstream-dead foreground service is reported as skipped
+//! ("stop it with Ctrl-C in its terminal") instead.
 
 use std::time::Duration;
 
@@ -68,14 +52,10 @@ use crate::state::StateDir;
 /// sanitize pass over one dead proxy still finishes promptly.
 const REPROBE_DELAY: Duration = Duration::from_millis(750);
 
-/// Why a zombie-upstream entry is dangling.
-///
-/// Split by kind because the two zombies tell different stories: a Proxy
-/// fronts a port the operator owns (the server behind it dying is the
-/// expected failure mode), while a Static worker IS the server, so its port
-/// dying underneath a live worker contradicts the model — an anomaly. (A
-/// Hook worker also hosts its origin in-process, so it shares the Static
-/// story.)
+/// Why a zombie-upstream entry is dangling. Split by kind: a Proxy fronts a
+/// port the operator owns (the upstream dying is the expected failure mode);
+/// a Static/Hook/Drop worker IS the origin, so a dead port under a live
+/// worker contradicts the model — an anomaly.
 enum ZombieReason {
     /// `kind == Proxy`: the operator's upstream server died; the tunnel 502s
     /// every request.
@@ -123,19 +103,12 @@ enum Action {
 }
 
 /// Whether the recorded worker is still alive, under prune's PID-reuse-safe
-/// rule rather than [`Service::status`]'s display-oriented one.
-///
-/// This is exactly the liveness half of prune's `classify` (see
-/// `cmd/prune.rs`): background workers through the cmdline-aware
-/// [`proc::pid_alive`]; foreground workers through
-/// `pid_matches(pid, "--foreground")`, because a foreground service's worker
-/// is the `ft` process itself, whose cmdline lacks the `run-worker` token.
-/// [`Service::status`] cannot be used for the foreground arm: it probes with
-/// plain [`proc::process_exists`] (no identity check), so a dead foreground
-/// entry whose pid was recycled by an unrelated process would read Running —
-/// and sanitize would then skip it forever, telling the operator to Ctrl-C a
-/// process that is not the service. Returns `None` for a pid-0 reservation
-/// (nothing has been recorded to probe).
+/// rule: background through the cmdline-aware [`proc::pid_alive`], foreground
+/// through `pid_matches(pid, "--foreground")` (the foreground worker is the
+/// `ft` process itself, whose cmdline lacks the `run-worker` token).
+/// [`Service::status`] cannot be used for the foreground arm: its plain
+/// [`proc::process_exists`] is satisfied by a recycled pid, which would strand
+/// the entry in SkipForeground forever. `None` = pid-0 reservation.
 fn worker_alive(svc: &Service) -> Option<bool> {
     if svc.worker_pid == 0 {
         return None;
@@ -147,31 +120,21 @@ fn worker_alive(svc: &Service) -> Option<bool> {
     })
 }
 
-/// Decide the fate of one service from injected inputs.
-///
-/// `worker_alive` is the recorded worker's liveness under prune's
-/// PID-reuse-safe rule (computed by [`worker_alive`]): `None` means a pid-0
-/// reservation (nothing recorded yet), `Some(false)` means the recorded pid
-/// is dead or no longer ours — a recycled foreground pid lands HERE, in the
-/// stale path, not in the zombie path — and `Some(true)` means a live
-/// worker, which is Running when a public URL is published and still
-/// Starting otherwise. `port_dead` is the origin double-probe result: `None`
-/// means "not probed" (the service is not Running), `Some(true)` means both
-/// probes failed. With both inputs supplied this is a pure decision table,
-/// which is what makes it unit-testable without sockets or signals.
+/// Decide the fate of one service from injected inputs — a pure decision
+/// table, which is what makes it unit-testable without sockets or signals.
+/// `worker_alive`: `None` = pid-0 reservation, `Some(false)` = dead or
+/// recycled pid (stale path), `Some(true)` = live worker (Running iff a
+/// public URL is published). `port_dead`: `None` = not probed, `Some(true)`
+/// = both probes failed.
 fn plan(svc: &Service, worker_alive: Option<bool>, port_dead: Option<bool>) -> Action {
     // --- rule 1: prune's staleness rule --------------------------------------
     match worker_alive {
-        // The recorded worker is gone — or its pid was recycled by an
-        // unrelated process: both probes behind `worker_alive` are
-        // cmdline-aware, so a recycled pid reads dead here even where
-        // `Service::status`'s plain `process_exists` would have shown a
-        // live foreground "worker".
+        // Dead or recycled: both probes behind `worker_alive` are
+        // cmdline-aware, so a recycled pid reads dead here.
         Some(false) => return Action::PruneStale,
         // A pid-0 reservation: the grace split alone decides — fresh = a
-        // start in progress (keep), expired = abandoned (prune). Reaping a
-        // fresh one would orphan the just-spawned worker (the M1 race);
-        // keeping an expired one leaves a "starting" ghost.
+        // start in progress (keep; reaping would orphan the worker, M1),
+        // expired = abandoned (prune).
         None => {
             return if svc.start_in_progress() {
                 Action::Keep
@@ -190,22 +153,19 @@ fn plan(svc: &Service, worker_alive: Option<bool>, port_dead: Option<bool>) -> A
     }
 
     // --- rule 2: zombie upstream ---------------------------------------------
-    // Reached only when Running (live worker, published URL). Only a DEAD
-    // double-probe counts; an answering port — or no probe at all — keeps
-    // the service.
+    // Reached only when Running. Only a DEAD double-probe counts; an
+    // answering port — or no probe at all — keeps the service.
     match port_dead {
         Some(true) if svc.foreground => Action::SkipForeground,
         Some(true) => Action::RemoveZombie {
             reason: match svc.kind {
-                // A Run service's origin is the command ft spawned fronting
-                // its port: if the worker+tunnel live but the port is dead,
-                // the command exited — the same "upstream died" story as a
-                // proxy. Keep in sync if the kinds' zombie semantics diverge.
+                // A Run service's origin is the command ft spawned: if the
+                // worker+tunnel live but the port is dead, the command exited
+                // — the same "upstream died" story as a proxy.
                 ServiceKind::Proxy | ServiceKind::Run => ZombieReason::UpstreamDead,
-                // A3/A4 compile arms (semantically final): Hook and Drop
-                // workers host their ft-owned origins in-process exactly like
-                // a Static worker, so a dead port under a live worker is the
-                // same in-process anomaly.
+                // Hook and Drop workers host their ft-owned origins
+                // in-process exactly like a Static worker — the same
+                // in-process anomaly.
                 ServiceKind::Static | ServiceKind::Hook | ServiceKind::Drop => {
                     ZombieReason::InProcessServerDead
                 }
@@ -238,15 +198,11 @@ fn stale_reason(svc: &Service) -> String {
 }
 
 /// Remove, under the registry lock held by [`Registry::update`], every
-/// candidate whose entry is still the one the snapshot judged.
-///
-/// The re-verification is the whole point of this closure: the snapshot was
-/// taken unlocked (so the slow port probes never hold the lock), and a
-/// concurrent `ft kill` / `ft start` may have changed the registry in
-/// between. A candidate goes only when the live registry still holds the
-/// SAME id AND the SAME `worker_pid` — the identity the decision was made
-/// against; anything else is left entirely alone (the concurrent writer
-/// wins, and its own output stays truthful).
+/// candidate whose entry is still the one the snapshot judged: the snapshot
+/// was taken unlocked (so the slow port probes never hold the lock), so a
+/// candidate goes only when the live registry still holds the SAME id AND the
+/// SAME `worker_pid` — the identity the decision was made against. Anything
+/// else is left alone (the concurrent writer wins).
 fn apply<'a>(reg: &mut Registry, candidates: &'a [Judgment]) -> Vec<(Service, &'a Action)> {
     let mut removed = Vec::new();
     for c in candidates {
@@ -264,17 +220,12 @@ fn apply<'a>(reg: &mut Registry, candidates: &'a [Judgment]) -> Vec<(Service, &'
 }
 
 /// True when `port` is dead under the DOUBLE probe: [`origin_alive`] once,
-/// and — only if that failed — again after [`REPROBE_DELAY`]; only
-/// still-dead counts.
-///
-/// A single refused connect is not proof the origin is gone: a dev server
-/// restarting (watch-mode relaunch, a framework rebinding its listener)
-/// drops the port for a moment and comes back, and its tunnel is perfectly
-/// healthy again. Two probes ~750 ms apart ride that window out. The probes
-/// reuse doctor's `origin_alive` (itself kept in sync with proxy.rs's
-/// private `upstream_alive`) so no third copy of the loopback probe exists.
-/// Like doctor, the blocking `std::net` connect is acceptable: this runs
-/// before the registry lock is taken, with no other concurrent I/O.
+/// and — only if that failed — again after [`REPROBE_DELAY`]. A single
+/// refused connect is not proof the origin is gone: a restarting dev server
+/// drops the port briefly and comes back healthy; two probes ~750 ms apart
+/// ride that window out. Reuses doctor's `origin_alive` (kept in sync with
+/// proxy.rs's pre-flight); the blocking connect is fine here — it runs
+/// before the registry lock, with no other concurrent I/O.
 async fn origin_dead_after_double_probe(port: u16) -> bool {
     if origin_alive(port) {
         return false;
@@ -284,33 +235,24 @@ async fn origin_dead_after_double_probe(port: u16) -> bool {
 }
 
 /// Remove every dangling service: stale entries (prune's rule) plus
-/// zombie-upstream entries whose tunnel fronts a dead port.
-///
-/// The pipeline: snapshot and probe everything BEFORE the registry lock
-/// (double-probes are slow), remove atomically and re-verified UNDER the
-/// lock, then signal OUTSIDE it, gated on cmdline identity — see the module
-/// docs for the full safety contract. Foreground services are never killed:
-/// an upstream-dead foreground service is reported as left alone. Exits 0
-/// whenever the command ran; only a broken environment (corrupt registry,
-/// unresolvable state dir) errors through the normal Result path.
+/// zombie-upstream entries whose tunnel fronts a dead port. Pipeline:
+/// snapshot and probe BEFORE the lock, remove re-verified UNDER it, signal
+/// OUTSIDE it — see the module docs for the safety contract. Exits 0
+/// whenever the command ran; only a broken environment errors.
 pub async fn run() -> Result<()> {
     let state = StateDir::new()?;
 
     // --- snapshot + probe: strictly BEFORE the registry lock -----------------
-    // A dead double-probe can take ~1.75 s worst case (two 500 ms probe
-    // timeouts plus the 750 ms gap; a loopback refusal is usually answered
-    // instantly, so ~750 ms is typical); the lock must never be held that
-    // long, so the registry is read unlocked here and every removal
-    // re-verified under the lock later.
+    // A dead double-probe can take ~1.75 s worst case; the lock must never
+    // be held that long.
     let snapshot = Registry::load(&state)?;
 
     if snapshot.services.is_empty() {
-        // Fresh machine: no registry at all (load falls back to an empty
-        // default). Nothing was judged, so return before `Registry::update`:
-        // its lock-file creation would fail against a state dir that does
-        // not exist yet (the same raw-error guard `ft kill` makes with its
-        // unlocked pre-read). A nothing-to-clean sanitize stays a no-op —
-        // not an error, and not state creation.
+        // Fresh machine: no registry at all. Return before `Registry::update`:
+        // its lock-file creation would fail against a state dir that does not
+        // exist yet (the same raw-error guard `ft kill` makes). A
+        // nothing-to-clean sanitize stays a no-op — no error, no state
+        // creation.
         output::print_sanitized(&[], &[]);
         return Ok(());
     }
@@ -319,10 +261,9 @@ pub async fn run() -> Result<()> {
     let mut skipped_foreground = Vec::new();
     for svc in &snapshot.services {
         let alive = worker_alive(svc);
-        // Probe the origin only when the service is Running (worker alive
-        // AND URL published): a Starting worker's port may not be bound yet,
-        // and a dead worker already explains any dead port (probing it would
-        // just repeat the stale finding).
+        // Probe the origin only when the service is Running: a Starting
+        // worker's port may not be bound yet, and a dead worker already
+        // explains any dead port.
         let port_dead = if let Some(true) = alive
             && svc.public_url.is_some()
         {
@@ -354,9 +295,8 @@ pub async fn run() -> Result<()> {
         match action {
             Action::PruneStale => {
                 // Best-effort reap of an orphaned cloudflared whose worker is
-                // gone (it normally dies via PDEATHSIG / its job object, but
-                // a host reboot beats both). Gated on the `cloudflared`
-                // cmdline identity, exactly like prune.
+                // gone (a host reboot beats PDEATHSIG), gated on the
+                // `cloudflared` cmdline identity like prune.
                 if let Some(tpid) = svc.tunnel_pid
                     && proc::pid_matches(tpid, "cloudflared")
                 {
@@ -365,19 +305,16 @@ pub async fn run() -> Result<()> {
                 bullets.push((svc.name.clone(), stale_reason(svc)));
             }
             Action::RemoveZombie { reason } => {
-                // Foreground zombies were classified SkipForeground above and
-                // are never removed, so a removed zombie is background by
-                // construction. Assert it anyway: group-signalling a
-                // foreground service would kill the operator's shell (its
-                // worker shares the shell's process group).
+                // Foreground zombies were classified SkipForeground above,
+                // so a removed zombie is background by construction; the
+                // assert guards the shell-safety invariant.
                 debug_assert!(
                     !svc.foreground,
                     "foreground zombie reached teardown — sanitize must skip it"
                 );
-                // kill.rs's TeardownKind::BackgroundGroup semantics: the group
-                // is signalled only when at least one member is confirmed
-                // ours (cmdline match) — cloudflared lives in the worker's
-                // group, so shutting the group down reaches both.
+                // kill.rs's BackgroundGroup semantics: signal the group only
+                // when a member is confirmed ours (cloudflared lives in the
+                // worker's group, so the group kill reaches both).
                 let worker_ours = proc::pid_matches(svc.worker_pid, "run-worker");
                 let cloudflared_ours = svc
                     .tunnel_pid
@@ -388,9 +325,8 @@ pub async fn run() -> Result<()> {
                 }
                 bullets.push((svc.name.clone(), reason.describe(svc)));
             }
-            // Keep / SkipForeground never become candidates (filtered out of
-            // `candidates` in the snapshot loop above), so they cannot reach
-            // the removed list.
+            // Keep / SkipForeground never become candidates, so they cannot
+            // reach the removed list.
             Action::Keep | Action::SkipForeground => {}
         }
     }

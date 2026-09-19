@@ -1,17 +1,13 @@
 //! The `prune` command: reconcile the registry with reality.
 //!
-//! After a reboot, an OOM, or a crash, the registry may still list services
-//! whose worker process no longer exists (and never will again). `ft prune`
-//! removes those stale entries and best-effort reaps any `cloudflared` child
-//! whose recorded worker is gone (it normally dies on its own via
-//! `PR_SET_PDEATHSIG`, but that does not survive a host reboot).
+//! After a reboot, an OOM, or a crash, the registry may list services whose
+//! worker no longer exists. `ft prune` removes those stale entries and
+//! best-effort reaps any `cloudflared` child whose worker is gone (it normally
+//! dies via `PR_SET_PDEATHSIG`, which does not survive a host reboot).
 //!
-//! Entries that are still starting (`worker_pid == 0` and inside
-//! `model::START_GRACE`) are left alone — the parent may be mid
-//! reserve→spawn→record, and reaping the entry then would orphan the
-//! just-spawned worker. A reservation whose grace has expired (the parent
-//! died mid-start, so the pid will never land) is pruned like any other
-//! stale entry.
+//! Entries still starting (`worker_pid == 0` inside `model::START_GRACE`) are
+//! left alone — reaping mid-window would orphan the just-spawned worker; once
+//! the grace expires the reservation is pruned like any other stale entry.
 
 use crate::error::Result;
 use crate::model::Registry;
@@ -34,15 +30,11 @@ struct Reconciliation {
 
 /// Decide the fate of every service in `reg` in a single pass.
 ///
-/// Stale = recorded worker that is no longer alive:
-/// - Background workers use the cmdline-aware `pid_alive` (PID-reuse safe).
-/// - Foreground services use a cmdline identity probe against `--foreground`
-///   (their `ft` cmdline lacks the `run-worker` token) so a recycled pid
-///   never reads as a live foreground service (mirrors `kill.rs`).
-///
-/// An unrecorded `worker_pid == 0` reservation is kept while its
-/// [`crate::model::START_GRACE`] window is open (still starting — see module
-/// docs) and treated as stale once it expires (abandoned mid-start). The
+/// Stale = recorded worker that is no longer alive: background workers via
+/// the cmdline-aware `pid_alive` (PID-reuse safe), foreground via a cmdline
+/// identity probe against `--foreground` (their `ft` cmdline lacks the
+/// `run-worker` token). A pid-0 reservation is kept while its
+/// [`crate::model::START_GRACE`] window is open, stale once it expires. The
 /// kept set is written back onto `reg.services`; the stale set is dropped.
 fn classify(reg: &mut Registry) -> Reconciliation {
     let mut keep = Vec::new();
@@ -56,17 +48,16 @@ fn classify(reg: &mut Registry) -> Reconciliation {
                 !proc::pid_alive(s.worker_pid)
             }
         } else {
-            // Reserved but never recorded. Inside the start grace the parent
-            // may be mid reserve→spawn→record, and pruning the entry then
-            // would orphan the just-spawned worker (M1); once the grace
-            // expires the reservation is abandoned and is pruned.
+            // Reserved but never recorded: kept inside the start grace
+            // (reaping mid-window would orphan the just-spawned worker, M1),
+            // pruned once the grace expires.
             !s.start_in_progress()
         };
         if is_stale {
             // Best-effort reap of an orphaned cloudflared, gated on a cmdline
-            // identity check so a recycled PID is never signalled (mirrors
-            // kill.rs). Only the identity decision lives here; the actual
-            // terminate_orphan() call happens in run() to keep this pure.
+            // identity check so a recycled PID is never signalled. The
+            // terminate_orphan() call itself happens in run(), keeping this
+            // pure.
             if let Some(tpid) = s.tunnel_pid
                 && proc::pid_matches(tpid, "cloudflared")
             {
@@ -77,9 +68,8 @@ fn classify(reg: &mut Registry) -> Reconciliation {
             keep.push(s);
         }
     }
-    // Persist the kept services back onto the registry so `Registry::update`
-    // saves the reconciled set (the stale ones were consumed by the loop and
-    // never re-added).
+    // Write the kept set back so `Registry::update` saves the reconciled
+    // registry (the stale ones were consumed and never re-added).
     reg.services = keep;
     Reconciliation {
         stale_names,
@@ -93,9 +83,8 @@ pub async fn run() -> Result<()> {
 
     let rec = Registry::update(&state, classify)?;
 
-    // Best-effort reap of the orphaned cloudflared children identified above.
-    // Done OUTSIDE the registry lock so signalling never blocks other `ft`
-    // invocations, and so a reap failure can't roll back the prune.
+    // Best-effort reap OUTSIDE the registry lock: signalling never blocks
+    // other `ft` invocations and a reap failure can't roll back the prune.
     for pid in &rec.orphans_to_reap {
         proc::terminate_orphan(*pid);
     }
