@@ -551,15 +551,16 @@ pub async fn shutdown_process_group(pgid: u32) {
     let _ = kill(Pid::from_raw(raw), Signal::SIGKILL);
 }
 
-/// Best-effort `SIGTERM` of a single process by pid. Used by `ft prune` and
-/// `ft sanitize` to reap an orphaned `cloudflared` whose worker is already gone
-/// (it normally dies on its own via `PR_SET_PDEATHSIG`, but that does not
-/// survive a host reboot). The `cloudflared` identity gate lives HERE,
-/// immediately before the signal: the callers check [`pid_matches`] at collect
-/// time and signal later — in prune/sanitize an entire locked registry save
-/// sits in between — so a pid recycled inside that window must be re-verified
-/// rather than signalled on the caller's stale say-so. Mirrors the Windows
-/// `terminate_orphan` gate.
+/// Best-effort `SIGTERM` of a single process by pid. Used by `ft prune`,
+/// `ft sanitize`, and `ft kill`'s foreground teardown to reap a `cloudflared`
+/// whose worker is already gone (an orphan normally dies on its own via
+/// `PR_SET_PDEATHSIG`, but that does not survive a host reboot). The
+/// `cloudflared` identity gate lives HERE, immediately before the signal: the
+/// callers check [`pid_matches`] at collect/decision time and signal later —
+/// in prune/sanitize an entire locked registry save sits between check and
+/// signal, kill's foreground arm merely its neighbouring probes — so a pid
+/// recycled inside that window must be re-verified rather than signalled on
+/// the caller's stale say-so. Mirrors the Windows `terminate_orphan` gate.
 #[cfg(unix)]
 pub fn terminate_orphan(pid: u32) {
     if !pid_matches(pid, "cloudflared") {

@@ -471,11 +471,30 @@ pub async fn run(
 
     // Tee cloudflared output to tunnel.log and scan for the URL (first wins).
     let url_found = Arc::new(AtomicBool::new(false));
-    let log_writer = Arc::new(Mutex::new(
-        crate::fsutil::open_private_append_async(&tunnel_log)
-            .await
-            .with_context(|| format!("opening tunnel log {}", tunnel_log.display()))?,
-    ));
+    let log_writer = match crate::fsutil::open_private_append_async(&tunnel_log).await {
+        Ok(f) => Arc::new(Mutex::new(f)),
+        Err(e) => {
+            // cloudflared is ALREADY live here (unlike the spawn-failure
+            // sibling above), and the tunnel may be publishing by now. Tear
+            // everything down in the normal-exit order — cloudflared first
+            // (SIGTERM → grace → SIGKILL + reap via the shared shutdown), then
+            // the command child's group, the server slot, and the registry
+            // entry. Without this, on macOS neither PR_SET_PDEATHSIG (Linux)
+            // nor the Job Object (Windows) exists to reap the children, so a
+            // bare `?` would orphan BOTH — and since publish_url never ran,
+            // tunnel_pid is unpublished, so prune/sanitize could never find
+            // the orphaned public tunnel to reap it either.
+            tracing::error!(%e, "failed to open the tunnel log");
+            cloudflared::shutdown(tunnel_pid, &mut child).await;
+            crate::proc::shutdown_child_command(command_pid, &mut command_monitor).await;
+            stop_server(kind, shutdown_tx, &mut server_handle).await;
+            // Dying worker mustn't leave a permanent stale entry.
+            let _ = Registry::update(&state, |reg| {
+                reg.remove(id);
+            });
+            return Err(e).with_context(|| format!("opening tunnel log {}", tunnel_log.display()));
+        }
+    };
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
