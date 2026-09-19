@@ -85,11 +85,10 @@ pub(crate) fn spawn_command_child(
 
     // Best-effort: on Linux, SIGKILL the child if its parent (the worker or
     // foreground ft) dies — even via SIGKILL or OOM — so the command can never
-    // outlive the process that owns its tunnel. Duplicated from
-    // cloudflared::spawn's pre_exec (that module is frozen for this area);
-    // keep the two in sync. There is an inherent fork→prctl window (see
-    // cloudflared::spawn for the full race discussion); the getppid re-check
-    // closes it the same way.
+    // outlive the process that owns its tunnel. Shares the named pre-exec hook
+    // with `cloudflared::spawn` (single source of truth for the fork→prctl
+    // race handling; the getppid re-check closes the window — see
+    // [`parent_death_signal`] for the full discussion).
     #[cfg(target_os = "linux")]
     unsafe {
         cmd.pre_exec(parent_death_signal);
@@ -117,14 +116,17 @@ fn own_process_group() -> Result<(), std::io::Error> {
 }
 
 /// Linux-only pre-exec hook: request SIGKILL on parent death and refuse to
-/// exec if the parent is ALREADY gone (reparented to init). Kept as a named
-/// function so `pre_exec`'s unsafe-unsafe closure stays a single call.
+/// exec if the parent is ALREADY gone (reparented to init). Kept as a named,
+/// `pub(crate)` function so both pre-exec sites — the command child here and
+/// `cloudflared::spawn` — share ONE implementation of the race handling
+/// instead of staying manually in sync.
 #[cfg(target_os = "linux")]
-fn parent_death_signal() -> Result<(), std::io::Error> {
+pub(crate) fn parent_death_signal() -> Result<(), std::io::Error> {
     // SAFETY: prctl only sets a kernel attribute on this (pre-exec) process;
-    // getppid is a plain read. Unlike cloudflared::spawn (which ignores the
-    // prctl return), a failed prctl is surfaced — the whole point of the hook
-    // is the death signal, and skipping it silently is what it must prevent.
+    // getppid is a plain read. A failed prctl is surfaced — the whole point of
+    // the hook is the death signal, and skipping it silently (as the inline
+    // copy cloudflared::spawn once carried did) is exactly what it must
+    // prevent.
     unsafe {
         if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
             return Err(std::io::Error::last_os_error());

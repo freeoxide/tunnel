@@ -118,17 +118,13 @@ pub fn spawn(port: u16, _tunnel_log: PathBuf) -> Result<Child> {
     // init (pid 1), and the signal would never fire. Close that race by
     // re-checking getppid() after prctl and refusing to exec if we already lost
     // the parent — spawn() then surfaces a normal error instead of an orphan.
+    // The hook is SHARED with the command-child spawn path (one implementation
+    // of the race handling, in [`crate::proc::parent_death_signal`]); it also
+    // surfaces a failed prctl instead of silently exec'ing without the death
+    // signal.
     #[cfg(target_os = "linux")]
     unsafe {
-        cmd.pre_exec(|| {
-            let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong);
-            if libc::getppid() == 1 {
-                return Err(std::io::Error::other(
-                    "parent died before prctl(PR_SET_PDEATHSIG); refusing to exec",
-                ));
-            }
-            Ok(())
-        });
+        cmd.pre_exec(crate::proc::parent_death_signal);
     }
 
     let child = cmd
