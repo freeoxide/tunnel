@@ -397,6 +397,17 @@ pub async fn run(
         }
     }
 
+    // Installed BEFORE cloudflared::spawn: no post-spawn failure may leave a
+    // live tunnel with no handler installed. Windows: ctrl_c() in the select.
+    #[cfg(unix)]
+    let (mut sig_term, mut sig_int) = {
+        use tokio::signal::unix::{SignalKind, signal};
+        (
+            signal(SignalKind::terminate()).context("installing SIGTERM handler")?,
+            signal(SignalKind::interrupt()).context("installing SIGINT handler")?,
+        )
+    };
+
     let mut child = match cloudflared::spawn(port) {
         Ok(c) => c,
         Err(e) => {
@@ -467,16 +478,8 @@ pub async fn run(
     // only origin is the operator's, which this worker cannot observe); Run
     // workers hold the spawned child's monitor in the command slot (its exit
     // is the origin dying — tear the tunnel down, not serve 502s forever).
-    // Unix installs explicit SIGTERM/SIGINT handlers; Windows falls back to
-    // ctrl_c().
     #[cfg(unix)]
     {
-        let mut sig_term =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .context("installing SIGTERM handler")?;
-        let mut sig_int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-            .context("installing SIGINT handler")?;
-
         let exit_reason = tokio::select! {
             status = child.wait() => {
                 match status {
