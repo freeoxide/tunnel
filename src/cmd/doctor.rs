@@ -535,7 +535,7 @@ mod tests {
     fn origin_alive_rejects_a_dead_port() {
         // Bind, note the port, then drop the listener: the port is closed
         // again, and nothing else realistically grabs that exact ephemeral
-        // port in the microseconds between (same pattern as proxy.rs).
+        // port in the microseconds between (same technique as `dead_loopback_port` in tests/integration.rs).
         let port = {
             let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
                 .expect("bind loopback listener");
