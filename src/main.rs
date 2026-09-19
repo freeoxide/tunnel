@@ -1,9 +1,10 @@
 // Freeoxide Tunnel (`ft`) — expose local/static services through temporary tunnels.
 //
-// Binary entry point. The CLI is defined in `cli`, dispatched by `cmd`, and the
-// frozen core (model, registry, state, ports, names, process helpers) lives in
-// its own modules. `main` only parses the CLI, runs the dispatch, and maps any
-// error to a clean single-line message on stderr before exiting non-zero.
+// Binary entry point. The CLI is defined in `cli`, dispatched by `cmd`, and
+// the core modules (model, registry, state, ports, names, process helpers)
+// live in their own modules. `main` only parses the CLI, runs the dispatch,
+// and maps any error to a clean single-line message on stderr before
+// exiting non-zero.
 
 mod cli;
 mod cloudflared;
