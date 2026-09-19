@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use anyhow::{bail, ensure};
 
-use super::{POLL_INTERVAL, POLL_TIMEOUT, start};
+use super::{POLL_INTERVAL, POLL_TIMEOUT, PROBE_TIMEOUT, start};
 use crate::cloudflared;
 use crate::error::Result;
 use crate::model::{Registry, Service, ServiceKind};
@@ -35,11 +35,6 @@ use crate::port;
 use crate::proc;
 use crate::spawn;
 use crate::state::StateDir;
-
-/// How long the origin probe waits for the connect to resolve. A loopback
-/// connect is answered by the local kernel almost instantly, so this only
-/// bounds pathological stacks; nothing is ever read from the socket.
-const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Entry point for the RUN command.
 pub async fn run(

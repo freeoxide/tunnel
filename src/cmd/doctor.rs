@@ -35,18 +35,13 @@
 //! dead-origin finding's wording mirrors that pre-flight's error on purpose.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
 
+use super::PROBE_TIMEOUT;
 use crate::error::Result;
 use crate::model::{Registry, Service, ServiceKind, ServiceStatus};
 use crate::output;
 use crate::proc;
 use crate::state::StateDir;
-
-/// How long the origin probe waits for the connect to resolve. A loopback
-/// connect is answered by the local kernel almost instantly, so this only
-/// bounds pathological stacks — nothing is ever read from the socket.
-const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Severity of one check's outcome.
 ///
