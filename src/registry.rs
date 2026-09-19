@@ -181,7 +181,15 @@ impl Registry {
             && !prev.iter().all(u8::is_ascii_whitespace)
             && Registry::parse(&prev).is_ok()
         {
-            let _ = std::fs::write(path.with_extension("json.bak"), prev);
+            // Owner-only like every other registry write: the .bak can carry
+            // static_flags token secrets (defense-in-depth atop the 0700 root).
+            let mut opts = OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            fsutil::apply_private_mode(&mut opts);
+            // Best-effort, like the fs::write it replaces.
+            if let Ok(mut file) = opts.open(path.with_extension("json.bak")) {
+                let _ = file.write_all(&prev);
+            }
         }
         std::fs::rename(&tmp, &path)
             .with_context(|| format!("committing registry {}", path.display()))?;
@@ -697,6 +705,40 @@ mod tests {
             reloaded, original,
             "proxy registry must round-trip field-for-field"
         );
+    }
+
+    #[test]
+    fn save_promotes_the_previous_blob_to_an_owner_only_bak() {
+        // Regression: the .bak used to be written with umask-default mode
+        // (typically 0644); it can carry static_flags token secrets.
+        #[cfg(unix)]
+        {
+            use crate::state::StateDir;
+            use std::os::unix::fs::PermissionsExt;
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = StateDir::new_at(tmp.path().join("ft-state"));
+            state.ensure().expect("ensure");
+
+            let first = Registry {
+                next_id: 43,
+                services: vec![fully_populated_service()],
+            };
+            first.save(&state).expect("first save");
+            let second = Registry {
+                next_id: 44,
+                services: Vec::new(),
+            };
+            second
+                .save(&state)
+                .expect("second save promotes the first blob");
+
+            let bak = state.registry_path().with_extension("json.bak");
+            let mode = std::fs::metadata(&bak)
+                .expect("a valid previous blob must have been promoted")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "the .bak must be owner-only");
+        }
     }
 
     #[test]
