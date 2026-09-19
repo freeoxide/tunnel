@@ -190,6 +190,9 @@ impl Registry {
             if let Ok(mut file) = opts.open(path.with_extension("json.bak")) {
                 let _ = file.write_all(&prev);
             }
+            // mode(0o600) applies only at creation — re-seal a legacy .bak
+            // that a pre-fix build left at umask-default 0644.
+            seal_private_file(&path.with_extension("json.bak"));
         }
         std::fs::rename(&tmp, &path)
             .with_context(|| format!("committing registry {}", path.display()))?;
@@ -738,6 +741,19 @@ mod tests {
                 .permissions()
                 .mode();
             assert_eq!(mode & 0o777, 0o600, "the .bak must be owner-only");
+
+            // Legacy trees: a pre-existing 0644 .bak (the creation-time mode
+            // never applies to it) must be healed by the next promotion.
+            std::fs::set_permissions(&bak, std::fs::Permissions::from_mode(0o644))
+                .expect("widen the .bak to a legacy mode");
+            Registry::default()
+                .save(&state)
+                .expect("third save re-promotes the second blob");
+            let mode = std::fs::metadata(&bak)
+                .expect("the .bak must still exist")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "a legacy 0644 .bak must be re-sealed");
         }
     }
 
