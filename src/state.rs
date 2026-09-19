@@ -48,9 +48,8 @@ impl StateDir {
         self.root.join("services")
     }
 
-    /// Per-service directory. The name is reduced to a single safe path segment
-    /// so a registry-controlled (possibly hand-edited) name can never traverse
-    /// out of `services/` via `..` or separators.
+    /// Per-service directory; the name is sanitized to one safe path segment
+    /// so a hand-edited registry name cannot traverse out of `services/`.
     pub fn service_dir(&self, name: &str) -> PathBuf {
         self.services_dir().join(safe_component(name))
     }
@@ -67,24 +66,19 @@ impl StateDir {
         self.service_dir(name).join("tunnel.log")
     }
 
-    /// Create the root and services directory tree if missing.
-    ///
-    /// Both are created owner-only (mode 0700): the registry lives at the root
-    /// and every service's logs (which may contain request URIs and local
-    /// filesystem paths) live under `services/`, so they must not be readable
-    /// by other users on a shared host. Pre-existing directories are
-    /// re-chmodded to 0700 so a state tree created by an older build is sealed.
+    /// Create the root and services directory tree if missing, owner-only
+    /// (0700): the registry and the service logs (request URIs, local paths)
+    /// must not be readable by other users. Pre-existing directories are
+    /// re-chmodded so a tree created by an older build is sealed.
     pub fn ensure(&self) -> Result<()> {
-        // Owner-only (0700) on Unix via the cross-platform helper; a plain
-        // recursive create on Windows (state tree under the user profile is
-        // already user-private).
+        // Plain recursive create on Windows: the profile-dir ACL suffices.
         crate::fsutil::ensure_private_dir(self.services_dir())
             .with_context(|| format!("creating state directory {}", self.root.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             // Re-seal the root itself, which `services_dir()`'s create may not
-            // have touched, so a state tree created by an older build is sealed.
+            // have touched.
             let _ = std::fs::set_permissions(self.root(), std::fs::Permissions::from_mode(0o700));
         }
         Ok(())
@@ -119,15 +113,10 @@ fn state_base() -> Result<PathBuf> {
     Ok(home.join(".local").join("state"))
 }
 
-/// Reduce a name to a single safe path segment via [`dash_sanitize`]: any
-/// char outside `[A-Za-z0-9_-]` becomes `-`, so `.`, `/`, and other
-/// separators are all neutralized to dashes and can never form a self or
-/// parent-dir segment (`.` and `..` map to `-`/`--`, which the all-dashes
-/// fallback below rejects). Trailing/leading dashes are intentionally NOT
-/// trimmed — trimming made distinct valid names collide (e.g. `"a"` and
-/// `"-a"` both collapsed to `"a"`). A result that is empty or consists only
-/// of dashes carries no usable identity, so it falls back to `"service"`.
-/// This keeps traversal neutralized while preserving name distinctness.
+/// Reduce a name to a single safe path segment via [`dash_sanitize`]: chars
+/// outside `[A-Za-z0-9_-]` become `-`, so separators and `.`/`..` can never
+/// form a traversal segment. Leading/trailing dashes are NOT trimmed (would
+/// collide `"-a"` with `"a"`); an all-dashes result falls back to `"service"`.
 fn safe_component(name: &str) -> String {
     let s = crate::name::dash_sanitize(name);
     // All-dashes (which also covers the empty string — `all` is vacuously
@@ -150,9 +139,7 @@ mod tests {
 
     #[test]
     fn safe_component_neutralizes_traversal() {
-        // `.` and `/` both become `-`, so `../etc` can never form a parent-dir
-        // reference. Leading dashes are NOT trimmed (would collide with `etc`),
-        // so the result is `---etc`.
+        // `.` and `/` both become `-`; leading dashes are not trimmed.
         assert_eq!(safe_component("../etc"), "---etc");
     }
 
@@ -163,13 +150,11 @@ mod tests {
 
     #[test]
     fn safe_component_pure_traversal_falls_back_to_service() {
-        // `..` maps entirely to dots, which is unsafe (parent dir) -> "service".
         assert_eq!(safe_component(".."), "service");
     }
 
     #[test]
     fn safe_component_empty_falls_back_to_service() {
-        // All-dashes name collapses to empty -> "service" (was "" before).
         assert_eq!(safe_component("---"), "service");
     }
 

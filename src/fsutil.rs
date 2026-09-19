@@ -1,11 +1,9 @@
 //! Cross-platform filesystem helpers for private file/directory creation.
 //!
 //! On Unix, log files and the state directory can contain request URIs and
-//! local filesystem paths, so they are created owner-only (mode 0600 / 0700).
-//! On Windows there is no chmod-equivalent in the std API; the state tree lives
-//! under the user's home directory (`~/.local/state/freeoxide/tunnel`, see
-//! `state::state_base`) and is protected by the home dir's ACL rather than a
-//! mode bit, so the helpers fall back to a plain create there.
+//! local paths, so they are created owner-only (0600/0700). On Windows the
+//! std API has no chmod equivalent; the state tree lives under the user's
+//! profile and its ACL, so the helpers fall back to a plain create there.
 
 use std::path::Path;
 
@@ -83,10 +81,8 @@ pub fn ensure_private_dir(dir: impl AsRef<Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Apply owner-only (0600) permissions to an [`std::fs::OpenOptions`] builder on
-/// Unix; a no-op on Windows, where the state tree already lives under the
-/// user-private profile and the std API has no chmod equivalent. Returns the
-/// builder so callers can keep chaining.
+/// Apply owner-only (0600) permissions to an [`std::fs::OpenOptions`] builder
+/// on Unix; a no-op on Windows (profile-dir ACL, no chmod equivalent).
 pub fn apply_private_mode(opts: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOptions {
     #[cfg(unix)]
     {

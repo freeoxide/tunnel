@@ -28,13 +28,10 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Map every char outside `[A-Za-z0-9_-]` to `-` (separators, dots, and
-/// non-ASCII all become dashes), preserving everything else verbatim —
-/// INCLUDING leading/trailing dashes. Whether those are trimmed is the
-/// caller's policy: [`generate_name`] trims for display names, while the
-/// state-dir path segment builder deliberately does not, because trimming
-/// made distinct valid names collide (e.g. `"a"` and `"-a"` both collapsed
-/// to `"a"`).
+/// Map every char outside `[A-Za-z0-9_-]` to `-`, preserving everything else
+/// verbatim INCLUDING leading/trailing dashes. Whether those are trimmed is
+/// the caller's policy: [`generate_name`] trims for display names; the
+/// state-dir segment builder does not (trimming collided `"-a"` with `"a"`).
 pub(crate) fn dash_sanitize(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -63,29 +60,23 @@ pub fn generate_name(dir: &Path) -> String {
 }
 
 /// Produce a name unique within the registry: `base`, `base-2`, `base-3`, ...
-///
-/// The scan is capped so a registry pre-filled with `base-2`..`base-N` (e.g. a
-/// hand-edited or scripted `registry.json`) cannot make name allocation spin
-/// unboundedly. If the cap is exhausted, the final candidate is returned anyway
-/// rather than panicking — collision with a pathological registry is the lesser
-/// evil versus dropping the user's start request.
+/// The scan is capped so a registry pre-filled with `base-2`..`base-N` cannot
+/// make allocation spin unboundedly; at the cap the last candidate is returned
+/// (collision beats dropping the start request).
 pub fn unique_name(registry: &Registry, base: &str) -> String {
     const LIMIT: u64 = 100_000;
     let taken: HashSet<&str> = registry.services.iter().map(|s| s.name.as_str()).collect();
     if !taken.contains(base) {
         return base.to_string();
     }
-    // Search `base-2`..`base-{LIMIT}`. The bound keeps the worst case finite
-    // even for a crafted registry; `LIMIT` is well within a typical registry's
-    // practical size, so normal use never hits it.
+    // Search `base-2`..`base-{LIMIT}`; the bound keeps the worst case finite.
     for n in 2..=LIMIT {
         let candidate = format!("{base}-{n}");
         if !taken.contains(candidate.as_str()) {
             return candidate;
         }
     }
-    // Pathological registry: every slot up to the cap is taken. Fall back to the
-    // last candidate so the caller still gets a name (best effort).
+    // Pathological registry: fall back to the last candidate (best effort).
     format!("{base}-{LIMIT}")
 }
 
