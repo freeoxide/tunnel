@@ -551,13 +551,20 @@ pub async fn shutdown_process_group(pgid: u32) {
     let _ = kill(Pid::from_raw(raw), Signal::SIGKILL);
 }
 
-/// Best-effort `SIGTERM` of a single process by pid. Used by `ft prune` to reap
-/// an orphaned `cloudflared` whose worker is already gone (it normally dies on
-/// its own via `PR_SET_PDEATHSIG`, but that does not survive a host reboot). The
-/// caller has already confirmed the pid is ours via [`pid_matches`], so this is
-/// safe against PID reuse.
+/// Best-effort `SIGTERM` of a single process by pid. Used by `ft prune` and
+/// `ft sanitize` to reap an orphaned `cloudflared` whose worker is already gone
+/// (it normally dies on its own via `PR_SET_PDEATHSIG`, but that does not
+/// survive a host reboot). The `cloudflared` identity gate lives HERE,
+/// immediately before the signal: the callers check [`pid_matches`] at collect
+/// time and signal later — in prune/sanitize an entire locked registry save
+/// sits in between — so a pid recycled inside that window must be re-verified
+/// rather than signalled on the caller's stale say-so. Mirrors the Windows
+/// `terminate_orphan` gate.
 #[cfg(unix)]
 pub fn terminate_orphan(pid: u32) {
+    if !pid_matches(pid, "cloudflared") {
+        return;
+    }
     let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
 }
 
@@ -565,10 +572,15 @@ pub fn terminate_orphan(pid: u32) {
 /// whose `worker_pid` is the `ft` process itself. Unlike
 /// [`shutdown_process_group`] this targets ONE pid and never a process group —
 /// a foreground `ft` shares the operator's shell's group, so `kill(-pgid)`
-/// would kill the shell. Used by `ft kill` after gating on an identity check so
-/// a recycled pid is not signalled.
+/// would kill the shell. The `--foreground` identity gate lives HERE,
+/// immediately before the signal (the caller in `ft kill` gates too, but its
+/// check can go stale before this call runs — the same recycled-pid window
+/// [`terminate_orphan`] closes); mirrors the Windows `terminate_foreground`.
 #[cfg(unix)]
 pub fn terminate_foreground(pid: u32) {
+    if !pid_matches(pid, "--foreground") {
+        return;
+    }
     let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
 }
 
@@ -959,6 +971,43 @@ mod tests {
         // The exec path is the first entry in the procargs blob, so the binary
         // name always appears.
         assert!(cmdline_contains(std::process::id(), needle));
+    }
+
+    /// PID-reuse guard: [`terminate_orphan`] and [`terminate_foreground`] gate
+    /// on cmdline identity INTERNALLY, immediately before signalling. The
+    /// callers (kill/prune/sanitize) check identity at collect time and signal
+    /// later — in prune/sanitize an entire locked registry save sits in
+    /// between — so a pid recycled in that window must be refused here, never
+    /// signalled on the caller's stale say-so. A live `sleep` child's cmdline
+    /// contains neither needle, so both calls must leave it running.
+    /// (Needle-aware platforms only: elsewhere `pid_matches` degrades to a
+    /// signal-0 liveness probe and the gate intentionally passes for a live
+    /// foreign process — the documented best-effort fallback.)
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn terminate_helpers_refuse_a_foreign_pid() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep child");
+        let pid = child.id();
+
+        terminate_orphan(pid);
+        terminate_foreground(pid);
+
+        // A regression (an ungated signal) would deliver SIGTERM to `sleep`,
+        // which dies within milliseconds; the short settle window keeps a
+        // delayed delivery from reading as "gate held".
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "a foreign pid was signalled through the identity gate — \
+             terminate_orphan/terminate_foreground must refuse non-matching pids"
+        );
+
+        // Gate held: clean up the child ourselves (kill + reap, no zombie).
+        child.kill().expect("kill sleep child");
+        child.wait().expect("reap sleep child");
     }
 
     /// CR-2 regression: the macOS argv parser must NOT match a needle that
