@@ -192,21 +192,16 @@ async fn serve_or_list(State(root): State<PathBuf>, request: Request, next: Next
     }
     let is_head = method == Method::HEAD;
     let raw = request.uri().path();
-    // Percent-decode and rebuild the candidate path exactly like the guard
-    // (and, ultimately, ServeDir) so the listing decision is made on the same
-    // path everyone else resolves.
+    // Percent-decode and rebuild the candidate path through the guard's
+    // shared [`candidate_path`] helper (and, ultimately, ServeDir's rules) so
+    // the listing decision is made on the same path everyone else resolves.
     let decoded = match percent_decode(raw.as_bytes()).decode_utf8() {
         Ok(s) => s,
         // Undecodable paths are refused by `confine` first; if one reaches us
         // anyway, let ServeDir decide its fate.
         Err(_) => return next.run(request).await,
     };
-    let mut candidate = root.clone();
-    for seg in decoded.trim_start_matches('/').split('/') {
-        if !seg.is_empty() {
-            candidate.push(seg);
-        }
-    }
+    let candidate = candidate_path(&root, &decoded);
 
     let listing = tokio::task::spawn_blocking(move || render_listing(&candidate, &root))
         .await
@@ -413,6 +408,35 @@ pub(crate) fn escape_html(s: &str) -> String {
     out
 }
 
+/// True when any percent-decoded path segment begins with `.`: dotfiles and
+/// dot-directories (`.env`, `.git`, `.ssh`, …), self (`.`), and parent
+/// (`..`). ServeDir already blocks `..` traversal; the guard blocks every
+/// dot segment EARLIER, for defense in depth, and adds the dotfile default
+/// that ServeDir does not provide. Shared by [`confine`] and the SPA
+/// fallback so the refusal policy cannot drift between them.
+fn has_dot_segment(decoded: &str) -> bool {
+    decoded
+        .trim_start_matches('/')
+        .split('/')
+        .any(|seg| seg.starts_with('.'))
+}
+
+/// Rebuild the request's target under `root` exactly the way ServeDir
+/// resolves it: percent-decode, drop the leading `/`, split on `/`, and
+/// push every non-empty segment as a path component. One shared builder
+/// guarantees the three decision points — [`confine`], [`serve_or_list`],
+/// and [`spa_fallback`] — decide on literally the same candidate rather
+/// than three re-implementations kept in sync by comment.
+fn candidate_path(root: &Path, decoded: &str) -> PathBuf {
+    let mut candidate = root.to_owned();
+    for seg in decoded.trim_start_matches('/').split('/') {
+        if !seg.is_empty() {
+            candidate.push(seg);
+        }
+    }
+    candidate
+}
+
 /// Confinement guard: deny dotfiles, reject `..` traversal, and refuse any
 /// path whose canonicalised target escapes the served root (symlink escape).
 ///
@@ -446,20 +470,14 @@ pub(crate) async fn confine(State(root): State<PathBuf>, request: Request, next:
         Ok(s) => s,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
-    let mut candidate = root.clone();
-    for seg in decoded.trim_start_matches('/').split('/') {
-        if seg.is_empty() {
-            continue;
-        }
-        // Any segment starting with '.' is refused: dotfiles/dot-dirs (.env,
-        // .git, .ssh, ...), self ('.'), and parent ('..'). ServeDir already
-        // blocks '..' traversal; we block it earlier here for defense in depth
-        // and add the dotfile default that ServeDir does not provide.
-        if seg.starts_with('.') {
-            return StatusCode::NOT_FOUND.into_response();
-        }
-        candidate.push(seg);
+    // Any segment starting with '.' is refused: dotfiles/dot-dirs (.env,
+    // .git, .ssh, ...), self ('.'), and parent ('..'). ServeDir already
+    // blocks '..' traversal; we block it earlier here for defense in depth
+    // and add the dotfile default that ServeDir does not provide.
+    if has_dot_segment(&decoded) {
+        return StatusCode::NOT_FOUND.into_response();
     }
+    let candidate = candidate_path(&root, &decoded);
     // Symlink confinement: resolve the candidate for real and require it to
     // stay beneath the canonical root. Escaping symlinks resolve outside `root`
     // and are refused; missing paths fail canonicalize and 404. Run all of the
@@ -541,26 +559,19 @@ async fn spa_fallback(State(root): State<PathBuf>, request: Request, next: Next)
     {
         return response;
     }
-    // Rebuild the candidate exactly like `confine` does (percent-decode, drop
-    // the leading `/`, split on `/`) so the fallback decides on the same path
-    // everyone else resolved.
+    // Rebuild the candidate through the guard's shared helpers so the
+    // fallback decides on the same path confine and ServeDir resolved.
     let decoded = match percent_decode(raw.as_bytes()).decode_utf8() {
         Ok(s) => s,
         // Undecodable paths were refused by confine; never rewrite them.
         Err(_) => return response,
     };
-    let mut candidate = root.clone();
-    for seg in decoded.trim_start_matches('/').split('/') {
-        if seg.is_empty() {
-            continue;
-        }
-        // Same rule, same place in the pipeline as the guard: a dot segment is
-        // a refusal, and a refusal must not turn into the app shell.
-        if seg.starts_with('.') {
-            return response;
-        }
-        candidate.push(seg);
+    // Same rule, same place in the pipeline as the guard: a dot segment is
+    // a refusal, and a refusal must not turn into the app shell.
+    if has_dot_segment(&decoded) {
+        return response;
     }
+    let candidate = candidate_path(&root, &decoded);
     let shell = tokio::task::spawn_blocking(move || {
         // The path resolves to something (inside or outside the root): its 404
         // was a deliberate confinement/ServeDir answer, not a miss to paper
@@ -724,25 +735,21 @@ mod confinement_tests {
     //! Logic-only checks for the path decisions inside `confine`. Full HTTP
     //! confinement (symlink escape, dotfiles, traversal, junction) is exercised
     //! inline in `http_confinement_tests` below.
+    use super::has_dot_segment;
     use std::path::Path;
 
     #[test]
     fn split_segments_drops_dotfiles_and_dots() {
-        // Mirrors the decision logic: any '.'-prefixed segment is a refusal.
-        fn allowed(decoded: &str) -> bool {
-            decoded
-                .trim_start_matches('/')
-                .split('/')
-                .all(|s| !s.starts_with('.'))
-        }
-        assert!(allowed("index.html"));
-        assert!(!allowed(".env"));
-        assert!(!allowed(".git/config"));
-        assert!(!allowed("a/../b"));
-        assert!(!allowed("../etc/passwd"));
+        // The refusal predicate itself, not a mirror of it: any '.'-prefixed
+        // segment is a refusal.
+        assert!(!has_dot_segment("index.html"));
+        assert!(has_dot_segment(".env"));
+        assert!(has_dot_segment(".git/config"));
+        assert!(has_dot_segment("a/../b"));
+        assert!(has_dot_segment("../etc/passwd"));
         // A literal '.html' filename segment does NOT start with '.', so it is
         // fine (only a leading dot of the *segment* is refused).
-        assert!(allowed("foo.html"));
+        assert!(!has_dot_segment("foo.html"));
     }
 
     #[test]
