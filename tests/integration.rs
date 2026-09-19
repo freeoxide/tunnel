@@ -336,8 +336,8 @@ fn run_ft_with_env(
 /// A loopback port with nothing listening on it.
 ///
 /// Bind an ephemeral listener, note its port, then drop it: the port is closed
-/// again immediately (same technique as the in-module `upstream_alive` tests
-/// in `cmd/proxy.rs`; only loopback is ever touched). Another process could
+/// again immediately (same technique as the in-module `origin_alive` tests
+/// in `cmd/doctor.rs`; only loopback is ever touched). Another process could
 /// theoretically re-grab that exact ephemeral port in the microseconds before
 /// `ft` probes it, but the kernel does not hand out just-released ephemeral
 /// ports that eagerly — accepted risk, same as the unit tests.
