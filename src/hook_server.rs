@@ -28,9 +28,10 @@
 //! head (path, query, headers — never truncated on capture) takes up to
 //! hyper's ~408 KiB wire budget, doubling under escaping at its
 //! quote/backslash-heavy worst. That is 200 × ~1.2 MiB ≈ 235 MiB by default,
-//! ≈ 1.2 GiB at keep=1000. The bound is enforced on RELOAD too:
-//! [`HookLog::load`] reads at most that many bytes, so a file tampered past
-//! what this server can write is treated as corruption, not slurped.
+//! ≈ 1.2 GiB at keep=1000. The RELOAD ceiling is keep-independent (computed
+//! at [`MAX_KEEP`]): a store written under a higher keep always loads and is
+//! re-truncated to `keep` — lowering `--keep` never wipes the log — while a
+//! file past even that ceiling is corruption, not a store this server wrote.
 //!
 //! # What is deliberately NOT recorded
 //!
@@ -78,6 +79,10 @@ const MAX_REQUEST_BODY: usize = 64 * 1024;
 /// `ft hook --keep <n>` overrides it (1..=1000). u16 because that is what
 /// the worker argv carries; convert with `usize::from` at the boundary.
 pub(crate) const DEFAULT_KEEP: u16 = 200;
+
+/// Maximum `--keep` the CLI accepts (1..=1000); the store-read ceiling is
+/// computed at this max so it never depends on the loading keep.
+const MAX_KEEP: usize = 1000;
 
 /// Name of the per-service request store inside the service's state dir — a
 /// sibling of `worker.log`/`tunnel.log` so `ft logs` stays coherent.
@@ -234,18 +239,24 @@ fn store_read_bound(keep: usize) -> u64 {
     (keep as u64).saturating_mul(per_record)
 }
 
-/// Read the persisted store with the hard size bound above, mirroring
+/// The ABSOLUTE store-read ceiling: [`store_read_bound`] at [`MAX_KEEP`],
+/// independent of the loading keep — a legitimate store written at ANY
+/// supported keep fits under it; load() then truncates to the loading keep.
+fn absolute_read_bound() -> u64 {
+    store_read_bound(MAX_KEEP)
+}
+
+/// Read the persisted store with a hard size bound, mirroring
 /// `registry::read_registry_blob`: at most `bound + 1` bytes are ever read
 /// (the +1 lets the caller tell "at the bound" from "past it" by length
 /// alone). Bounding the READ — not just failing the parse afterwards — is
 /// the point: without it, a stray huge file (e.g. a log redirected over the
 /// store) would be slurped whole into memory before the parser rejected it.
-fn read_store_blob(path: &Path, keep: usize) -> std::io::Result<Vec<u8>> {
+fn read_store_blob(path: &Path, bound: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
     let file = std::fs::File::open(path)?;
     let mut bytes = Vec::new();
-    file.take(store_read_bound(keep).saturating_add(1))
-        .read_to_end(&mut bytes)?;
+    file.take(bound.saturating_add(1)).read_to_end(&mut bytes)?;
     Ok(bytes)
 }
 
@@ -253,54 +264,66 @@ impl HookLog {
     /// Load the store at `path`, or start empty when it does not exist yet.
     ///
     /// Two failure modes are treated differently:
-    /// - a **corrupt (unparseable) store** degrades to empty rather than
-    ///   failing the origin: corruption implies disk trouble (the write is
-    ///   atomic), and bricking the service until a human deletes the file is
-    ///   worse than restarting the log — webhook senders re-deliver;
+    /// - a **corrupt (unparseable, or past the absolute [`MAX_KEEP`]-sized
+    ///   read ceiling — not a store this server wrote at any supported keep)
+    ///   store** degrades to empty rather than failing the origin: corruption
+    ///   implies disk trouble (the write is atomic), and bricking the service
+    ///   until a human deletes the file is worse than restarting the log —
+    ///   webhook senders re-deliver;
     /// - a **read error other than NotFound** fails the load with `Err`: the
     ///   store may be intact behind the error, and starting empty would let
     ///   the next append's atomic rename destroy it — unlogged record loss.
     ///   Failing fast (at startup, before anything can be renamed over it)
     ///   surfaces the disk problem while nothing is lost yet.
     ///
-    /// A loaded store is re-sorted by seq and re-truncated to `keep`, so a
-    /// hand-edited file cannot grow retention behind the operator's back.
+    /// A loaded store is re-sorted by seq and re-truncated to `keep`; the
+    /// read ceiling is keep-independent, so lowering `--keep` loads the
+    /// fatter old store and truncates it — never wipes it.
     pub fn load(path: PathBuf, keep: usize) -> std::io::Result<Self> {
-        let bound = store_read_bound(keep);
-        let mut requests = match read_store_blob(&path, keep) {
-            // Oversized = not a store this server wrote (every record is
-            // body-capped and the bound budgets serde_json's worst-case
-            // escaping of body AND head, so `keep` legit records can never
-            // reach it): the SAME corrupt-store recovery as a parse failure,
-            // not the read-error arm, which protects a store that may be
-            // intact behind an I/O error.
-            Ok(bytes) if bytes.len() as u64 > bound => {
-                tracing::warn!(
-                    path = %path.display(),
-                    "hook request store is larger than the keep x record bound; starting a new one"
-                );
-                Vec::new()
-            }
-            Ok(bytes) if !bytes.iter().all(u8::is_ascii_whitespace) => {
-                match serde_json::from_slice::<Vec<RecordedRequest>>(&bytes) {
-                    Ok(parsed) => parsed,
-                    Err(e) => {
-                        tracing::warn!(%e, path = %path.display(), "hook request store is corrupt; starting a new one");
-                        Vec::new()
+        let ceiling = absolute_read_bound();
+        // Past the ceiling by METADATA: not a store this server wrote at any
+        // supported keep; rejected without reading a tampered giant at all.
+        let mut requests = if std::fs::metadata(&path).is_ok_and(|m| m.len() > ceiling) {
+            tracing::warn!(
+                path = %path.display(),
+                "hook request store is larger than the absolute read bound; starting a new one"
+            );
+            Vec::new()
+        } else {
+            match read_store_blob(&path, ceiling) {
+                // Past the ceiling by READ length (the file grew between the
+                // stat and the read): the same corrupt-store recovery.
+                Ok(bytes) if bytes.len() as u64 > ceiling => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "hook request store is larger than the absolute read bound; starting a new one"
+                    );
+                    Vec::new()
+                }
+                // Between the loading keep's retention bound and the ceiling
+                // (e.g. written under a higher keep) is a LEGITIMATE store:
+                // parse it; the truncate below re-applies the new keep.
+                Ok(bytes) if !bytes.iter().all(u8::is_ascii_whitespace) => {
+                    match serde_json::from_slice::<Vec<RecordedRequest>>(&bytes) {
+                        Ok(parsed) => parsed,
+                        Err(e) => {
+                            tracing::warn!(%e, path = %path.display(), "hook request store is corrupt; starting a new one");
+                            Vec::new()
+                        }
                     }
                 }
+                // A missing store is the ordinary first start.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                // An empty/whitespace file has nothing recorded yet.
+                Ok(_) => Vec::new(),
+                // Any other read error fails the load — see the doc comment: an
+                // empty fallback here would rename an intact store into oblivion
+                // on the next append.
+                Err(e) => return Err(e),
             }
-            // A missing store is the ordinary first start.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            // An empty/whitespace file has nothing recorded yet.
-            Ok(_) => Vec::new(),
-            // Any other read error fails the load — see the doc comment: an
-            // empty fallback here would rename an intact store into oblivion
-            // on the next append.
-            Err(e) => return Err(e),
         };
         // Restore the newest-first invariant by seq (not on-disk order) and
-        // re-apply retention so the bound holds from load.
+        // re-apply retention so the store honors `keep` from load.
         requests.sort_by_key(|r| std::cmp::Reverse(r.seq));
         requests.truncate(keep);
         // Saturate rather than `+ 1`: a hand-edited seq = u64::MAX would
@@ -732,30 +755,58 @@ mod tests {
         assert_eq!(paths, vec!["/after", "/seed"]);
     }
 
+    // Unix-gated: set_len is not sparse on NTFS, and a real 1.2 GiB fixture
+    // is too heavy for a test.
+    #[cfg(unix)]
     #[test]
     fn load_treats_an_oversized_store_as_corruption() {
-        // A store larger than keep × (escape-expanded body cap + head
-        // allowance) is not one this server wrote: corrupt-store recovery
-        // (warn, start empty), never the read-error arm (which protects a
-        // store that may be intact — this one provably is not), and never a
-        // whole-file slurp.
+        // A store larger than the absolute ceiling (max-keep × per-record)
+        // is not one this server wrote at ANY supported keep: corrupt-store
+        // recovery (warn, start empty), never the read-error arm (which
+        // protects a store that may be intact — this one provably is not),
+        // and never a whole-file slurp.
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("requests.json");
-        // Valid JSON whose single record exceeds the keep=1 per-record bound
-        // (plain 'x's do not escape, so the byte count is honest).
-        let fat_body = "x".repeat(MAX_REQUEST_BODY * JSON_ESCAPE_FACTOR + STORE_RECORD_OVERHEAD);
-        let json = format!(
-            "[{{\"seq\":1,\"received_at\":\"2024-01-01T00:00:00Z\",\"method\":\"POST\",\
-             \"path\":\"/x\",\"query\":null,\"headers\":[],\"body\":\"{fat_body}\",\
-             \"body_len\":0,\"truncated\":false}}]"
+        // Sparse file past the ceiling; the metadata check refuses it
+        // without reading the giant.
+        std::fs::File::create(&path)
+            .and_then(|f| f.set_len(absolute_read_bound() + 1))
+            .expect("plant a sparse over-ceiling store");
+        let log = HookLog::load(path, 200).expect("an oversized store still loads (as empty)");
+        assert_eq!(log.len(), 0, "oversized store must load as empty");
+    }
+
+    #[test]
+    fn lowering_keep_loads_a_fat_legit_store_and_truncates_it() {
+        // Regression (phase-2 d6): a store legitimately written under a
+        // higher keep exceeds the NEW keep's retention bound; load() must
+        // load it and truncate to the new keep, not classify it oversized
+        // and wipe the newest records.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("requests.json");
+        {
+            let mut log = HookLog::load(path.clone(), 10).expect("seed load");
+            for seq in 1..=5u64 {
+                let head = parts("POST", &format!("/{seq}"), &[]);
+                let body = vec![0u8; MAX_REQUEST_BODY];
+                log.record(RecordedRequest::capture(seq, &head, &body))
+                    .expect("record");
+            }
+        }
+        let persisted_len = std::fs::metadata(&path).expect("store exists").len();
+        assert!(
+            persisted_len > store_read_bound(1),
+            "the fixture must exceed the keep=1 bound (the old wipe trigger)"
         );
         assert!(
-            json.len() as u64 > store_read_bound(1),
-            "the seeded store must be over the keep=1 bound"
+            persisted_len <= absolute_read_bound(),
+            "the fixture must sit inside the absolute ceiling"
         );
-        std::fs::write(&path, json).expect("seed oversized store");
-        let log = HookLog::load(path, 1).expect("an oversized store still loads (as empty)");
-        assert_eq!(log.len(), 0, "oversized store must load as empty");
+        let reloaded = HookLog::load(path, 1).expect("reload with a lowered keep");
+        let snap = reloaded.snapshot();
+        assert_eq!(snap.len(), 1, "load-and-truncate, not wipe");
+        assert_eq!(snap[0].seq, 5, "the NEWEST record survives the truncation");
+        assert_eq!(snap[0].body.len(), MAX_REQUEST_BODY);
     }
 
     #[test]
