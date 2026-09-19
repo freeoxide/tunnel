@@ -1,9 +1,11 @@
 //! The DROP command: `ft drop <dir>` runs an ft-owned upload-receiver origin
 //! (see `drop_server`) behind a cloudflared Quick Tunnel. The background flow
-//! mirrors START/PROXY/RUN/HOOK's reserve-entry → spawn-worker →
-//! poll-for-URL shape; the worker binds the origin itself on
-//! `127.0.0.1:<port>` (fail-fast on a bind error), so success is "URL
-//! published" — no separate origin probe.
+//! mirrors START's reserve-entry → spawn-worker → poll-for-URL shape,
+//! sharing `cmd/start.rs`'s fail-fast helpers (`fail_start`/`fail_timeout`);
+//! the poll loop itself is drop-specific (the success arm also prints the
+//! token). The worker binds the origin itself on `127.0.0.1:<port>`
+//! (fail-fast on a bind error), so success is "URL published" — no separate
+//! origin probe.
 //!
 //! The START flow's directory safety checks (`resolve_dir` +
 //! `is_sensitive_dir`) run BEFORE any state is touched, and the worker
@@ -24,23 +26,26 @@
 //! [`find_drop_dir_conflict`]); the origin's write path is cross-process safe
 //! on its own regardless (see `drop_server`).
 //!
-//! The foreground flow duplicates the shared machinery from `cmd/start.rs`
-//! (`run_foreground_inner`) — that file is outside this area's allowed
-//! paths, and the repo's frozen-core rule prefers duplication with "keep in
-//! sync" comments over touching shared files. Keep in sync with
-//! `cmd/start.rs::run_foreground_inner` (and `cmd/hook.rs`'s copy).
+//! The foreground flow mirrors `cmd/start.rs::run_foreground_inner`'s shape
+//! but stays separate: a merge needs a fourth origin variant (static/proxy/
+//! run + drop), and the drop-specific parts (token file before the origin,
+//! token block printed as soon as the origin is up) read clearer inline.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::AtomicBool;
+use std::time::Instant;
 
 use anyhow::{Context, bail, ensure};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Mutex;
 
+use super::{POLL_INTERVAL, POLL_TIMEOUT};
 use crate::cloudflared;
-use crate::cmd::start::{is_sensitive_dir, resolve_dir};
+use crate::cmd::start::{
+    EntryGuard, SERVER_SHUTDOWN_TIMEOUT, drain_and_announce, fail_start, fail_timeout,
+    is_sensitive_dir, resolve_dir,
+};
 use crate::drop_server::{self, DropStore};
 use crate::error::Result;
 use crate::model::{Registry, Service, ServiceKind};
@@ -50,17 +55,6 @@ use crate::port;
 use crate::proc;
 use crate::spawn;
 use crate::state::StateDir;
-
-/// Poll cadence for the worker's public URL (mirrors START/PROXY/RUN/HOOK's
-/// private loop).
-const POLL_INTERVAL: Duration = Duration::from_millis(250);
-/// Upper bound on how long the parent waits for the tunnel URL.
-const POLL_TIMEOUT: Duration = Duration::from_secs(30);
-/// Most bytes read from a log when surfacing a start-failure reason.
-const LAST_REASON_CAP: u64 = 16 * 1024;
-/// Bound on draining in-flight uploads on Ctrl-C before the server task is
-/// aborted (mirrors `cmd/start.rs`).
-const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Entry point for the DROP command.
 pub async fn run(
@@ -130,9 +124,8 @@ fn resolve_token(token: Option<String>) -> Result<String> {
 
 /// Background flow: reserve the entry, write the token file, spawn the
 /// detached DROP worker (which binds the origin itself), then poll for the
-/// tunnel URL (failing fast if the worker dies first). Mirrors
-/// `cmd::start::run_background`/`cmd::proxy`/`cmd::run`/`cmd::hook`
-/// shape-for-shape; keep the five in sync.
+/// tunnel URL (failing fast if the worker dies first). A drop-specific
+/// sibling of start's `poll_for_url`: the success arm also prints the token.
 async fn run_background(
     dir: PathBuf,
     port: u16,
@@ -246,22 +239,15 @@ async fn run_background(
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
-    // Timed out: the worker + cloudflared may still be alive, so tear them
-    // down (the group kill reaches the worker's children) before bailing.
-    proc::shutdown_process_group(worker_pid).await;
-    if let Err(cleanup_err) = Registry::update(&state, |reg| {
-        reg.remove(id);
-    }) {
-        tracing::warn!(%cleanup_err, id, "failed to clean up registry entry after URL timeout");
-    }
-    let reason = last_reason(&state, &name);
-    bail!("timed out waiting for the tunnel URL{reason}")
+    // Timed out: tear the live worker + cloudflared down (the group kill
+    // reaches the worker's children) and remove the entry before bailing.
+    fail_timeout(&state, id, &name, worker_pid).await
 }
 
-/// Reserve the drop entry inside the `Registry::update` flock (shared by both
-/// start flows): refuse a second drop service on the same bucket (see
-/// [`find_drop_dir_conflict`]), resolve the name, push the entry. Returns
-/// (id, name, service_dir).
+/// Reserve the drop entry inside the `Registry::update` flock. Drop-specific
+/// (not the shared `start::reserve_entry`): it refuses a second drop service
+/// on the same bucket (see [`find_drop_dir_conflict`]) and returns the
+/// service dir so the caller can store the token file before spawning.
 fn reserve_entry(
     state: &StateDir,
     dir: &Path,
@@ -314,74 +300,15 @@ fn reserve_entry(
     })?
 }
 
-/// Tear the just-started service down and fail: shared by the poll loop's
-/// fail-fast arms. Duplicated from `cmd/hook.rs`'s frozen-core split; keep
-/// in sync.
-async fn fail_start(state: &StateDir, id: u64, name: &str, worker_pid: u32) -> Result<()> {
-    proc::shutdown_process_group(worker_pid).await;
-    if let Err(cleanup_err) = Registry::update(state, |reg| {
-        reg.remove(id);
-    }) {
-        tracing::warn!(%cleanup_err, id, "failed to clean up registry entry after worker death");
-    }
-    let reason = last_reason(state, name);
-    bail!("worker for '{name}' exited before the tunnel came up{reason}")
-}
-
-/// Best-effort last non-empty log line for a start-failure message:
-/// `tunnel.log` first (cloudflared's own output), then `worker.log`.
-/// Duplicated from `cmd/start.rs`/`cmd/hook.rs` (private there); keep in sync.
-fn last_reason(state: &StateDir, name: &str) -> String {
-    let pick = [state.tunnel_log(name), state.worker_log(name)]
-        .into_iter()
-        .find_map(|p| last_line(&p));
-    match pick {
-        Some(line) => format!(":\n  {line}"),
-        None => String::new(),
-    }
-}
-
-/// The last non-empty line of `path`, reading at most `LAST_REASON_CAP`
-/// trailing bytes so a chatty cloudflared cannot make a failure message slurp
-/// megabytes. Duplicated from `cmd/start.rs`; see [`last_reason`].
-fn last_line(path: &Path) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    if len > LAST_REASON_CAP {
-        // Seek into the trailing window; the first "line" then starts mid-file
-        // and is likely partial, so drop everything up to the first newline
-        // (if the window has no newline at all, use it rather than drop the
-        // reason).
-        file.seek(SeekFrom::Start(len - LAST_REASON_CAP)).ok()?;
-    }
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf);
-    let text: &str = if len > LAST_REASON_CAP {
-        match text.find('\n') {
-            Some(i) => &text[i + 1..],
-            None => text.as_ref(),
-        }
-    } else {
-        text.as_ref()
-    };
-    text.lines()
-        .map(str::trim)
-        .rfind(|l| !l.is_empty())
-        .map(str::to_owned)
-}
-
 /// One bucket, one owner: find an existing Drop service whose upload target
-/// IS `dir` (canonical comparison — aliases and `..` spellings resolve to the
-/// same answer), returning its name. WHY: two origins on one directory would
-/// race writes and stack their 1 GiB total-cap allowances. Checked INSIDE the
-/// `Registry::update` flock in both start flows, so concurrent `ft drop`s are
-/// serialized. Only Drop-vs-Drop conflicts: a read-only Static publish of
-/// the same directory is untouched by uploads landing in it and stays
-/// allowed. An entry whose dir cannot be resolved cannot be PROVEN equal, so
-/// it does not conflict (the worker's own resolve_dir check refuses such a
-/// bucket at startup anyway).
+/// IS `dir` (canonical comparison — aliases and `..` spellings resolve to
+/// the same answer), returning its name. Two origins on one directory would
+/// race writes and stack their 1 GiB total-cap allowances. Checked INSIDE
+/// the `Registry::update` flock, so concurrent `ft drop`s are serialized.
+/// Only Drop-vs-Drop conflicts: a read-only Static publish of the same
+/// directory is untouched by uploads and stays allowed. An unresolvable
+/// entry dir cannot be PROVEN equal, so it does not conflict (the worker's
+/// own resolve_dir check refuses such a bucket at startup anyway).
 fn find_drop_dir_conflict(reg: &Registry, dir: &Path) -> Option<String> {
     let target = std::fs::canonicalize(dir).ok()?;
     reg.services
@@ -395,28 +322,6 @@ fn find_drop_dir_conflict(reg: &Registry, dir: &Path) -> Option<String> {
         })
 }
 
-/// RAII guard that removes a reserved registry entry on drop — the foreground
-/// flow has early-`?`/panic exits between reserve and teardown, and every one
-/// must release the entry. Duplicated from `cmd/start.rs` (private there);
-/// keep in sync.
-struct EntryGuard {
-    state: StateDir,
-    id: u64,
-}
-
-impl Drop for EntryGuard {
-    fn drop(&mut self) {
-        if let Err(e) = Registry::update(&self.state, |reg| {
-            reg.remove(self.id);
-        }) {
-            // Runs on every foreground exit path including panics; a failed
-            // cleanup must be visible or the entry leaks until `ft prune`.
-            // tracing is sync-safe inside Drop.
-            tracing::warn!(%e, id = self.id, "failed to clean up foreground registry entry on drop");
-        }
-    }
-}
-
 /// Why the foreground keep-alive loop ended. A drop foreground has no command
 /// child, so unlike `cmd/start.rs`'s enum there is no `CommandExited` arm.
 enum ReaderExit {
@@ -426,11 +331,9 @@ enum ReaderExit {
 
 /// Foreground flow: run the drop origin and tunnel in THIS process and block
 /// until cloudflared exits, Ctrl-C is received, or (Unix) SIGTERM arrives.
-/// Duplicated from `cmd/start.rs::run_foreground_inner` (frozen-core split —
-/// see the module docs); keep in sync. Drop-specific: the kind is always
-/// [`ServiceKind::Drop`], the origin writes uploads into the target
-/// directory, the token file is written before the origin starts, and the
-/// token block is printed as soon as the origin is up.
+/// Drop-specific: the origin writes uploads into the target directory, the
+/// token file is written before the origin starts, and the token block is
+/// printed as soon as the origin is up.
 async fn run_foreground(
     dir: PathBuf,
     port: u16,
@@ -452,10 +355,7 @@ async fn run_foreground(
         reserve_entry(&state, &dir, port, name, std::process::id(), true)?;
 
     // From here, every exit path must release the reserved entry.
-    let _entry = EntryGuard {
-        state: state.clone(),
-        id,
-    };
+    let _entry = EntryGuard::new(state.clone(), id);
 
     // The token file before the origin starts: `ft detail` shows it, and the
     // in-process origin below is built from the same value.
@@ -507,9 +407,8 @@ async fn run_foreground(
     let tunnel_pid = child.id();
 
     // Mirror cloudflared output to stdout AND tunnel.log, and publish the
-    // public URL on first discovery (so `ft open`/`ft detail` work too).
-    // Duplicated from `cmd/start.rs::drain_and_announce` (frozen-core
-    // split); keep in sync.
+    // public URL on first discovery (so `ft open`/`ft detail` work too) —
+    // via start's shared drain_and_announce.
     let found = Arc::new(AtomicBool::new(false));
     let mut tasks = Vec::new();
     if let Some(out) = child.stdout.take() {
@@ -600,56 +499,6 @@ async fn run_foreground(
 
     // The `_entry` guard removes our registry entry on return.
     Ok(())
-}
-
-/// Read `lines` to EOF, mirror each line to stdout AND `tunnel.log`, and
-/// publish the first discovered Quick Tunnel URL onto the registry entry
-/// (printing the foreground success banner at the same time). Duplicated
-/// from `cmd/start.rs::drain_and_announce` (private there); keep in sync.
-#[allow(clippy::too_many_arguments)]
-async fn drain_and_announce<R>(
-    mut lines: tokio::io::Lines<R>,
-    found: Arc<AtomicBool>,
-    name: String,
-    port: u16,
-    state: StateDir,
-    id: u64,
-    tunnel_pid: Option<u32>,
-    log_writer: Arc<tokio::sync::Mutex<tokio::fs::File>>,
-) where
-    R: tokio::io::AsyncBufRead + Unpin,
-{
-    use tokio::io::AsyncWriteExt;
-    while let Ok(Some(line)) = lines.next_line().await {
-        println!("{line}");
-        {
-            let mut f = log_writer.lock().await;
-            let _ = f.write_all(line.as_bytes()).await;
-            let _ = f.write_all(b"\n").await;
-            let _ = f.flush().await;
-        }
-        if !found.load(Ordering::Acquire)
-            && let Some(url) = cloudflared::extract_url(&line)
-            && !found.swap(true, Ordering::AcqRel)
-        {
-            println!();
-            println!("Started {name}");
-            println!();
-            println!("Local:   http://127.0.0.1:{port}");
-            println!("Public:  {url}");
-            println!();
-            if let Err(e) = Registry::update(&state, |reg| {
-                if let Some(svc) = reg.find_mut(&id.to_string()) {
-                    svc.public_url = Some(url.clone());
-                    if svc.tunnel_pid.is_none() {
-                        svc.tunnel_pid = tunnel_pid;
-                    }
-                }
-            }) {
-                tracing::error!(%e, "failed to record foreground tunnel URL");
-            }
-        }
-    }
 }
 
 #[cfg(test)]
