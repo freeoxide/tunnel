@@ -236,9 +236,11 @@ const HYPER_HEAD_BUDGET: usize = 417_792;
 /// [`HYPER_HEAD_BUDGET`] bytes can be quote/backslash-heavy — the http
 /// crate admits raw `"` in the request path and both `"` and `\` in
 /// header values (passing them through `HeaderValue::to_str` verbatim) —
-/// and serde_json expands each such byte 1→2. Head-borne control bytes
-/// cannot occur (the http crate rejects them in targets and header
-/// values), so 2x is the head's strict expansion ceiling; the +2 KiB
+/// and serde_json expands each such byte 1→2. Control bytes cannot occur
+/// in head material except TAB in header values (httparse admits it, hyper
+/// passes values unchecked, and `HeaderValue::to_str` accepts it) — and
+/// serde_json short-escapes TAB 1→2 as well, so 2x is the head's
+/// strict expansion ceiling; the +2 KiB
 /// slack covers the record's JSON structural bytes (field names,
 /// brackets, seq/timestamp). (The path/query portion is even tighter
 /// bounded on its own — the http crate caps a whole Uri at
