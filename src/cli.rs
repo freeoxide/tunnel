@@ -54,6 +54,9 @@ pub struct Cli {
     /// work. Security discipline is unchanged — dotfiles stay denied, symlink
     /// confinement stays on, and directories without an `index.html` still
     /// render the generated listing.
+    ///
+    /// See also `static_server`'s module docs — the normative semantics for
+    /// `--spa`/`--cors`/`--token` (this help and `StaticFlags` summarize them).
     #[arg(long)]
     pub spa: bool,
 
