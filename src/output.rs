@@ -1,13 +1,16 @@
 //! Terminal output formatting for `ft` commands.
 //!
-//! All printing lives here so command modules stay focused on control flow.
-//! Output shapes are fixed by the CLI's public contract — see the `OUTPUT
-//! FORMATS` notes in the module docs of the command layer.
+//! The fixed-format output blocks (start banner, ls table, detail report,
+//! doctor/sanitize reports, stop confirmations) live here so command modules
+//! stay focused on control flow; inherently sequential printing — interactive
+//! prompts, streamed log lines — stays in the commands themselves. Output
+//! shapes are fixed by the CLI's public contract — see the `OUTPUT FORMATS`
+//! notes in the module docs of the command layer.
 
 use crate::cmd::doctor::{Check, CheckStatus};
 use crate::model::{Service, ServiceKind};
 use chrono::{Datelike, Timelike};
-use comfy_table::{ContentArrangement, Table};
+use comfy_table::{Cell, ContentArrangement, Table};
 
 /// Format a timestamp as `YYYY-MM-DD HH:MM` (no seconds, no timezone suffix).
 fn fmt_started(service: &Service) -> String {
@@ -25,8 +28,9 @@ fn fmt_started(service: &Service) -> String {
 /// The public URL, or `(pending)` while the worker has not discovered one yet.
 ///
 /// Returns a borrowed slice to avoid cloning the (potentially long) public URL
-/// on every call. Callers that feed a `comfy_table` cell can convert with
-/// `.into()` / `.to_string()`; the `println!` paths use the borrow for free.
+/// on every call. Both call sites use the borrow for free: `println!` takes it
+/// as a format argument, and the `comfy_table` row hands it to `Cell::new`,
+/// which stringifies each cell exactly once internally.
 fn url_or_pending(service: &Service) -> &str {
     service.public_url.as_deref().unwrap_or("(pending)")
 }
@@ -90,17 +94,36 @@ pub fn print_list(services: &[Service]) {
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_header(vec!["ID", "NAME", "STATUS", "PORT", "URL"]);
 
+    // Cell::new stringifies each cell exactly once internally; passing owned
+    // Strings would allocate twice per cell (our conversion plus comfy-table's
+    // re-stringify through its blanket From<T: ToString> for Cell), so hand it
+    // borrows and plain integers instead.
     for s in services {
         table.add_row(vec![
-            s.id.to_string(),
-            s.name.clone(),
-            s.status().as_str().to_string(),
-            s.port.to_string(),
-            url_or_pending(s).to_string(),
+            Cell::new(s.id),
+            Cell::new(s.name.as_str()),
+            Cell::new(s.status().as_str()),
+            Cell::new(s.port),
+            Cell::new(url_or_pending(s)),
         ]);
     }
 
     println!("{table}");
+}
+
+/// A recorded pid rendered for the detail rows, `-` when absent (not yet
+/// spawned, or a kind of service that never carries one).
+fn pid_or_dash(pid: Option<u32>) -> String {
+    pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())
+}
+
+/// The `Directory:` row value: the carried path, or `-` when this kind of
+/// service fronts a port and carries no directory.
+fn dir_or_dash(service: &Service) -> String {
+    service
+        .dir
+        .as_deref()
+        .map_or_else(|| "-".to_string(), |d| d.display().to_string())
 }
 
 /// Print a key/value detail block for a single service, including a Logs
@@ -127,15 +150,6 @@ pub fn print_list(services: &[Service]) {
 /// `worker.log`; a hook's request record is `requests.json`; a drop's record
 /// is the bucket directory itself).
 pub fn print_detail(service: &Service) {
-    let tunnel_pid = service
-        .tunnel_pid
-        .map(|p| p.to_string())
-        .unwrap_or_else(|| "-".into());
-    let command_pid = service
-        .command_pid
-        .map(|p| p.to_string())
-        .unwrap_or_else(|| "-".into());
-
     println!("Name:         {}", service.name);
     println!("ID:           {}", service.id);
     println!("Status:       {}", service.status().as_str());
@@ -149,13 +163,7 @@ pub fn print_detail(service: &Service) {
         }
         ServiceKind::Drop => {
             println!("Mode:         {}", service.kind.as_str());
-            println!(
-                "Directory:    {}",
-                service
-                    .dir
-                    .as_deref()
-                    .map_or_else(|| "-".to_string(), |d| d.display().to_string())
-            );
+            println!("Directory:    {}", dir_or_dash(service));
         }
         ServiceKind::Static => {
             println!(
@@ -166,13 +174,7 @@ pub fn print_detail(service: &Service) {
                     "background"
                 }
             );
-            println!(
-                "Directory:    {}",
-                service
-                    .dir
-                    .as_deref()
-                    .map_or_else(|| "-".to_string(), |d| d.display().to_string())
-            );
+            println!("Directory:    {}", dir_or_dash(service));
             // The static-origin flags as started (`--spa`/`--cors`/`--token`):
             // always rendered on/off so the shape is predictable, with the
             // token row only when one is configured (a `-` placeholder for a
@@ -202,8 +204,8 @@ pub fn print_detail(service: &Service) {
     }
     println!("Port:         {}", service.port);
     println!("Worker PID:   {}", service.worker_pid);
-    println!("Tunnel PID:   {tunnel_pid}");
-    println!("Command PID:  {command_pid}");
+    println!("Tunnel PID:   {}", pid_or_dash(service.tunnel_pid));
+    println!("Command PID:  {}", pid_or_dash(service.command_pid));
     println!("Started:      {}", fmt_started(service));
     println!("Local URL:    {}", service.local_url);
     println!("Public URL:   {}", url_or_pending(service));
