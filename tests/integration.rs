@@ -1165,13 +1165,11 @@ fn run_fixture_renders_in_ls_and_detail() {
 
 // --- `ft drop` (usage, pre-flights, seeded fixtures; no cloudflared) --------
 //
-// Like the hook section, only paths that stop BEFORE cloudflared is looked up
-// are driven here: `ft drop` is ft's own origin, so its pre-flights (upload
-// target resolution/sensitivity, occupied port, empty token) all run ahead of
-// that lookup, and everything past it would depend on whether this machine
-// has cloudflared. The origin itself (token auth, caps, sanitization,
-// confinement on the GET side) is covered by the drop_server unit tests
-// driving the Router directly with tower::oneshot.
+// Only paths that stop BEFORE cloudflared is looked up run here: the
+// pre-flights (upload target resolution/sensitivity, occupied port, empty
+// token) all run ahead of that lookup. The origin itself (token auth, caps,
+// sanitization, GET-side confinement) is covered by the drop_server unit
+// tests driving the Router directly with tower::oneshot.
 
 #[test]
 fn drop_help_documents_the_command() {
@@ -1194,9 +1192,8 @@ fn drop_help_documents_the_command() {
     );
     assert!(out.contains("--token"), "missing --token in: {out}");
     assert!(out.contains("--max-size"), "missing --max-size in: {out}");
-    // The token is the bucket's write credential and its flag is the
-    // command's public surface: the help must explain that uploads REQUIRE
-    // it and that one is minted and printed when omitted.
+    // The token is the bucket's write credential: the help must explain that
+    // uploads REQUIRE it and that one is minted and printed when omitted.
     assert!(
         out.contains("token"),
         "the help must mention the token in: {out}"
@@ -1210,17 +1207,14 @@ fn drop_help_documents_the_command() {
 #[test]
 fn drop_usage_errors_and_preflight_refusals_leave_no_state() {
     // Every rejected invocation must fail before the state tree exists: clap
-    // usage errors (missing positional, port/cap ranges) and the command's
-    // own pre-flights (nonexistent target, sensitive target, empty token)
-    // all precede any reservation or spawn.
+    // usage errors and the command's own pre-flights all precede any
+    // reservation or spawn.
     let dir = TempDir::new().unwrap();
     let missing = dir.path().join("does-not-exist");
     let missing = missing.to_string_lossy().into_owned();
-    // A neutral EXISTING directory for the token-refusal cases: it must not
-    // be an ancestor of ft's state root (pinned under `dir`), because serving
-    // an ancestor of the state tree would expose registry.json via subpaths
-    // and is — correctly — refused as sensitive (R3-7). A second tempdir is
-    // a sibling, not an ancestor.
+    // A neutral EXISTING directory for the token-refusal cases: a sibling
+    // tempdir, not an ancestor of ft's state root (an ancestor would be —
+    // correctly — refused as sensitive, R3-7).
     let neutral = TempDir::new().unwrap();
     let neutral_arg = neutral.path().to_string_lossy().into_owned();
     for (args, expected) in [
@@ -1250,9 +1244,8 @@ fn drop_usage_errors_and_preflight_refusals_leave_no_state() {
             &["drop", &neutral_arg, "--token", ""][..],
             "--token must be a non-empty secret",
         ),
-        // R3-9's flip side at the CLI boundary: a WHITESPACE-ONLY token is
-        // refused (not silently accepted untrimmed) — the trim happens once,
-        // at token resolution, before anything is stored or printed.
+        // A WHITESPACE-ONLY token is refused too — the trim happens once, at
+        // token resolution, before anything is stored or printed.
         (
             &["drop", &neutral_arg, "--token", "   "][..],
             "--token must be a non-empty secret",
@@ -1281,8 +1274,7 @@ fn drop_usage_errors_and_preflight_refusals_leave_no_state() {
 fn drop_refuses_an_occupied_port_and_leaves_no_state() {
     // The drop origin is ft's OWN server, so an occupied port fails the
     // pre-flight — before cloudflared is looked up and before any state
-    // exists — with a message that names the port (same as `ft hook`, the
-    // inverse of `ft proxy`'s dead-upstream pre-flight).
+    // exists — with a message that names the port (same as `ft hook`).
     let dir = TempDir::new().unwrap();
     let bucket = TempDir::new().unwrap();
     let bucket_arg = bucket.path().to_string_lossy().into_owned();
@@ -1319,18 +1311,13 @@ fn drop_refuses_an_occupied_port_and_leaves_no_state() {
 
 #[test]
 fn drop_refuses_fts_own_state_tree_in_every_overlap() {
-    // R3-7: ft's state root ($XDG_STATE_HOME/freeoxide/tunnel) holds
-    // registry.json, worker/tunnel logs, hook request records, and every
-    // service's drop-token file — all non-dotfile, so a drop bucket placed ON
-    // the state root made them publicly readable via unauthenticated GETs
-    // (and a bucket WRITE-touches the tree on top of that). The shared
-    // sensitive-dir check must refuse every overlap with the state tree: the
-    // root itself, a subtree (services/ — the token files live there), and an
-    // ancestor (which would serve the tree via subpaths) — before any state
-    // is touched. The plain-bucket counterpart
-    // (`drop_refuses_an_occupied_port_and_leaves_no_state`) already pins that
-    // a NON-state dir still passes this pre-flight and fails later, at the
-    // port check.
+    // R3-7: ft's state root holds registry.json, logs, hook records, and
+    // every service's drop-token file — all non-dotfile, so a bucket placed
+    // ON the state tree made them publicly readable via unauthenticated GETs
+    // (and WRITE-touched the tree on top). The shared sensitive-dir check
+    // must refuse every overlap — root, subtree, ancestor — before any state
+    // is touched. The plain-bucket counterpart above pins that a NON-state
+    // dir still passes this pre-flight and fails later, at the port check.
     let dir = TempDir::new().unwrap();
     let state_root = dir.path().join("freeoxide").join("tunnel");
     let services = state_root.join("services");
@@ -1397,15 +1384,14 @@ fn start_refuses_fts_own_state_dir_noninteractively() {
 
 #[test]
 fn drop_fixture_renders_in_ls_detail_and_kill() {
-    // A seeded `"kind": "drop"` entry (the on-disk shape `ft drop` reserves —
-    // note `dir` IS carried, like static, because the bucket is a real
-    // directory) must render through the same lifecycle commands as any other
-    // kind: kind-agnostic in `ls`, kind-aware in `detail` — Mode names the
-    // drop, the Directory row names the upload target, the Token row reads
-    // the service's private token file (here seeded so the display contract
-    // is pinned end-to-end), and the Logs list has no server.log (the drop
-    // origin's record is the bucket directory itself). kill stays
-    // kind-agnostic: a dead worker pid makes the entry stale and removable.
+    // A seeded `"kind": "drop"` entry (the on-disk shape `ft drop` reserves;
+    // `dir` IS carried, like static) must render through the same lifecycle
+    // commands as any other kind: kind-agnostic in `ls`, kind-aware in
+    // `detail` — Mode names the drop, the Directory row names the upload
+    // target, the Token row reads the service's private token file (seeded
+    // here so the display contract is pinned end-to-end), and the Logs list
+    // has no server.log. kill stays kind-agnostic: a dead worker pid makes
+    // the entry stale and removable.
     let dir = TempDir::new().unwrap();
     // Anchor the service's state_dir inside the test's tempdir so the token
     // file the detail command reads is private to this test.
