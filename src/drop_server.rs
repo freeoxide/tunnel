@@ -369,6 +369,14 @@ fn query_param(query: &str, key: &str) -> Option<String> {
     })
 }
 
+/// Extract the credentials after a case-insensitive `Bearer` scheme match
+/// (RFC 7235: auth schemes are case-insensitive; the credentials are not).
+/// Byte-in-sync twin of `static_server::bearer_token`; keep the two in sync.
+fn bearer_token(value: &str) -> Option<&str> {
+    let (scheme, credentials) = value.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then_some(credentials)
+}
+
 /// Token-check middleware: GET/HEAD pass (reads are public); every other
 /// method must present the token, constant-time compared, BEFORE its body is
 /// read (an unauthenticated client pays no bytes into us).
@@ -385,7 +393,7 @@ async fn require_token(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
+        .and_then(bearer_token);
     let ok = match header_token {
         Some(t) => tokens_match(t, &store.token),
         // Only the query arm needs an allocation (percent-decoding); the
@@ -916,6 +924,41 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600, "stored uploads must be owner-only");
         }
+    }
+
+    #[tokio::test]
+    async fn bearer_scheme_matches_case_insensitively_per_rfc_7235() {
+        // RFC 7235: the auth SCHEME is case-insensitive — `bearer <token>`
+        // must authenticate a mutation (the credentials stay case-sensitive).
+        let (_tmp, store) = test_store(MAX_TOTAL_STORE);
+        let resp = router(store.clone())
+            .oneshot(req(
+                "POST",
+                "/lower.txt",
+                &[("authorization", "bearer tok-abc123")],
+                b"lo",
+            ))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(
+            std::fs::read(store.root.join("lower.txt")).expect("read back"),
+            b"lo".to_vec()
+        );
+        let resp = router(store.clone())
+            .oneshot(req(
+                "POST",
+                "/nope.txt",
+                &[("authorization", "BEARER TOK-ABC123")],
+                b"lo",
+            ))
+            .await
+            .expect("oneshot");
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "the credentials stay case-sensitive"
+        );
     }
 
     #[tokio::test]

@@ -537,7 +537,7 @@ async fn require_token(State(expected): State<String>, request: Request, next: N
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
+        .and_then(bearer_token)
         .map(str::to_owned);
     let query_token = request.uri().query().and_then(|q| query_param(q, "token"));
     let ok = header_token
@@ -552,6 +552,14 @@ async fn require_token(State(expected): State<String>, request: Request, next: N
             .into_response();
     }
     next.run(request).await
+}
+
+/// Extract the credentials after a case-insensitive `Bearer` scheme match
+/// (RFC 7235: auth schemes are case-insensitive; the credentials are not).
+/// Byte-in-sync twin of `drop_server::bearer_token`; keep the two in sync.
+fn bearer_token(value: &str) -> Option<&str> {
+    let (scheme, credentials) = value.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then_some(credentials)
 }
 
 /// Extract the first value of `key` from a raw query string, percent-decoded
@@ -1579,6 +1587,53 @@ mod origin_flags_tests {
             .await
             .expect("wrong query token");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "wrong ?token=");
+    }
+
+    #[tokio::test]
+    async fn bearer_scheme_matches_case_insensitively_per_rfc_7235() {
+        // RFC 7235: the auth SCHEME is case-insensitive (`bearer <secret>`
+        // must pass); the credentials themselves stay case-sensitive.
+        let dir = spa_dir();
+        let app = flagged_router(dir.path(), false, false, Some("sekrit"));
+        for scheme in ["bearer", "BEARER", "BeArEr"] {
+            let resp = app
+                .clone()
+                .oneshot(req_with(
+                    "GET",
+                    "/asset.js",
+                    &[("authorization", &format!("{scheme} sekrit"))],
+                ))
+                .await
+                .expect("oneshot");
+            assert_eq!(resp.status(), StatusCode::OK, "scheme {scheme} must pass");
+        }
+        let resp = app
+            .clone()
+            .oneshot(req_with(
+                "GET",
+                "/asset.js",
+                &[("authorization", "BEARER SEKRIT")],
+            ))
+            .await
+            .expect("oneshot");
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "the credentials stay case-sensitive"
+        );
+        let resp = app
+            .oneshot(req_with(
+                "GET",
+                "/asset.js",
+                &[("authorization", "basic sekrit")],
+            ))
+            .await
+            .expect("oneshot");
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a different scheme never carries the token"
+        );
     }
 
     #[tokio::test]
