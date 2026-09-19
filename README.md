@@ -6,7 +6,10 @@ through a Cloudflare Quick Tunnel.
 Freeoxide Tunnel is a small Rust CLI, shipped as the `ft` binary, that runs a localhost static
 file server and fronts it with an ephemeral `cloudflared` Quick Tunnel — giving you a public
 `*.trycloudflare.com` URL in seconds, with no Cloudflare account or DNS setup required. It can
-also skip the static server entirely and front a local port you already serve (`ft proxy`).
+also skip the static server entirely: front a local port you already serve (`ft proxy`), run a
+command such as a dev server and tunnel it as one unit (`ft run`), or expose small ft-built
+origins — a webhook receiver/inspector (`ft hook`) and a token-gated upload receiver
+(`ft drop`).
 
 ---
 
@@ -83,7 +86,10 @@ ft ./dist
 `ft` prints the Quick Tunnel URL and keeps the tunnel running as a detached background worker.
 
 Already running your own server on a port? Skip the static server and attach a tunnel to it
-directly with `ft proxy 3000`.
+directly with `ft proxy 3000`. Want the tunnel to own the whole lifecycle — starting the
+server, and stopping it with the tunnel? `ft run --port 3000 -- npm run dev` does that.
+`ft hook` and `ft drop` expose small ft-built origins: a webhook inspector and an upload
+bucket.
 
 ## Commands
 
@@ -109,6 +115,9 @@ literally named `proxy`), prefix it with `./` — `ft ./proxy` — to reach the 
 | `ft prune` | Remove stale services whose worker is no longer running. (alias: `gc`) |
 | `ft sanitize` | Remove every dangling service: stale entries plus tunnels whose origin port is dead. (alias: `clean`) |
 | `ft proxy <port>` | Attach a tunnel to a local server that is already running on `port`. |
+| `ft run --port <port> -- <command...>` | Run a command (e.g. a dev server) and tunnel it — `ft kill` stops command and tunnel together. |
+| `ft hook` | Run a webhook receiver that records every request; inspect at `/__inspect` or `/__inspect.json`. |
+| `ft drop <dir>` | Run an upload receiver into `dir` — uploads require a token, downloads are public. |
 
 ### Flags for START
 
@@ -116,6 +125,14 @@ literally named `proxy`), prefix it with `./` — `ft ./proxy` — to reach the 
 - `--port <port>` — local port to bind on; defaults to a free, allocated port.
 - `--foreground` / `-f` — run in the foreground instead of spawning a detached worker.
 - `--yes` / `-y` — answer "yes" to the sensitive-directory confirmation prompt (e.g. when publishing `$HOME` or `/`); non-interactive runs against a sensitive directory must pass this or they refuse to start.
+- `--spa` — serve a single-page app: a path that matches no file under the directory falls back to the root `index.html`, so client-side router deep links work. Security discipline is unchanged — dotfiles stay denied, symlink confinement stays on, and a directory without an `index.html` keeps its honest 404 (the generated listing still renders too).
+- `--cors` — stamp permissive CORS headers on this origin (`Access-Control-Allow-Origin: *`, methods GET/HEAD/OPTIONS, wildcard request headers), on successful and error responses alike. Preflight OPTIONS requests are not answered specially — see the `--token` note below for what that means when the two are combined.
+- `--token <secret>` — require this secret on every request of the static origin, sent as `Authorization: Bearer <secret>` (preferred) or `?token=<secret>`; anything else is answered 401 before the served tree can be probed at all. You choose the value (it is never auto-generated); it is stored in the service's registry entry and shown again by `ft detail`. Prefer the header form: a `?token=` query string ends up in shell history and in client/proxy logs.
+
+The three origin flags belong to the implicit START only — its origin is the only one they
+can configure — so `ft proxy`, `ft run`, `ft hook`, and `ft drop` reject them as usage
+errors. They persist on the registry entry (the detached worker re-applies them exactly as
+given), and `ft detail` shows SPA/CORS on/off plus the token when one is set.
 
 ### Flags for PROXY
 
@@ -125,6 +142,77 @@ literally named `proxy`), prefix it with `./` — `ft ./proxy` — to reach the 
 These flags belong after the subcommand (`ft proxy 3000 --name api`). A `--name` or
 `-f` placed before it is parsed as the implicit START's top-level flags, which `proxy`
 ignores. There is no `--yes` — no directory is published, so there is nothing to confirm.
+
+### Run: tunnel a command's whole lifecycle
+
+`ft run --port 3000 -- npm run dev` is lifecycle glue for a dev server (or any command that
+ends up serving a port): `ft` spawns the command, waits for `127.0.0.1:3000` to accept
+connections, and points cloudflared straight at that port — identical to `ft proxy`, nothing
+ft-owned in between. The wait exists for the same reason proxy's pre-flight does: a friendly
+"server never came up" — with the command's captured output — beats a tunnel that comes up
+happily and then 502s every request. If the command exits, its tunnel is torn down instead of
+serving 502s forever.
+
+The port is explicit and required (`ft` never guesses which port a dev server picked) and is
+also exported to the command's environment as `PORT`, so well-behaved tools pick it up
+without a flag. An already-occupied port is refused before anything is created — the command
+ft spawns has to be able to bind it.
+
+The detached worker owns the command it spawns: the child is made the leader of its own
+process group at spawn, and the worker tears that whole group down — the command plus
+everything it forked (`npm run dev`'s vite, say) — on every exit path, SIGTERM first and
+SIGKILL after a short grace (on Linux a `PR_SET_PDEATHSIG` additionally kills the child if
+the worker itself is hard-killed, and on Windows the worker's Job Object covers the whole
+tree). So `ft kill` stops the tunnel AND the command together, and a well-behaved command
+leaves no orphans — the known edges are a command that ignores SIGTERM (ft's SIGKILL
+escalation can be cut short by `ft kill`'s own stop deadline) and a grandchild that outlives
+a child which exited on its own. The child's output is teed into the service's `worker.log`,
+which is what `ft logs` reads. Doctor knows about the failure mode hard kills can still
+leave: a worker that died without taking its command down is flagged "tunnel dead, command
+still running" — an unverified pid that could equally be a recycled one, since an operator
+command carries no identity marker and nothing ties the port's listener to the recorded pid
+(see Diagnosing problems). Flags: `--name <name>` (defaults to `run-<port>`), `--foreground`
+/ `-f`. The command itself goes after `--`; everything after the separator reaches it
+verbatim, including flag-looking arguments.
+
+### Hook: record and inspect webhooks
+
+`ft hook` exposes an ft-built origin that answers `200 OK` to every request and records it —
+method, path, query, a small allowlist of headers, and the body up to 64 KiB (larger bodies
+are rejected with 413) — into a private per-service store. One exception: the inspection
+paths `/__inspect` and `/__inspect.json` accept GET only, so a non-GET there is answered
+405 and not recorded. Credential-looking headers
+(Authorization, Cookie, signature headers) are never recorded. Inspect the records through
+the tunnel itself: `GET /__inspect` renders an HTML view in your browser, `GET
+/__inspect.json` returns the same records as a JSON array for scripts, both newest first.
+Only the newest records are kept — `--keep <N>` (1–1000, default 200) — so the disk cannot
+fill, and the record survives restarts.
+
+The hook is entirely public: anyone holding the tunnel URL can POST requests into it and read
+the inspection view, so treat everything it records as readable by exactly the audience that
+can reach the tunnel. Flags: `--port <port>` (defaults to a free, allocated port), `--name
+<name>` (defaults to `hook-<port>`), `--keep <N>`, `--foreground` / `-f`.
+
+### Drop: a token-gated upload bucket
+
+`ft drop <dir>` exposes an ft-built origin that accepts uploads into an existing `dir` and
+serves the stored files back. Uploads are `POST`/`PUT` of a raw body named by the path
+(`POST /file.txt`) or by `?filename=` on `/` (both at once is an error); multipart is not
+parsed and is stored as opaque bytes. Every upload MUST present the access token —
+`Authorization: Bearer <secret>` or `?token=<secret>`, compared in constant time — and is
+answered 401 before its body is read. Omitting `--token <secret>` is fine: a crypto-random
+token is generated, printed once at start, stored in the service's private state dir, and
+shown again by `ft detail`. Downloads (`GET`) need no token: anyone holding the tunnel URL
+can read what you dropped.
+
+Caps keep the bucket bounded: an upload over `--max-size` bytes (default 64 MiB) is rejected
+with 413, and a fixed 1 GiB total-store cap answers 507 once full. Uploads never overwrite an
+existing file (409); dotfiles, separators, `..`, and Windows-reserved names are rejected with
+an explanation rather than mangled; only one drop service may target a given directory; and
+sensitive directories (`/`, `$HOME`, `/etc`) are refused outright — this is a WRITE surface
+opened to the internet, so the target is held to a stricter standard than a read-only static
+publish (there is no `--yes`). Flags: `--port <port>`, `--name <name>` (defaults to
+`drop-<port>`), `--token <secret>`, `--max-size <bytes>`, `--foreground` / `-f`.
 
 ### Diagnosing problems
 
@@ -138,6 +226,15 @@ Run `ft doctor` when a tunnel misbehaves, or to sanity-check the setup. It check
   upstream server went away: the tunnel stays up and 502s every request, and nothing in
   `ft ls` shows it (`ft sanitize` cleans such zombies — background ones; a foreground one
   is left for its own terminal);
+- for a `ft run` service whose worker died, whether its recorded command child died with
+  it. If a process is still alive at the recorded pid — and the run's port still answers —
+  doctor reports "tunnel dead, command still running". Neither signal proves identity: the
+  pid is existence-probed only (an operator command has no reliable identity marker), so it
+  may be a recycled, unrelated process, and the listener on the run's port cannot be tied to
+  the recorded pid either — the port answering is supporting evidence, not proof. The hint
+  therefore tells you to check what the pid is before stopping it by hand; `ft kill` removes
+  the stale entry, but it cannot signal the command, because the worker that tore the
+  command's group down is gone;
 - each service's state directory (where its logs live) still exists.
 
 `ft doctor` is strictly read-only: it never mutates the registry, signals processes, or
@@ -174,6 +271,12 @@ ft ./dist --foreground                    # run attached to the current shell
 ft proxy 3000                             # tunnel a local server already running on port 3000
 ft proxy 3000 --name api                  # same, with an explicit service name
 ft proxy 3000 --foreground                # run the proxy tunnel attached to the current shell
+ft run --port 3000 -- npm run dev         # spawn a dev server and tunnel it as one unit
+ft hook                                   # record webhooks; inspect at /__inspect
+ft drop ~/inbox                           # upload bucket; a token is generated and printed
+ft ./dist --spa                           # single-page app: deep links fall back to index.html
+ft ./dist --cors                          # permissive CORS headers on the static origin
+ft ./dist --token sekrit                  # require a bearer token on the static origin
 ft ls                                     # list services
 ft ps                                     # same as `ft ls`
 ft detail blog                            # inspect by name
@@ -209,6 +312,15 @@ background start is interrupted during the brief window before its worker pid is
 rather than orphan the just-spawned worker; after that the reservation counts as abandoned
 and is cleaned up like any stale entry.
 
+`ft run --port 3000 -- <command>` is the managed variant: `ft` itself spawns the command
+(with `PORT` exported into its environment), waits for the port to come up, and tunnels it.
+The difference from `ft proxy` is ownership — the worker is the command's parent, gives the
+child its own process group at spawn (Linux adds a `PR_SET_PDEATHSIG` on the child; Windows
+relies on the worker's Job Object), and tears that whole group down on every exit path, so
+a stopped tunnel takes the dev server down with it. `ft hook` and `ft drop` go one step further and bring their own
+origin: the worker runs an axum server of ft's own (the same shape as the static server),
+so nothing external besides cloudflared is involved.
+
 ## State location
 
 All state lives under:
@@ -225,8 +337,10 @@ All state lives under:
 
 The root honors `$XDG_STATE_HOME` (defaulting to `~/.local/state`). Service names are reduced to
 a single safe path segment, so a registry-controlled name can never escape `services/` via `..`
-or separators. A proxy service runs no server of its own, so its directory only ever holds
-`worker.log` and `tunnel.log` — there is no `server.log`.
+or separators. A proxy or run service runs no server of its own (a run's command output is teed
+into `worker.log`), so its directory only ever holds `worker.log` and `tunnel.log` — there is no
+`server.log`. A hook service keeps its request record in `requests.json`, and a drop service
+keeps its access token in `drop-token`; both are created mode `0600`.
 
 ## Platform support
 
@@ -246,8 +360,9 @@ or separators. A proxy service runs no server of its own, so its directory only 
 
 ## Project status
 
-**MVP** — complete and usable. Functional start/stop/list/logs flow for static directories
-and already-running local servers (`ft proxy`) over Cloudflare Quick Tunnels.
+**MVP** — complete and usable. Start/stop/list/logs flow for static directories,
+already-running local servers (`ft proxy`), spawned commands (`ft run`), and ft-built
+origins (`ft hook`, `ft drop`) over Cloudflare Quick Tunnels.
 
 > Branded as **Freeoxide Tunnel** · binary `ft` · repo [freeoxide/tunnel](https://github.com/freeoxide/tunnel) · [tunnel.freeoxide.com](https://tunnel.freeoxide.com)
 

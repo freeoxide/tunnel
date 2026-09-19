@@ -13,6 +13,7 @@
 //! `kill_process_group(worker_pid)` later reach the worker and everything it
 //! spawned.
 
+use std::ffi::OsString;
 use std::path::Path;
 
 use crate::error::Result;
@@ -33,49 +34,129 @@ fn worker_token() -> String {
     format!("{mixed:016x}")
 }
 
-/// Stand-in value for the mandatory `--dir` flag when spawning a PROXY worker.
+/// Stand-in value for the mandatory `--dir` flag when spawning a worker that
+/// has no directory — a PROXY worker (fronts the operator's upstream), a RUN
+/// worker (fronts the command `ft` itself spawns), and a HOOK worker (records
+/// requests into its state dir; it serves no directory) alike.
 ///
-/// clap rejects empty flag values (`--dir ""` fails to parse), so a proxy
-/// worker — which has no directory — passes this deliberately non-existent
-/// path instead. The worker never reads it for proxy services (their spec
-/// comes from the reserved registry entry; see [`crate::worker::run`]), and
-/// even a hand-crafted direct invocation against a mis-tagged `Static`
-/// registry entry fails closed on it: `resolve_dir` refuses the non-existent
-/// path and `is_sensitive_dir` fail-closes on the un-resolvable one.
+/// clap rejects empty flag values (`--dir ""` fails to parse), so such a
+/// worker passes this deliberately non-existent path instead. The worker never
+/// reads it for proxy/run services (their spec comes from the reserved
+/// registry entry; see [`crate::worker::run`]), and even a hand-crafted direct
+/// invocation against a mis-tagged `Static` registry entry fails closed on it:
+/// `resolve_dir` refuses the non-existent path and `is_sensitive_dir`
+/// fail-closes on the un-resolvable one.
 pub(crate) const PROXY_DIR_SENTINEL: &str = "/ft-proxy-has-no-directory";
 
 /// The `run-worker` argv prefix shared by the Unix and Windows spawn paths:
-/// the `--dir` value is the served directory, or [`PROXY_DIR_SENTINEL`] for a
-/// proxy worker.
-fn run_worker_args(id: u64, name: &str, dir: Option<&Path>, port: u16) -> Vec<String> {
+/// the `--dir` value is the served directory (or the upload target for a
+/// DROP worker), or [`PROXY_DIR_SENTINEL`] for a directory-less (proxy/run/
+/// hook) worker. `command` is the Run worker's child command, passed after a
+/// trailing `--` so flag-looking child arguments are never parsed as worker
+/// flags; it must be empty for every kind that spawns no child. `keep` is the
+/// Hook worker's retention (`--keep`) and `max_size` the Drop worker's
+/// per-upload cap (`--max-size`); `None` for every other kind — all optional
+/// values ride the argv because the registry entry carries no fields for them
+/// (they are runtime configuration of the origin itself, not lifecycle
+/// state). The Drop worker's access token deliberately does NOT ride the
+/// argv: it is read from the service's private token file instead, so the
+/// secret never shows up in `ps`.
+fn run_worker_args(
+    id: u64,
+    name: &str,
+    dir: Option<&Path>,
+    port: u16,
+    command: &[OsString],
+    keep: Option<u16>,
+    max_size: Option<u64>,
+) -> Vec<OsString> {
     let dir_arg = dir
         .map(|d| d.to_string_lossy().into_owned())
         .unwrap_or_else(|| PROXY_DIR_SENTINEL.to_string());
-    vec![
-        "run-worker".to_string(),
-        "--id".to_string(),
-        id.to_string(),
-        "--name".to_string(),
-        name.to_string(),
-        "--dir".to_string(),
-        dir_arg,
-        "--port".to_string(),
-        port.to_string(),
-    ]
+    let mut args: Vec<OsString> = vec![
+        "run-worker".into(),
+        "--id".into(),
+        id.to_string().into(),
+        "--name".into(),
+        name.into(),
+        "--dir".into(),
+        dir_arg.into(),
+        "--port".into(),
+        port.to_string().into(),
+    ];
+    if let Some(keep) = keep {
+        args.push("--keep".into());
+        args.push(keep.to_string().into());
+    }
+    if let Some(max_size) = max_size {
+        args.push("--max-size".into());
+        args.push(max_size.to_string().into());
+    }
+    if !command.is_empty() {
+        args.push("--".into());
+        args.extend(command.iter().cloned());
+    }
+    args
 }
 
 /// Spawn the detached `run-worker` child for a service and return its pid.
 ///
-/// `dir: None` spawns a PROXY worker (the service fronts an upstream the
-/// operator already runs on `port`, and the worker starts no server of its
-/// own); `dir: Some(_)` spawns the usual STATIC worker. The child is given a
-/// fresh process group and session, its stdin is wired to `/dev/null`, and its
-/// stdout + stderr are both pointed at the service's `worker.log` (opened in
-/// append mode so restarts accumulate rather than clobber). The child is
-/// intentionally *not* awaited and `kill_on_drop` is left disabled so it keeps
-/// running after this function returns and after the parent process exits.
-#[cfg(unix)]
+/// `dir: None` spawns a worker that fronts a port rather than a directory
+/// (proxy, or run whose child is passed separately); `dir: Some(_)` spawns the
+/// usual STATIC worker. See [`spawn_worker_with_command`] for the detachment
+/// contract; this wrapper covers the flows that never spawn a command child.
 pub fn spawn_worker(id: u64, name: &str, dir: Option<&Path>, port: u16) -> Result<u32> {
+    spawn_worker_full(id, name, dir, port, &[], None, None)
+}
+
+/// Spawn the detached `run-worker` child for a HOOK service and return its
+/// pid: directory-less (the hook origin has no served tree) and carrying the
+/// retention value the worker applies to its request store.
+pub fn spawn_hook_worker(id: u64, name: &str, port: u16, keep: u16) -> Result<u32> {
+    spawn_worker_full(id, name, None, port, &[], Some(keep), None)
+}
+
+/// Spawn the detached `run-worker` child for a DROP service and return its
+/// pid: the argv carries the upload target directory (the worker re-resolves
+/// and re-checks it) and the per-upload cap, while the access token travels
+/// via the service's private token file — never the argv (`ps` visibility).
+pub fn spawn_drop_worker(id: u64, name: &str, dir: &Path, port: u16, max_size: u64) -> Result<u32> {
+    spawn_worker_full(id, name, Some(dir), port, &[], None, Some(max_size))
+}
+
+/// Spawn the detached `run-worker` child for a service and return its pid,
+/// passing `command` (the `ft run -- <command>` child) to the worker.
+///
+/// The child is given a fresh process group and session, its stdin is wired
+/// to `/dev/null`, and its stdout + stderr are both pointed at the service's
+/// `worker.log` (opened in append mode so restarts accumulate rather than
+/// clobber). The child is intentionally *not* awaited and `kill_on_drop` is
+/// left disabled so it keeps running after this function returns and after
+/// the parent process exits.
+pub fn spawn_worker_with_command(
+    id: u64,
+    name: &str,
+    dir: Option<&Path>,
+    port: u16,
+    command: &[OsString],
+) -> Result<u32> {
+    spawn_worker_full(id, name, dir, port, command, None, None)
+}
+
+/// The single spawn path behind every entry point: each public wrapper pins
+/// the optional values its flow does not use (`command` empty / `keep` and
+/// `max_size` None), so historical argv shapes stay byte-identical while the
+/// hook flow adds only `--keep` and the drop flow only `--max-size`.
+#[cfg(unix)]
+fn spawn_worker_full(
+    id: u64,
+    name: &str,
+    dir: Option<&Path>,
+    port: u16,
+    command: &[OsString],
+    keep: Option<u16>,
+    max_size: Option<u64>,
+) -> Result<u32> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -97,19 +178,22 @@ pub fn spawn_worker(id: u64, name: &str, dir: Option<&Path>, port: u16) -> Resul
 
     let token = worker_token();
     let mut cmd = Command::new(exe);
-    cmd.args(run_worker_args(id, name, dir, port))
-        .env("FT_WORKER_TOKEN", &token)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file));
+    cmd.args(run_worker_args(
+        id, name, dir, port, command, keep, max_size,
+    ))
+    .env("FT_WORKER_TOKEN", &token)
+    .stdin(Stdio::null())
+    .stdout(Stdio::from(stdout_file))
+    .stderr(Stdio::from(stderr_file));
 
     // New session via setsid(): the child becomes a session leader AND the
     // leader of a fresh process group whose id equals its pid — so a later
-    // kill(-worker_pid) reaches the whole tree, including cloudflared, which
-    // inherits this group. We deliberately do NOT also call process_group(0):
-    // std applies that (via setpgid) before pre_exec, which would make the
-    // child a group leader first and cause setsid() to fail with EPERM. The
-    // error is propagated rather than swallowed so a failure to detach is loud.
+    // kill(-worker_pid) reaches the whole tree, including cloudflared and a
+    // run worker's command child, which inherit this group. We deliberately
+    // do NOT also call process_group(0): std applies that (via setpgid)
+    // before pre_exec, which would make the child a group leader first and
+    // cause setsid() to fail with EPERM. The error is propagated rather than
+    // swallowed so a failure to detach is loud.
     unsafe {
         cmd.pre_exec(|| {
             nix::unistd::setsid()
@@ -138,10 +222,19 @@ pub fn spawn_worker(id: u64, name: &str, dir: Option<&Path>, port: u16) -> Resul
 /// with no console, so it survives the parent `ft` exiting. Its stdout/stderr
 /// are pointed at the service's `worker.log` (append, mode-inherited). The
 /// worker assigns itself to a Job Object (see [`crate::worker::run`]), so
-/// `kill`-the-worker cascades to cloudflared and a hard-killed worker still
-/// reaps its tree. `dir: None` spawns a proxy worker (see the Unix variant).
+/// `kill`-the-worker cascades to cloudflared and a run worker's command child,
+/// and a hard-killed worker still reaps its tree. `dir: None` spawns a
+/// directory-less (proxy/run/hook) worker (see the Unix variant).
 #[cfg(windows)]
-pub fn spawn_worker(id: u64, name: &str, dir: Option<&Path>, port: u16) -> Result<u32> {
+fn spawn_worker_full(
+    id: u64,
+    name: &str,
+    dir: Option<&Path>,
+    port: u16,
+    command: &[OsString],
+    keep: Option<u16>,
+    max_size: Option<u64>,
+) -> Result<u32> {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -165,12 +258,14 @@ pub fn spawn_worker(id: u64, name: &str, dir: Option<&Path>, port: u16) -> Resul
 
     let token = worker_token();
     let mut cmd = Command::new(exe);
-    cmd.args(run_worker_args(id, name, dir, port))
-        .env("FT_WORKER_TOKEN", &token)
-        .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file));
+    cmd.args(run_worker_args(
+        id, name, dir, port, command, keep, max_size,
+    ))
+    .env("FT_WORKER_TOKEN", &token)
+    .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS)
+    .stdin(Stdio::null())
+    .stdout(Stdio::from(stdout_file))
+    .stderr(Stdio::from(stderr_file));
 
     let pid = cmd
         .spawn()
@@ -184,14 +279,27 @@ pub fn spawn_worker(id: u64, name: &str, dir: Option<&Path>, port: u16) -> Resul
 #[cfg(test)]
 mod tests {
     use super::{PROXY_DIR_SENTINEL, run_worker_args};
+    use std::ffi::OsString;
     use std::path::Path;
+
+    fn os(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
 
     #[test]
     fn static_worker_passes_the_real_directory() {
-        let args = run_worker_args(7, "blog", Some(Path::new("/srv/blog")), 8000);
+        let args = run_worker_args(
+            7,
+            "blog",
+            Some(Path::new("/srv/blog")),
+            8000,
+            &[],
+            None,
+            None,
+        );
         assert_eq!(
             args,
-            vec![
+            os(&[
                 "run-worker",
                 "--id",
                 "7",
@@ -201,7 +309,7 @@ mod tests {
                 "/srv/blog",
                 "--port",
                 "8000",
-            ]
+            ])
         );
     }
 
@@ -209,10 +317,10 @@ mod tests {
     fn proxy_worker_passes_the_sentinel_directory() {
         // A proxy worker has no directory: the mandatory `--dir` flag carries
         // the sentinel, and the worker takes its real spec from the registry.
-        let args = run_worker_args(9, "api", None, 3000);
+        let args = run_worker_args(9, "api", None, 3000, &[], None, None);
         assert_eq!(
             args,
-            vec![
+            os(&[
                 "run-worker",
                 "--id",
                 "9",
@@ -222,10 +330,105 @@ mod tests {
                 PROXY_DIR_SENTINEL,
                 "--port",
                 "3000",
-            ]
+            ])
         );
         // The sentinel must never name an existing path: a mis-tagged Static
         // worker has to fail closed on it, not serve some real directory.
         assert!(!std::path::Path::new(PROXY_DIR_SENTINEL).exists());
+    }
+
+    #[test]
+    fn run_worker_carries_the_child_command_after_a_separator() {
+        // A run worker's argv ends with `-- <command...>`: the separator is
+        // load-bearing, because a child argument that looks like a flag (e.g.
+        // `--verbose`) must reach the child verbatim instead of being parsed
+        // as a worker flag by the run-worker's own clap definition.
+        let args = run_worker_args(
+            11,
+            "dev",
+            None,
+            3000,
+            &os(&["npm", "run", "dev", "--verbose"]),
+            None,
+            None,
+        );
+        assert_eq!(
+            args,
+            os(&[
+                "run-worker",
+                "--id",
+                "11",
+                "--name",
+                "dev",
+                "--dir",
+                PROXY_DIR_SENTINEL,
+                "--port",
+                "3000",
+                "--",
+                "npm",
+                "run",
+                "dev",
+                "--verbose",
+            ])
+        );
+    }
+
+    #[test]
+    fn hook_worker_carries_its_retention_flag_before_the_separator() {
+        // A hook worker's argv carries `--keep N` as an ordinary worker flag:
+        // it belongs to ft (parsed by run-worker's own clap definition), so it
+        // must sit BEFORE the `--` separator — after it, everything belongs to
+        // a run worker's command child.
+        let args = run_worker_args(12, "gh", None, 9000, &[], Some(50), None);
+        assert_eq!(
+            args,
+            os(&[
+                "run-worker",
+                "--id",
+                "12",
+                "--name",
+                "gh",
+                "--dir",
+                PROXY_DIR_SENTINEL,
+                "--port",
+                "9000",
+                "--keep",
+                "50",
+            ])
+        );
+    }
+
+    #[test]
+    fn drop_worker_carries_its_directory_and_cap_before_the_separator() {
+        // A drop worker's argv carries the REAL upload target (unlike the
+        // directory-less kinds) and `--max-size N` before the `--` separator.
+        // The access token deliberately appears NOWHERE in the argv: it is
+        // read from the service's private token file, so `ps` never shows the
+        // bucket's write credential.
+        let args = run_worker_args(
+            13,
+            "share",
+            Some(Path::new("/srv/inbox")),
+            9001,
+            &[],
+            None,
+            Some(4096),
+        );
+        assert_eq!(
+            args,
+            os(&[
+                "run-worker",
+                "--id",
+                "13",
+                "--name",
+                "share",
+                "--dir",
+                "/srv/inbox",
+                "--port",
+                "9001",
+                "--max-size",
+                "4096",
+            ])
+        );
     }
 }

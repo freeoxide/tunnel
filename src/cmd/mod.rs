@@ -7,12 +7,15 @@
 
 pub mod detail;
 pub mod doctor;
+pub mod drop;
+pub mod hook;
 pub mod kill;
 pub mod list;
 pub mod logs;
 pub mod open;
 pub mod proxy;
 pub mod prune;
+pub mod run;
 pub mod sanitize;
 pub mod start;
 
@@ -40,16 +43,55 @@ pub async fn run(cli: Cli) -> Result<()> {
             name,
             foreground,
         }) => proxy::run(port, name, foreground).await,
+        Some(Command::Run {
+            port,
+            name,
+            foreground,
+            command,
+        }) => run::run(port, name, foreground, &command).await,
+        Some(Command::Hook {
+            port,
+            name,
+            foreground,
+            keep,
+        }) => hook::run(port, name, foreground, keep).await,
+        Some(Command::Drop {
+            dir,
+            port,
+            name,
+            foreground,
+            token,
+            max_size,
+        }) => drop::run(dir, port, name, foreground, token, max_size).await,
         Some(Command::Sanitize) => sanitize::run().await,
         Some(Command::RunWorker {
             id,
             name,
             dir,
             port,
-        }) => crate::worker::run(id, name, dir, port).await,
+            command,
+            keep,
+            max_size,
+        }) => crate::worker::run(id, name, dir, port, command, keep, max_size).await,
         None => {
             let dir: PathBuf = cli.dir.unwrap_or_else(|| PathBuf::from("."));
-            start::run(Some(dir), cli.name, cli.port, cli.foreground, cli.yes).await
+            // The static-origin flags only exist on the implicit START (the
+            // CLI structurally has no such flag on any subcommand), so the
+            // never-on-proxy exclusion holds by construction.
+            let static_flags = crate::model::StaticFlags {
+                spa: cli.spa,
+                cors: cli.cors,
+                token: cli.token,
+            };
+            start::run(
+                Some(dir),
+                cli.name,
+                cli.port,
+                cli.foreground,
+                cli.yes,
+                static_flags,
+            )
+            .await
         }
     }
 }

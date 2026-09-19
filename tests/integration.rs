@@ -329,6 +329,27 @@ fn dead_loopback_port() -> u16 {
     port
 }
 
+/// A loopback port left in TIME_WAIT by a just-stopped server.
+///
+/// Bind an ephemeral listener, connect a client, then close the SERVER side
+/// first (listener, then the accepted stream, while the client is still
+/// open): the active close leaves the server endpoint — bound to the returned
+/// port — held by FIN_WAIT/TIME_WAIT sockets instead of a listener. Loopback
+/// only, same accepted-risk note as [`dead_loopback_port`].
+fn time_wait_loopback_port() -> u16 {
+    let listener =
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral loopback listener");
+    let port = listener.local_addr().expect("local addr").port();
+    let client = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).expect("connect");
+    let accepted = listener.accept().expect("accept").0;
+    // Drop order is the point: the server closes while the client is still
+    // open, so the close is ACTIVE on the server endpoint.
+    drop(listener);
+    drop(accepted);
+    drop(client);
+    port
+}
+
 /// Every file AND directory under `root`, recursively; empty when `root` does
 /// not exist yet.
 ///
@@ -900,6 +921,577 @@ fn prune_keeps_a_fresh_proxy_reservation_and_reaps_an_expired_one() {
     );
 }
 
+// --- `ft run` (usage, occupied-port pre-flight, seeded fixtures; no cloudflared)
+//
+// Like the proxy section, only paths that stop BEFORE cloudflared is looked up
+// are driven here: everything past `cloudflared::ensure_installed` would
+// depend on whether this machine has cloudflared — and, worse, on machines
+// that do, would really spawn workers + the command child + a live tunnel.
+// The spawned flow itself is covered by the unit seams in cmd/run.rs,
+// worker.rs, and spawn.rs.
+
+#[test]
+fn run_help_documents_the_command() {
+    let dir = TempDir::new().unwrap();
+    let (ok, out) = run_ft(dir.path(), &["run", "--help"]);
+    assert!(ok, "`ft run --help` failed: {out}");
+    assert!(
+        out.contains("Usage: ft run"),
+        "missing the usage line in: {out}"
+    );
+    assert!(out.contains("--port"), "missing --port in: {out}");
+    assert!(
+        out.contains("<COMMAND>"),
+        "missing the COMMAND placeholder in: {out}"
+    );
+    assert!(out.contains("--name"), "missing --name in: {out}");
+    assert!(
+        out.contains("--foreground"),
+        "missing --foreground in: {out}"
+    );
+}
+
+#[test]
+fn run_usage_errors_leave_no_state() {
+    // Every rejected invocation must fail before the state tree exists: a
+    // usage error (clap) or the empty-command check (runtime, deliberately
+    // first in cmd::run) means nothing was reserved, spawned, or written.
+    let dir = TempDir::new().unwrap();
+    for (args, expected) in [
+        (&["run"][..], "required arguments were not provided"),
+        (
+            &["run", "--port", "abc"][..],
+            "invalid digit found in string",
+        ),
+        (
+            &["run", "--port", "0", "--", "x"][..],
+            "0 is not in 1..=65535",
+        ),
+        (
+            &["run", "--port", "70000", "--", "x"][..],
+            "70000 is not in 1..=65535",
+        ),
+        (
+            &["run", "--port", "3000"][..],
+            "no command given after `--`",
+        ),
+        (
+            &["run", "--port", "3000", "--"][..],
+            "no command given after `--`",
+        ),
+    ] {
+        let (ok, out) = run_ft(dir.path(), args);
+        assert!(
+            !ok,
+            "expected a failure for `ft {}`, got: {out}",
+            args.join(" ")
+        );
+        assert!(
+            out.contains(expected),
+            "expected `{expected}` for `ft {}`, got: {out}",
+            args.join(" ")
+        );
+    }
+    assert!(
+        tree_paths(dir.path()).is_empty(),
+        "rejected runs must leave no state, found: {:?}",
+        tree_paths(dir.path())
+    );
+}
+
+#[test]
+fn run_refuses_an_occupied_port_and_leaves_no_state() {
+    // The child ft spawns must be able to BIND the port, so an occupied one
+    // fails the pre-flight — before cloudflared is looked up and before any
+    // state exists — with a message that names the port. This holds on every
+    // machine regardless of cloudflared, because the check precedes that
+    // lookup entirely.
+    let dir = TempDir::new().unwrap();
+    let listener =
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral loopback listener");
+    let port = listener.local_addr().expect("local addr").port();
+    let port_arg = port.to_string();
+
+    let (ok, out) = run_ft(
+        dir.path(),
+        &["run", "--port", &port_arg, "--", "sleep", "30"],
+    );
+    // The listener must outlive the run: the probe happens inside it.
+    drop(listener);
+
+    assert!(!ok, "an occupied port must fail `ft run`, got: {out}");
+    assert!(
+        out.contains(&format!("port {port} is already in use")),
+        "expected the occupied-port error naming the port, got: {out}"
+    );
+    assert!(
+        tree_paths(dir.path()).is_empty(),
+        "a refused run must leave no state, found: {:?}",
+        tree_paths(dir.path())
+    );
+}
+
+#[test]
+fn run_accepts_a_port_a_just_stopped_server_left_in_time_wait() {
+    // R3-2 end-to-end: `is_port_free` used to be a plain bind probe, so a
+    // port still held by TIME_WAIT sockets after a server-side close read as
+    // occupied and `ft run` refused the restart spuriously. Drive the real
+    // binary against such a port: the pre-flight must NOT refuse with
+    // "already in use".
+    //
+    // PATH is stripped so the run deterministically stops at the cloudflared
+    // lookup — the gate right after the port pre-flight — on every machine:
+    // with cloudflared installed, the run would otherwise proceed to spawn a
+    // real worker and tunnel. Stopping there (with zero state, since
+    // `ensure_installed` precedes `state.ensure`) proves the pre-flight let
+    // the TIME_WAIT port through.
+    let dir = TempDir::new().unwrap();
+    let port = time_wait_loopback_port();
+    let port_arg = port.to_string();
+
+    let output = Command::new(ft_bin())
+        .args(["run", "--port", &port_arg, "--", "sleep", "30"])
+        .env("XDG_STATE_HOME", dir.path())
+        .env("RUST_LOG", "")
+        .env("PATH", "")
+        .output()
+        .expect("spawning `ft` binary");
+    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+
+    assert!(
+        !output.status.success(),
+        "the run must stop at the cloudflared lookup, got: {combined}"
+    );
+    assert!(
+        !combined.contains(&format!("port {port} is already in use")),
+        "a TIME_WAIT-only port must not read as occupied, got: {combined}"
+    );
+    assert!(
+        tree_paths(dir.path()).is_empty(),
+        "a run stopped at the cloudflared lookup must leave no state, found: {:?}",
+        tree_paths(dir.path())
+    );
+}
+
+#[test]
+fn run_fixture_renders_in_ls_and_detail() {
+    // A seeded `"kind": "run"` entry (the on-disk shape `ft run` reserves,
+    // including the run-only `command_pid`) must render through the same
+    // lifecycle commands as any other kind: kind-agnostic in `ls`, kind-aware
+    // in `detail` — Mode names the run, the Command PID row carries the
+    // recorded child (the field orphan detection reads), there is no
+    // Directory row (a run fronts a port, not a directory), and the Logs list
+    // has no server.log (no ft-owned server exists; the command's output is
+    // teed into worker.log).
+    let dir = TempDir::new().unwrap();
+    let body = r#"{
+  "next_id": 3,
+  "services": [
+    {
+      "id": 1,
+      "name": "seed-run",
+      "kind": "run",
+      "dir": null,
+      "port": 3000,
+      "local_url": "http://127.0.0.1:3000",
+      "public_url": "https://x.trycloudflare.com",
+      "worker_pid": 4000000,
+      "tunnel_pid": null,
+      "command_pid": 4242,
+      "created_at": "2026-07-21T00:00:00Z",
+      "state_dir": "/tmp/seed-run-state",
+      "foreground": false
+    }
+  ]
+}"#;
+    seed_registry(dir.path(), body);
+
+    let (ok_ls, out_ls) = run_ft(dir.path(), &["ls"]);
+    assert!(ok_ls, "`ft ls` on a run registry failed: {out_ls}");
+    assert!(
+        out_ls.contains("seed-run") && out_ls.contains("stale") && out_ls.contains("3000"),
+        "expected the run entry listed with its recorded-but-dead worker status \
+         and port, got: {out_ls}"
+    );
+
+    let (ok, out) = run_ft(dir.path(), &["detail", "seed-run"]);
+    assert!(ok, "`ft detail seed-run` failed: {out}");
+    assert!(
+        out.contains("Mode:         run"),
+        "expected the run Mode row, got: {out}"
+    );
+    assert!(
+        out.contains("Command PID:  4242"),
+        "expected the recorded command pid, got: {out}"
+    );
+    assert!(
+        !out.contains("Directory:"),
+        "a run entry must not render a Directory row: {out}"
+    );
+    assert!(
+        !out.contains("Upstream:"),
+        "a run entry is not a proxy and must not render an Upstream row: {out}"
+    );
+    assert!(
+        out.contains("worker.log") && out.contains("tunnel.log"),
+        "expected worker/tunnel logs listed, got: {out}"
+    );
+    assert!(
+        !out.contains("server.log"),
+        "a run entry must not list server.log: {out}"
+    );
+    assert!(
+        out.contains("https://x.trycloudflare.com"),
+        "expected the seeded public url, got: {out}"
+    );
+
+    // kill is kind-agnostic (it targets pids): a recorded-but-dead worker pid
+    // makes the entry stale, and killing it reports the stale removal and
+    // persists the emptied registry.
+    let reg = registry_path(dir.path());
+    let (ok_kill, out_kill) = run_ft(dir.path(), &["kill", "seed-run"]);
+    assert!(ok_kill, "`ft kill seed-run` failed: {out_kill}");
+    assert!(
+        out_kill.contains("Removed stale service seed-run."),
+        "expected the stale-removal message, got: {out_kill}"
+    );
+    let after = fs::read_to_string(&reg).unwrap();
+    assert!(
+        !after.contains("seed-run"),
+        "kill should have removed the run entry, but registry is: {after}"
+    );
+}
+
+// --- `ft drop` (usage, pre-flights, seeded fixtures; no cloudflared) --------
+//
+// Like the hook section, only paths that stop BEFORE cloudflared is looked up
+// are driven here: `ft drop` is ft's own origin, so its pre-flights (upload
+// target resolution/sensitivity, occupied port, empty token) all run ahead of
+// that lookup, and everything past it would depend on whether this machine
+// has cloudflared. The origin itself (token auth, caps, sanitization,
+// confinement on the GET side) is covered by the drop_server unit tests
+// driving the Router directly with tower::oneshot.
+
+#[test]
+fn drop_help_documents_the_command() {
+    let dir = TempDir::new().unwrap();
+    let (ok, out) = run_ft(dir.path(), &["drop", "--help"]);
+    assert!(ok, "`ft drop --help` failed: {out}");
+    assert!(
+        out.contains("Usage: ft drop"),
+        "missing the usage line in: {out}"
+    );
+    assert!(
+        out.contains("<DIR>"),
+        "missing the DIR positional in: {out}"
+    );
+    assert!(out.contains("--port"), "missing --port in: {out}");
+    assert!(out.contains("--name"), "missing --name in: {out}");
+    assert!(
+        out.contains("--foreground"),
+        "missing --foreground in: {out}"
+    );
+    assert!(out.contains("--token"), "missing --token in: {out}");
+    assert!(out.contains("--max-size"), "missing --max-size in: {out}");
+    // The token is the bucket's write credential and its flag is the
+    // command's public surface: the help must explain that uploads REQUIRE
+    // it and that one is minted and printed when omitted.
+    assert!(
+        out.contains("token"),
+        "the help must mention the token in: {out}"
+    );
+    assert!(
+        out.to_lowercase().contains("printed"),
+        "the help must say the generated token is printed: {out}"
+    );
+}
+
+#[test]
+fn drop_usage_errors_and_preflight_refusals_leave_no_state() {
+    // Every rejected invocation must fail before the state tree exists: clap
+    // usage errors (missing positional, port/cap ranges) and the command's
+    // own pre-flights (nonexistent target, sensitive target, empty token)
+    // all precede any reservation or spawn.
+    let dir = TempDir::new().unwrap();
+    let missing = dir.path().join("does-not-exist");
+    let missing = missing.to_string_lossy().into_owned();
+    // A neutral EXISTING directory for the token-refusal cases: it must not
+    // be an ancestor of ft's state root (pinned under `dir`), because serving
+    // an ancestor of the state tree would expose registry.json via subpaths
+    // and is — correctly — refused as sensitive (R3-7). A second tempdir is
+    // a sibling, not an ancestor.
+    let neutral = TempDir::new().unwrap();
+    let neutral_arg = neutral.path().to_string_lossy().into_owned();
+    for (args, expected) in [
+        // clap: the DIR positional is required.
+        (&["drop"][..], "required arguments were not provided"),
+        (
+            &["drop", "inbox", "--port", "abc"][..],
+            "invalid digit found in string",
+        ),
+        (
+            &["drop", "inbox", "--port", "0"][..],
+            "0 is not in 1..=65535",
+        ),
+        (
+            &["drop", "inbox", "--max-size", "0"][..],
+            "0 is not in 1..=1073741824",
+        ),
+        (
+            &["drop", "inbox", "--max-size", "1073741825"][..],
+            "1073741825 is not in 1..=1073741824",
+        ),
+        // Runtime pre-flights (before any state): the target must exist, must
+        // not be sensitive, and an explicit token must be non-empty.
+        (&["drop", &missing][..], "does not exist"),
+        (&["drop", "/"][..], "sensitive directory"),
+        (
+            &["drop", &neutral_arg, "--token", ""][..],
+            "--token must be a non-empty secret",
+        ),
+        // R3-9's flip side at the CLI boundary: a WHITESPACE-ONLY token is
+        // refused (not silently accepted untrimmed) — the trim happens once,
+        // at token resolution, before anything is stored or printed.
+        (
+            &["drop", &neutral_arg, "--token", "   "][..],
+            "--token must be a non-empty secret",
+        ),
+    ] {
+        let (ok, out) = run_ft(dir.path(), args);
+        assert!(
+            !ok,
+            "expected a failure for `ft {}`, got: {out}",
+            args.join(" ")
+        );
+        assert!(
+            out.contains(expected),
+            "expected `{expected}` for `ft {}`, got: {out}",
+            args.join(" ")
+        );
+    }
+    assert!(
+        tree_paths(dir.path()).is_empty(),
+        "rejected drops must leave no state, found: {:?}",
+        tree_paths(dir.path())
+    );
+}
+
+#[test]
+fn drop_refuses_an_occupied_port_and_leaves_no_state() {
+    // The drop origin is ft's OWN server, so an occupied port fails the
+    // pre-flight — before cloudflared is looked up and before any state
+    // exists — with a message that names the port (same as `ft hook`, the
+    // inverse of `ft proxy`'s dead-upstream pre-flight).
+    let dir = TempDir::new().unwrap();
+    let bucket = TempDir::new().unwrap();
+    let bucket_arg = bucket.path().to_string_lossy().into_owned();
+    let listener =
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral loopback listener");
+    let port = listener.local_addr().expect("local addr").port();
+    let port_arg = port.to_string();
+
+    let (ok, out) = run_ft(
+        dir.path(),
+        &[
+            "drop",
+            &bucket_arg,
+            "--port",
+            &port_arg,
+            "--token",
+            "sekrit",
+        ],
+    );
+    // The listener must outlive the run: the probe happens inside it.
+    drop(listener);
+
+    assert!(!ok, "an occupied port must fail `ft drop`, got: {out}");
+    assert!(
+        out.contains(&format!("port {port} is already in use")),
+        "expected the occupied-port error naming the port, got: {out}"
+    );
+    assert!(
+        tree_paths(dir.path()).is_empty(),
+        "a refused drop must leave no state, found: {:?}",
+        tree_paths(dir.path())
+    );
+}
+
+#[test]
+fn drop_refuses_fts_own_state_tree_in_every_overlap() {
+    // R3-7: ft's state root ($XDG_STATE_HOME/freeoxide/tunnel) holds
+    // registry.json, worker/tunnel logs, hook request records, and every
+    // service's drop-token file — all non-dotfile, so a drop bucket placed ON
+    // the state root made them publicly readable via unauthenticated GETs
+    // (and a bucket WRITE-touches the tree on top of that). The shared
+    // sensitive-dir check must refuse every overlap with the state tree: the
+    // root itself, a subtree (services/ — the token files live there), and an
+    // ancestor (which would serve the tree via subpaths) — before any state
+    // is touched. The plain-bucket counterpart
+    // (`drop_refuses_an_occupied_port_and_leaves_no_state`) already pins that
+    // a NON-state dir still passes this pre-flight and fails later, at the
+    // port check.
+    let dir = TempDir::new().unwrap();
+    let state_root = dir.path().join("freeoxide").join("tunnel");
+    let services = state_root.join("services");
+    let ancestor = dir.path().join("freeoxide");
+    fs::create_dir_all(&services).unwrap();
+
+    // The bucket argument accepts any of the three overlap shapes; each must
+    // be refused with the sensitive-directory message.
+    for bucket in [state_root.clone(), services.clone(), ancestor.clone()] {
+        let arg = bucket.to_string_lossy().into_owned();
+        let (ok, out) = run_ft(dir.path(), &["drop", &arg]);
+        assert!(
+            !ok,
+            "dropping onto ft's state tree at {} must be refused: {out}",
+            bucket.display()
+        );
+        assert!(
+            out.contains("sensitive directory"),
+            "expected the sensitive-dir refusal for {}, got: {out}",
+            bucket.display()
+        );
+    }
+
+    // Refusal happened before any state: no registry, and the pre-created
+    // (test-fixture) services dir gained nothing.
+    assert!(
+        !registry_path(dir.path()).exists(),
+        "a refused drop must not create a registry"
+    );
+    assert!(
+        tree_paths(&services).is_empty(),
+        "a refused drop must not touch the state tree, found: {:?}",
+        tree_paths(&services)
+    );
+}
+
+#[test]
+fn start_refuses_fts_own_state_dir_noninteractively() {
+    // R3-7 tightens the START caller too (the check is shared): `ft <state-
+    // dir>` without --yes and without a TTY must refuse with the sensitive-
+    // directory error, like $HOME does. (--yes keeps its existing
+    // confirmed-sensitive override semantics, as for $HOME itself — the fix
+    // is the denylist entry, not a new refusal class.)
+    let dir = TempDir::new().unwrap();
+    let state_root = dir.path().join("freeoxide").join("tunnel");
+    fs::create_dir_all(&state_root).unwrap();
+    let arg = state_root.to_string_lossy().into_owned();
+
+    let (ok, out) = run_ft(dir.path(), &[arg.as_str()]);
+
+    assert!(
+        !ok,
+        "starting a tunnel on ft's own state dir must be refused: {out}"
+    );
+    assert!(
+        out.contains("refusing to publish a sensitive directory"),
+        "expected the non-interactive sensitive-dir refusal, got: {out}"
+    );
+    assert!(
+        !registry_path(dir.path()).exists(),
+        "a refused start must not create a registry"
+    );
+}
+
+#[test]
+fn drop_fixture_renders_in_ls_detail_and_kill() {
+    // A seeded `"kind": "drop"` entry (the on-disk shape `ft drop` reserves —
+    // note `dir` IS carried, like static, because the bucket is a real
+    // directory) must render through the same lifecycle commands as any other
+    // kind: kind-agnostic in `ls`, kind-aware in `detail` — Mode names the
+    // drop, the Directory row names the upload target, the Token row reads
+    // the service's private token file (here seeded so the display contract
+    // is pinned end-to-end), and the Logs list has no server.log (the drop
+    // origin's record is the bucket directory itself). kill stays
+    // kind-agnostic: a dead worker pid makes the entry stale and removable.
+    let dir = TempDir::new().unwrap();
+    // Anchor the service's state_dir inside the test's tempdir so the token
+    // file the detail command reads is private to this test.
+    let state_dir = dir.path().join("seed-drop-state");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(state_dir.join("drop-token"), "tok-seeded-abc\n").unwrap();
+    let state_dir_arg = state_dir.to_string_lossy().into_owned();
+    let body = format!(
+        r#"{{
+  "next_id": 3,
+  "services": [
+    {{
+      "id": 1,
+      "name": "seed-drop",
+      "kind": "drop",
+      "dir": "/tmp/seed-bucket",
+      "port": 9100,
+      "local_url": "http://127.0.0.1:9100",
+      "public_url": "https://x.trycloudflare.com",
+      "worker_pid": 4000000,
+      "tunnel_pid": null,
+      "created_at": "2026-07-21T00:00:00Z",
+      "state_dir": "{state_dir_arg}",
+      "foreground": false
+    }}
+  ]
+}}"#
+    );
+    seed_registry(dir.path(), &body);
+
+    let (ok_ls, out_ls) = run_ft(dir.path(), &["ls"]);
+    assert!(ok_ls, "`ft ls` on a drop registry failed: {out_ls}");
+    assert!(
+        out_ls.contains("seed-drop") && out_ls.contains("stale") && out_ls.contains("9100"),
+        "expected the drop entry listed with its recorded-but-dead worker status \
+         and port, got: {out_ls}"
+    );
+
+    let (ok, out) = run_ft(dir.path(), &["detail", "seed-drop"]);
+    assert!(ok, "`ft detail seed-drop` failed: {out}");
+    assert!(
+        out.contains("Mode:         drop"),
+        "expected the drop Mode row, got: {out}"
+    );
+    assert!(
+        out.contains("Directory:    /tmp/seed-bucket"),
+        "expected the bucket Directory row, got: {out}"
+    );
+    assert!(
+        out.contains("Token:        tok-seeded-abc"),
+        "expected the token row reading the private token file, got: {out}"
+    );
+    assert!(
+        !out.contains("Upstream:"),
+        "a drop entry is not a proxy and must not render an Upstream row: {out}"
+    );
+    assert!(
+        out.contains("worker.log") && out.contains("tunnel.log"),
+        "expected worker/tunnel logs listed, got: {out}"
+    );
+    assert!(
+        !out.contains("server.log"),
+        "a drop entry must not list server.log: {out}"
+    );
+    assert!(
+        out.contains("https://x.trycloudflare.com"),
+        "expected the seeded public url, got: {out}"
+    );
+
+    // kill is kind-agnostic (it targets pids): a recorded-but-dead worker pid
+    // makes the entry stale, and killing it reports the stale removal and
+    // persists the emptied registry.
+    let reg = registry_path(dir.path());
+    let (ok_kill, out_kill) = run_ft(dir.path(), &["kill", "seed-drop"]);
+    assert!(ok_kill, "`ft kill seed-drop` failed: {out_kill}");
+    assert!(
+        out_kill.contains("Removed stale service seed-drop."),
+        "expected the stale-removal message, got: {out_kill}"
+    );
+    let after = fs::read_to_string(&reg).unwrap();
+    assert!(
+        !after.contains("seed-drop"),
+        "kill should have removed the drop entry, but registry is: {after}"
+    );
+}
+
 // --- `ft doctor` (read-only diagnosis; no cloudflared needed) ---------------
 
 #[test]
@@ -1002,6 +1594,74 @@ fn doctor_flags_a_live_proxy_whose_upstream_port_is_dead() {
     let after = fs::read_to_string(registry_path(dir.path())).unwrap();
     assert!(
         after.contains("seed-proxy"),
+        "doctor must not mutate the registry, got: {after}"
+    );
+}
+
+#[test]
+fn doctor_flags_a_stale_run_service_whose_command_is_still_running() {
+    // The Run orphan finding, end to end (the one doctor surface A2 could not
+    // reach from its unit-only paths): a stale run entry — dead worker pid,
+    // so its tunnel is gone — carrying a command_pid that IS alive (this test
+    // process's own pid, probed by the doctor child as plain existence) plus
+    // a run port that still answers (a real listener the test holds). That is
+    // the confident "tunnel dead, command still running" signature. Doctor
+    // must exit 0, flag the `command <name>` check with its verify-first
+    // hint, and stay read-only.
+    let dir = TempDir::new().unwrap();
+    let listener =
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral loopback listener");
+    let port = listener.local_addr().expect("local addr").port();
+    let body = format!(
+        r#"{{
+  "next_id": 2,
+  "services": [
+    {{
+      "id": 1,
+      "name": "seed-run",
+      "kind": "run",
+      "dir": null,
+      "port": {port},
+      "local_url": "http://127.0.0.1:{port}",
+      "public_url": "https://x.trycloudflare.com",
+      "worker_pid": 4000000,
+      "tunnel_pid": null,
+      "command_pid": {pid},
+      "created_at": "2026-07-21T00:00:00Z",
+      "state_dir": "/tmp/seed-run-state",
+      "foreground": false
+    }}
+  ]
+}}"#,
+        pid = std::process::id()
+    );
+    seed_registry(dir.path(), &body);
+
+    let (ok, out) = run_ft(dir.path(), &["doctor"]);
+    // The listener must outlive the run: the orphan cross-check probes it.
+    drop(listener);
+
+    assert!(
+        ok,
+        "a finding is not a command failure — doctor exits 0, got: {out}"
+    );
+    assert!(
+        out.contains("command seed-run: tunnel dead, command still running"),
+        "expected the orphan finding for the run command, got: {out}"
+    );
+    assert!(
+        out.contains(&format!("pid {} is alive", std::process::id()))
+            && out.contains(&format!("127.0.0.1:{port} still answers")),
+        "expected the confident branch's evidence (live pid + answering port), got: {out}"
+    );
+    assert!(
+        out.contains("stop it if it is the command") && out.contains("`ft kill seed-run`"),
+        "expected the shared verify-first hint naming the kill, got: {out}"
+    );
+    // Read-only: doctor reports the orphan but never touches the entry.
+    let after = fs::read_to_string(registry_path(dir.path())).unwrap();
+    assert!(
+        after.contains("seed-run"),
         "doctor must not mutate the registry, got: {after}"
     );
 }
@@ -1200,5 +1860,394 @@ fn sanitize_keeps_a_fresh_reservation_and_reaps_an_expired_one() {
     assert!(
         after.contains("proxy-fresh") && !after.contains("proxy-expired"),
         "sanitize must keep the fresh and drop the expired reservation, registry: {after}"
+    );
+}
+
+// --- `ft hook` (usage, occupied-port pre-flight, seeded fixtures; no cloudflared)
+//
+// Like the proxy/run sections, only paths that stop BEFORE cloudflared is
+// looked up are driven here: `ft hook` is ft's own origin, so an occupied
+// port fails the pre-flight ahead of that lookup, and everything past it
+// would depend on whether this machine has cloudflared. The origin itself
+// (recording, /__inspect HTML + JSON views, retention, body cap) is covered
+// by the hook_server unit tests driving the Router directly with
+// tower::oneshot.
+
+#[test]
+fn hook_help_documents_the_command() {
+    let dir = TempDir::new().unwrap();
+    let (ok, out) = run_ft(dir.path(), &["hook", "--help"]);
+    assert!(ok, "`ft hook --help` failed: {out}");
+    assert!(
+        out.contains("Usage: ft hook"),
+        "missing the usage line in: {out}"
+    );
+    assert!(out.contains("--port"), "missing --port in: {out}");
+    assert!(out.contains("--name"), "missing --name in: {out}");
+    assert!(
+        out.contains("--foreground"),
+        "missing --foreground in: {out}"
+    );
+    assert!(out.contains("--keep"), "missing --keep in: {out}");
+    assert!(
+        out.contains("/__inspect"),
+        "the help must document the inspection paths in: {out}"
+    );
+}
+
+#[test]
+fn hook_usage_errors_leave_no_state() {
+    // Every rejected invocation must fail before the state tree exists: a
+    // usage error (clap value-parser ranges) means nothing was reserved,
+    // spawned, or written.
+    let dir = TempDir::new().unwrap();
+    for (args, expected) in [
+        (
+            &["hook", "--port", "abc"][..],
+            "invalid digit found in string",
+        ),
+        (&["hook", "--port", "0"][..], "0 is not in 1..=65535"),
+        (
+            &["hook", "--port", "70000"][..],
+            "70000 is not in 1..=65535",
+        ),
+        (&["hook", "--keep", "0"][..], "0 is not in 1..=1000"),
+        (&["hook", "--keep", "1001"][..], "1001 is not in 1..=1000"),
+    ] {
+        let (ok, out) = run_ft(dir.path(), args);
+        assert!(
+            !ok,
+            "expected a failure for `ft {}`, got: {out}",
+            args.join(" ")
+        );
+        assert!(
+            out.contains(expected),
+            "expected `{expected}` for `ft {}`, got: {out}",
+            args.join(" ")
+        );
+    }
+    assert!(
+        tree_paths(dir.path()).is_empty(),
+        "rejected hooks must leave no state, found: {:?}",
+        tree_paths(dir.path())
+    );
+}
+
+#[test]
+fn hook_refuses_an_occupied_port_and_leaves_no_state() {
+    // The hook origin is ft's OWN server, so an occupied port fails the
+    // pre-flight — before cloudflared is looked up and before any state
+    // exists — with a message that names the port. This holds on every
+    // machine regardless of cloudflared, because the check precedes that
+    // lookup entirely (the inverse of proxy's dead-upstream pre-flight).
+    let dir = TempDir::new().unwrap();
+    let listener =
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral loopback listener");
+    let port = listener.local_addr().expect("local addr").port();
+    let port_arg = port.to_string();
+
+    let (ok, out) = run_ft(dir.path(), &["hook", "--port", &port_arg]);
+    // The listener must outlive the run: the probe happens inside it.
+    drop(listener);
+
+    assert!(!ok, "an occupied port must fail `ft hook`, got: {out}");
+    assert!(
+        out.contains(&format!("port {port} is already in use")),
+        "expected the occupied-port error naming the port, got: {out}"
+    );
+    assert!(
+        tree_paths(dir.path()).is_empty(),
+        "a refused hook must leave no state, found: {:?}",
+        tree_paths(dir.path())
+    );
+}
+
+#[test]
+fn hook_fixture_renders_in_ls_and_detail() {
+    // A seeded `"kind": "hook"` entry (the on-disk shape `ft hook` reserves)
+    // must render through the same lifecycle commands as any other kind:
+    // kind-agnostic in `ls`, kind-aware in `detail` — Mode names the hook,
+    // there is no Directory/Upstream row (a hook serves no directory and
+    // fronts no operator upstream), and the Logs list carries the hook's
+    // request store (requests.json) but no server.log (the hook origin's
+    // record IS requests.json — there is no traced static server).
+    let dir = TempDir::new().unwrap();
+    let body = r#"{
+  "next_id": 3,
+  "services": [
+    {
+      "id": 1,
+      "name": "seed-hook",
+      "kind": "hook",
+      "dir": null,
+      "port": 9000,
+      "local_url": "http://127.0.0.1:9000",
+      "public_url": "https://x.trycloudflare.com",
+      "worker_pid": 4000000,
+      "tunnel_pid": null,
+      "created_at": "2026-07-21T00:00:00Z",
+      "state_dir": "/tmp/seed-hook-state",
+      "foreground": false
+    }
+  ]
+}"#;
+    seed_registry(dir.path(), body);
+
+    let (ok_ls, out_ls) = run_ft(dir.path(), &["ls"]);
+    assert!(ok_ls, "`ft ls` on a hook registry failed: {out_ls}");
+    assert!(
+        out_ls.contains("seed-hook") && out_ls.contains("stale") && out_ls.contains("9000"),
+        "expected the hook entry listed with its recorded-but-dead worker status \
+         and port, got: {out_ls}"
+    );
+
+    let (ok, out) = run_ft(dir.path(), &["detail", "seed-hook"]);
+    assert!(ok, "`ft detail seed-hook` failed: {out}");
+    assert!(
+        out.contains("Mode:         hook"),
+        "expected the hook Mode row, got: {out}"
+    );
+    assert!(
+        !out.contains("Directory:"),
+        "a hook entry must not render a Directory row: {out}"
+    );
+    assert!(
+        !out.contains("Upstream:"),
+        "a hook entry is not a proxy and must not render an Upstream row: {out}"
+    );
+    assert!(
+        out.contains("requests.json"),
+        "expected the hook request store listed, got: {out}"
+    );
+    assert!(
+        out.contains("worker.log") && out.contains("tunnel.log"),
+        "expected worker/tunnel logs listed, got: {out}"
+    );
+    assert!(
+        !out.contains("server.log"),
+        "a hook entry must not list server.log: {out}"
+    );
+    assert!(
+        out.contains("https://x.trycloudflare.com"),
+        "expected the seeded public url, got: {out}"
+    );
+
+    // kill is kind-agnostic (it targets pids): a recorded-but-dead worker pid
+    // makes the entry stale, and killing it reports the stale removal and
+    // persists the emptied registry.
+    let reg = registry_path(dir.path());
+    let (ok_kill, out_kill) = run_ft(dir.path(), &["kill", "seed-hook"]);
+    assert!(ok_kill, "`ft kill seed-hook` failed: {out_kill}");
+    assert!(
+        out_kill.contains("Removed stale service seed-hook."),
+        "expected the stale-removal message, got: {out_kill}"
+    );
+    let after = fs::read_to_string(&reg).unwrap();
+    assert!(
+        !after.contains("seed-hook"),
+        "kill should have removed the hook entry, but registry is: {after}"
+    );
+}
+
+// --- static-origin flags on `ft <dir>` (A5): CLI surface, never-on-proxy,
+// --- registry persistence + detail rendering. No cloudflared: the origin
+// --- behaviour itself (SPA fallback, CORS headers, 401 token gate) is covered
+// --- by the static_server unit tests driving `router_with` directly; these
+// --- binary-level tests pin the plumbing around it.
+
+#[test]
+fn start_help_documents_the_static_origin_flags() {
+    // The implicit START's help is the flags' only documentation surface at
+    // the CLI level (README is A6's sweep): all three must be listed.
+    let dir = TempDir::new().unwrap();
+    let (ok, out) = run_ft(dir.path(), &["--help"]);
+    assert!(ok, "`ft --help` failed: {out}");
+    assert!(out.contains("--spa"), "missing --spa in: {out}");
+    assert!(out.contains("--cors"), "missing --cors in: {out}");
+    assert!(out.contains("--token"), "missing --token in: {out}");
+}
+
+#[test]
+fn proxy_takes_no_static_origin_flags() {
+    // NEVER-ON-PROXY (hard exclusion, binary level): the static-origin flags
+    // exist only on the implicit START, so `ft proxy` with any of them is a
+    // clap usage error — before any preflight, state, or cloudflared lookup —
+    // and `ft proxy --help` does not even advertise them. A proxy fronts the
+    // operator's own server; ft-owned origin policy must be unparsable there,
+    // not silently ignored.
+    let dir = TempDir::new().unwrap();
+    for args in [
+        vec!["proxy", "--help"],
+        vec!["proxy", "3000", "--spa"],
+        vec!["proxy", "3000", "--cors"],
+        vec!["proxy", "3000", "--token", "sekrit"],
+    ] {
+        let (ok, out) = run_ft(dir.path(), &args);
+        if args == vec!["proxy", "--help"] {
+            assert!(ok, "`ft proxy --help` failed: {out}");
+            assert!(
+                !out.contains("--spa") && !out.contains("--cors") && !out.contains("--token"),
+                "proxy help must not advertise static-origin flags: {out}"
+            );
+        } else {
+            assert!(
+                !ok,
+                "expected a usage error for `ft {}`, got: {out}",
+                args.join(" ")
+            );
+            assert!(
+                out.contains("unexpected argument"),
+                "expected a clap unknown-argument error for `ft {}`, got: {out}",
+                args.join(" ")
+            );
+        }
+    }
+    assert!(
+        tree_paths(dir.path()).is_empty(),
+        "rejected proxy invocations must leave no state, found: {:?}",
+        tree_paths(dir.path())
+    );
+}
+
+#[test]
+fn static_flags_fixture_renders_in_detail() {
+    // A seeded static entry carrying `static_flags` (the on-disk shape `ft
+    // <dir> --spa --cors --token s` reserves) must render the flags in `ft
+    // detail` — SPA/CORS always (on/off) and the token only when configured —
+    // while a plain static entry in the same registry keeps the historical
+    // shape (SPA/CORS off, no Token row).
+    let dir = TempDir::new().unwrap();
+    let body = r#"{
+  "next_id": 3,
+  "services": [
+    {
+      "id": 1,
+      "name": "flagged-svc",
+      "kind": "static",
+      "dir": "/tmp/seed-dir",
+      "port": 8080,
+      "local_url": "http://127.0.0.1:8080",
+      "public_url": "https://x.trycloudflare.com",
+      "worker_pid": 4000000,
+      "tunnel_pid": null,
+      "static_flags": { "spa": true, "cors": true, "token": "hunter2" },
+      "created_at": "2026-07-21T00:00:00Z",
+      "state_dir": "/tmp/seed-state",
+      "foreground": false
+    },
+    {
+      "id": 2,
+      "name": "plain-svc",
+      "kind": "static",
+      "dir": "/tmp/plain-dir",
+      "port": 8081,
+      "local_url": "http://127.0.0.1:8081",
+      "public_url": null,
+      "worker_pid": 4000000,
+      "tunnel_pid": null,
+      "created_at": "2026-07-21T00:00:00Z",
+      "state_dir": "/tmp/plain-state",
+      "foreground": false
+    }
+  ]
+}"#;
+    seed_registry(dir.path(), body);
+
+    let (ok, out) = run_ft(dir.path(), &["detail", "flagged-svc"]);
+    assert!(ok, "`ft detail flagged-svc` failed: {out}");
+    assert!(
+        out.contains("SPA:          on"),
+        "expected the SPA row on, got: {out}"
+    );
+    assert!(
+        out.contains("CORS:         on"),
+        "expected the CORS row on, got: {out}"
+    );
+    assert!(
+        out.contains("Token:        hunter2"),
+        "expected the configured token row, got: {out}"
+    );
+
+    let (ok_plain, out_plain) = run_ft(dir.path(), &["detail", "plain-svc"]);
+    assert!(ok_plain, "`ft detail plain-svc` failed: {out_plain}");
+    assert!(
+        out_plain.contains("SPA:          off") && out_plain.contains("CORS:         off"),
+        "a plain static entry must render both flags off, got: {out_plain}"
+    );
+    assert!(
+        !out_plain.contains("Token:"),
+        "a plain static entry must not render a Token row: {out_plain}"
+    );
+}
+
+#[test]
+fn static_flags_persist_through_a_full_registry_rewrite() {
+    // The re-apply story end to end at the registry layer: the detached worker
+    // re-applies the flags by reading them off the entry, so they must survive
+    // a real load → update → save cycle through the binary. Prune reaps the
+    // EXPIRED pid-0 reservation but keeps the FRESH one (M1 grace) — and the
+    // kept entry must come out of the rewrite with its static_flags intact,
+    // byte-identical in meaning, in the compact JSON the save path writes.
+    let dir = TempDir::new().unwrap();
+    let body = format!(
+        r#"{{
+  "next_id": 3,
+  "services": [
+    {{
+      "id": 1,
+      "name": "flagged-fresh",
+      "kind": "static",
+      "dir": "/tmp/seed-dir",
+      "port": 8080,
+      "local_url": "http://127.0.0.1:8080",
+      "public_url": null,
+      "worker_pid": 0,
+      "tunnel_pid": null,
+      "static_flags": {{ "spa": true, "cors": true, "token": "hunter2" }},
+      "created_at": "{fresh}",
+      "state_dir": "/tmp/seed-state",
+      "foreground": false
+    }},
+    {{
+      "id": 2,
+      "name": "expired-reservation",
+      "kind": "static",
+      "dir": "/tmp/old-dir",
+      "port": 8081,
+      "local_url": "http://127.0.0.1:8081",
+      "public_url": null,
+      "worker_pid": 0,
+      "tunnel_pid": null,
+      "created_at": "2026-07-21T00:00:00Z",
+      "state_dir": "/tmp/old-state",
+      "foreground": false
+    }}
+  ]
+}}"#,
+        fresh = now_rfc3339()
+    );
+    let reg = seed_registry(dir.path(), &body);
+
+    let (ok, out) = run_ft(dir.path(), &["prune"]);
+    assert!(ok, "`ft prune` failed: {out}");
+    assert!(
+        out.contains("Pruned 1 stale service") && out.contains("expired-reservation"),
+        "expected exactly the expired reservation reaped, got: {out}"
+    );
+
+    // The rewrite kept the flagged entry WITH its flags (so a re-started or
+    // inspected service still re-applies them), through the real save path.
+    let after = fs::read_to_string(&reg).unwrap();
+    assert!(
+        after.contains("flagged-fresh")
+            && after.contains("static_flags")
+            && after.contains("\"spa\":true")
+            && after.contains("\"cors\":true")
+            && after.contains("\"token\":\"hunter2\""),
+        "the flagged entry must survive the rewrite with its flags, registry: {after}"
+    );
+    assert!(
+        !after.contains("expired-reservation"),
+        "the expired reservation must be gone, registry: {after}"
     );
 }

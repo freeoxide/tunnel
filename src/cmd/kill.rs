@@ -193,6 +193,8 @@ mod tests {
             public_url: None,
             worker_pid: 12345,
             tunnel_pid: None,
+            command_pid: None,
+            static_flags: Default::default(),
             created_at: crate::model::now_utc(),
             state_dir: PathBuf::from("/tmp"),
             foreground,

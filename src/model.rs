@@ -38,6 +38,26 @@ pub enum ServiceKind {
     /// The operator already runs a server on [`Service::port`]; the tunnel
     /// fronts it directly and `ft` starts no server of its own.
     Proxy,
+    /// `ft run -- <command>`: `ft` itself spawns the operator's command (a
+    /// dev server), which is expected to listen on [`Service::port`], and
+    /// the tunnel fronts it directly — nothing ft-owned in between. Unlike
+    /// `Proxy`, `ft` OWNS the child's lifecycle: the worker spawns it in its
+    /// own process group, so `ft kill` tears the tunnel and the command down
+    /// together, and [`Service::command_pid`] records the child so a
+    /// survivor can still be found after the worker is gone.
+    Run,
+    /// `ft hook`: `ft` runs its own webhook receiver/inspector origin on
+    /// [`Service::port`] (like `Static`, the server lives inside the worker),
+    /// recording every request that arrives through the tunnel to disk. Like
+    /// `Proxy`/`Run` there is no served directory: the recorded requests live
+    /// in the service's state dir instead (`requests.json`).
+    Hook,
+    /// `ft drop <dir>`: `ft` runs its own upload-receiver origin on
+    /// [`Service::port`] (an ft-owned origin inside the worker, like
+    /// `Static`/`Hook`) that accepts token-gated uploads into
+    /// [`Service::dir`] — a real directory, carried like Static's — and
+    /// serves the stored files back GET-only.
+    Drop,
 }
 
 impl ServiceKind {
@@ -45,8 +65,57 @@ impl ServiceKind {
         match self {
             ServiceKind::Static => "static",
             ServiceKind::Proxy => "proxy",
+            ServiceKind::Run => "run",
+            ServiceKind::Hook => "hook",
+            ServiceKind::Drop => "drop",
         }
     }
+}
+
+/// Static-origin behaviour flags (`ft <dir> --spa/--cors/--token`), carried on
+/// a [`Service`] so the detached worker re-applies exactly what the operator
+/// asked for.
+///
+/// They travel on the registry entry — not the worker argv — because the
+/// worker already reloads the reserved entry before starting (that is where
+/// the `kind` comes from), so a second channel would duplicate this state and,
+/// worse, put the `token` secret in `ps` output. All three are meaningless for
+/// non-Static kinds (the CLI only accepts them on the implicit `ft <dir>`
+/// START, whose origin is always static; `ft proxy` structurally has no such
+/// flags — the hard never-on-proxy exclusion).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StaticFlags {
+    /// `--spa`: fall unmatched paths (the 404s for non-existent files under
+    /// the served root) back to the root `index.html`, so a client-side
+    /// router's deep links work. Refusal 404s keep their meaning: dotfiles,
+    /// `..` traversal, and symlink escapes are never rewritten to the shell,
+    /// and a root without an `index.html` keeps the honest 404.
+    pub spa: bool,
+    /// `--cors`: stamp permissive CORS headers (`Access-Control-Allow-Origin:
+    /// *`, methods GET/HEAD/OPTIONS, wildcard request headers) on every
+    /// response of the static origin. Preflight OPTIONS requests are
+    /// deliberately NOT answered with a success status: only a CORS-simple
+    /// request skips the preflight (a GET/HEAD whose headers are all
+    /// safelisted), while a GET/HEAD carrying a non-safelisted header such as
+    /// `Authorization` DOES preflight — and this origin 405s every OPTIONS
+    /// like any non-GET/HEAD, so the browser never sends that request.
+    /// Consequence of combining with `--token`: a cross-origin BROWSER can
+    /// never complete a Bearer-authenticated request here (it falls back to
+    /// `?token=`); same-origin pages and non-browser clients are unaffected.
+    pub cors: bool,
+    /// `--token <secret>`: require this operator-chosen secret on EVERY
+    /// request (GET/HEAD included — the static origin's entire value is its
+    /// content, so unlike the drop bucket's write-only gate there is no safe
+    /// unauthenticated subset) via `Authorization: Bearer <secret>` or
+    /// `?token=<secret>`, compared in constant time, answered 401 before the
+    /// confinement layer so a 404-scanner cannot probe the tree shape without
+    /// the token. Deliberately never auto-generated (unlike the drop bucket's
+    /// write credential): the brief makes it an operator-chosen secret, and a
+    /// value the operator already knows needs no minting ceremony. Stored here
+    /// in the registry — the save path is owner-only 0600, the same protection
+    /// the drop token's private file gets.
+    pub token: Option<String>,
 }
 
 /// A single managed tunnel service.
@@ -57,17 +126,24 @@ pub struct Service {
     pub id: u64,
     /// Human-friendly name, usable as a target.
     pub name: String,
-    /// How this service sources its local origin: ft's own static server
-    /// ([`ServiceKind::Static`]) or the operator's existing upstream
-    /// ([`ServiceKind::Proxy`]).
+    /// How this service sources its local origin: ft's own static file server
+    /// ([`ServiceKind::Static`]), the operator's existing upstream
+    /// ([`ServiceKind::Proxy`]), a command `ft` spawns itself
+    /// ([`ServiceKind::Run`]), ft's own webhook receiver/inspector
+    /// ([`ServiceKind::Hook`]), or ft's own upload receiver
+    /// ([`ServiceKind::Drop`]).
     ///
     /// Defaults to `Static` on deserialize so pre-proxy `registry.json`
     /// files — which carry no `kind` — keep their existing meaning.
     #[serde(default)]
     pub kind: ServiceKind,
-    /// Absolute path to the directory being served. `None` for `Proxy`
-    /// services, which front an existing port instead of a directory.
-    /// Nullable and defaulted so proxy entries may omit it on disk.
+    /// Absolute path to the directory being served. `Some` for `Static` (the
+    /// served tree) and `Drop` (the upload target, which the origin also
+    /// writes into); `None` for `Proxy`, `Run`, and `Hook` services, which
+    /// front a port instead of a directory (the proxy fronts the operator's
+    /// server; a run fronts the command `ft` spawned; a hook records requests
+    /// into its state dir). Nullable and defaulted so those entries may omit
+    /// it on disk.
     #[serde(default)]
     pub dir: Option<PathBuf>,
     /// Local port. For `Static` services this is the port ft's own server
@@ -85,6 +161,24 @@ pub struct Service {
     pub worker_pid: u32,
     /// PID of the `cloudflared` child, once spawned.
     pub tunnel_pid: Option<u32>,
+    /// Static-origin flags for `Static` services (`--spa`/`--cors`/`--token`),
+    /// persisted so the detached worker re-applies them — see [`StaticFlags`]
+    /// for why they live here rather than on the worker argv. Serde-defaulted
+    /// so every registry written before the flags existed (and every non-Static
+    /// entry, which never sets them) keeps loading unchanged with all flags
+    /// off.
+    #[serde(default)]
+    pub static_flags: StaticFlags,
+    /// PID of the user's command child, for `Run` services only: `None` for
+    /// every other kind, and for a `Run` entry until its worker has actually
+    /// spawned the command. The worker records it under the registry lock so
+    /// the child remains reachable by id even if the worker dies without
+    /// tearing it down (the future `ft doctor` "tunnel dead, command still
+    /// running" orphan detection reads exactly this field). Only the pid is
+    /// registry state — the command line itself travels in the worker's argv
+    /// and is deliberately not persisted.
+    #[serde(default)]
+    pub command_pid: Option<u32>,
     pub created_at: DateTime<Utc>,
     /// Per-service directory holding its log files.
     pub state_dir: PathBuf,
@@ -224,6 +318,8 @@ mod tests {
             public_url: public_url.map(str::to_string),
             worker_pid,
             tunnel_pid: None,
+            static_flags: StaticFlags::default(),
+            command_pid: None,
             created_at: super::now_utc(),
             state_dir: PathBuf::from("/tmp/state"),
             foreground,
@@ -262,7 +358,8 @@ mod tests {
     #[test]
     fn explicit_kind_tags_deserialize() {
         // tests/integration.rs fixtures seed `"kind": "static"` explicitly;
-        // proxy entries tag `"proxy"` and may carry `"dir": null`.
+        // proxy entries tag `"proxy"` and may carry `"dir": null`, and run
+        // entries tag `"run"` the same way (a run fronts a port, no dir).
         let json = service_json(r#""kind": "static", "dir": "/tmp/dir","#);
         let s: Service = serde_json::from_str(&json).expect("explicit static must parse");
         assert_eq!(s.kind, ServiceKind::Static);
@@ -271,6 +368,21 @@ mod tests {
         let s: Service = serde_json::from_str(&json).expect("proxy must parse");
         assert_eq!(s.kind, ServiceKind::Proxy);
         assert_eq!(s.dir, None);
+
+        let json = service_json(r#""kind": "run", "dir": null,"#);
+        let s: Service = serde_json::from_str(&json).expect("run must parse");
+        assert_eq!(s.kind, ServiceKind::Run);
+        assert_eq!(s.dir, None);
+
+        let json = service_json(r#""kind": "hook", "dir": null,"#);
+        let s: Service = serde_json::from_str(&json).expect("hook must parse");
+        assert_eq!(s.kind, ServiceKind::Hook);
+        assert_eq!(s.dir, None);
+
+        let json = service_json(r#""kind": "drop", "dir": "/tmp/inbox","#);
+        let s: Service = serde_json::from_str(&json).expect("drop must parse");
+        assert_eq!(s.kind, ServiceKind::Drop);
+        assert_eq!(s.dir, Some(PathBuf::from("/tmp/inbox")));
     }
 
     #[test]
@@ -298,14 +410,148 @@ mod tests {
     }
 
     #[test]
+    fn run_service_round_trips_through_json() {
+        // A run service — dir: None plus the command child's recorded pid —
+        // must survive a serialize → deserialize cycle field-for-field,
+        // including the `kind` tag and `command_pid` (the field A2's orphan
+        // detection reads back).
+        let s = Service {
+            kind: ServiceKind::Run,
+            dir: None,
+            command_pid: Some(4242),
+            ..service(7, Some("https://example.trycloudflare.com"), false)
+        };
+        let encoded = serde_json::to_string(&s).expect("encode");
+        let decoded: Service = serde_json::from_str(&encoded).expect("decode");
+        assert_eq!(decoded, s);
+    }
+
+    #[test]
+    fn hook_service_round_trips_through_json() {
+        // A hook service — dir: None, like proxy/run, plus no command child —
+        // must survive a serialize → deserialize cycle field-for-field,
+        // including the `kind` tag: the hook's spec (retention aside) lives
+        // entirely in the kind, so the round-trip IS the persistence story.
+        let s = Service {
+            kind: ServiceKind::Hook,
+            dir: None,
+            ..service(7, Some("https://example.trycloudflare.com"), false)
+        };
+        let encoded = serde_json::to_string(&s).expect("encode");
+        let decoded: Service = serde_json::from_str(&encoded).expect("decode");
+        assert_eq!(decoded, s);
+    }
+
+    #[test]
+    fn drop_service_round_trips_through_json() {
+        // A drop service — dir: Some (the upload target, carried like
+        // Static's), no command child — must survive a serialize →
+        // deserialize cycle field-for-field, including the `kind` tag: the
+        // token deliberately is NOT registry state (it lives in the service's
+        // private token file), so the round-trip is the whole persistence
+        // story.
+        let s = Service {
+            kind: ServiceKind::Drop,
+            dir: Some(PathBuf::from("/tmp/inbox")),
+            ..service(7, Some("https://example.trycloudflare.com"), false)
+        };
+        let encoded = serde_json::to_string(&s).expect("encode");
+        let decoded: Service = serde_json::from_str(&encoded).expect("decode");
+        assert_eq!(decoded, s);
+    }
+
+    #[test]
+    fn omitted_command_pid_deserializes_as_none() {
+        // `command_pid` is serde-defaulted so every registry written before
+        // `ft run` existed (and every non-run entry, which never sets it)
+        // keeps loading unchanged — an old entry must read as "no command
+        // child", never fail the parse.
+        let json = service_json(r#""kind": "proxy", "dir": null,"#);
+        let s: Service = serde_json::from_str(&json).expect("entry without command_pid");
+        assert_eq!(s.command_pid, None);
+    }
+
+    #[test]
+    fn omitted_static_flags_deserialize_as_all_off() {
+        // `static_flags` is serde-defaulted so every registry written before
+        // the static-origin flags existed keeps loading unchanged: a legacy
+        // (or plain) entry must read as spa off, cors off, no token — never
+        // fail the parse, never silently enable a behaviour the operator did
+        // not ask for.
+        let json = service_json(r#""kind": "static", "dir": "/tmp/dir","#);
+        let s: Service = serde_json::from_str(&json).expect("entry without static_flags");
+        assert_eq!(s.static_flags, StaticFlags::default());
+        assert!(!s.static_flags.spa);
+        assert!(!s.static_flags.cors);
+        assert_eq!(s.static_flags.token, None);
+    }
+
+    #[test]
+    fn static_flags_round_trip_through_json() {
+        // A static entry carrying all three origin flags must survive a
+        // serialize → deserialize cycle field-for-field: the flags ARE the
+        // persistence story — the detached worker re-applies exactly these
+        // values (including the token secret) from the reloaded entry.
+        let s = Service {
+            static_flags: StaticFlags {
+                spa: true,
+                cors: true,
+                token: Some("hunter2".to_string()),
+            },
+            ..service(7, Some("https://example.trycloudflare.com"), false)
+        };
+        let encoded = serde_json::to_string(&s).expect("encode");
+        let decoded: Service = serde_json::from_str(&encoded).expect("decode");
+        assert_eq!(decoded, s);
+    }
+
+    #[test]
+    fn explicit_static_flags_json_deserializes() {
+        // The on-disk shape a real `ft <dir> --spa --cors --token s` start
+        // reserves: a `static_flags` object on the entry. Partial objects work
+        // too (container-level serde default), so a hand-edited entry cannot
+        // be bricked by an incomplete flag group.
+        let json = service_json(
+            r#""kind": "static", "dir": "/tmp/dir",
+            "static_flags": {"spa": true, "cors": false, "token": "s"},"#,
+        );
+        let s: Service = serde_json::from_str(&json).expect("flagged entry must parse");
+        assert!(s.static_flags.spa);
+        assert!(!s.static_flags.cors);
+        assert_eq!(s.static_flags.token.as_deref(), Some("s"));
+
+        let json =
+            service_json(r#""kind": "static", "dir": "/tmp/dir", "static_flags": {"spa": true},"#);
+        let s: Service = serde_json::from_str(&json).expect("partial flag group must parse");
+        assert!(s.static_flags.spa);
+        assert!(!s.static_flags.cors);
+        assert_eq!(s.static_flags.token, None);
+    }
+
+    #[test]
     fn kind_as_str_matches_serde_tags() {
         // `as_str` is the human/CLI rendering and must agree with the on-disk
         // serde tag for each variant.
         assert_eq!(ServiceKind::Static.as_str(), "static");
         assert_eq!(ServiceKind::Proxy.as_str(), "proxy");
+        assert_eq!(ServiceKind::Run.as_str(), "run");
+        assert_eq!(ServiceKind::Hook.as_str(), "hook");
+        assert_eq!(ServiceKind::Drop.as_str(), "drop");
         assert_eq!(
             serde_json::to_value(ServiceKind::Proxy).expect("encode"),
             serde_json::json!("proxy")
+        );
+        assert_eq!(
+            serde_json::to_value(ServiceKind::Run).expect("encode"),
+            serde_json::json!("run")
+        );
+        assert_eq!(
+            serde_json::to_value(ServiceKind::Hook).expect("encode"),
+            serde_json::json!("hook")
+        );
+        assert_eq!(
+            serde_json::to_value(ServiceKind::Drop).expect("encode"),
+            serde_json::json!("drop")
         );
     }
 

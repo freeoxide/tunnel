@@ -52,6 +52,24 @@ pub fn print_started(service: &Service) {
     println!("Logs:    {}/", service.state_dir.display());
 }
 
+/// Print the drop bucket's access-token block, printed ONCE by a successful
+/// `ft drop` (background and foreground alike): the token is the write
+/// credential for the bucket, so the operator must walk away from the start
+/// command with it in hand (it also lives in the service's private token file
+/// and is shown by `ft detail`). The example embeds `example_origin` so the
+/// command line is copy-pasteable.
+pub fn print_drop_token(token: &str, example_origin: &str) {
+    println!();
+    println!("Token:   {token}");
+    println!();
+    println!("Uploads REQUIRE this token (POST/PUT; GET downloads are public), e.g.:");
+    println!(
+        "  curl -H \"Authorization: Bearer {token}\" --data-binary @file.txt \
+         {example_origin}/file.txt"
+    );
+    println!("Recover it later with `ft detail <name>`.");
+}
+
 /// Print the service list as a table, or `(no services)` when empty.
 ///
 /// Columns: `ID NAME STATUS PORT URL`. Status comes from `Service::status`;
@@ -90,51 +108,129 @@ pub fn print_list(services: &[Service]) {
 ///
 /// The `Mode`/`Directory` rows are kind-aware: a Static service keeps the
 /// historical shape exactly (mode = foreground/background, plus the served
-/// `Directory:`), while a Proxy service renders its kind in the `Mode:` row
-/// and replaces `Directory:` with the `Upstream:` it fronts (the proxy's
-/// `local_url` IS the operator's server). A proxy also runs no static server,
-/// so its Logs section lists no `server.log` (the worker never creates one).
+/// `Directory:`) and adds its static-origin flag rows (`SPA:`/`CORS:` always,
+/// on/off; `Token:` only when the operator started it with `--token`), a Proxy
+/// service renders its kind in the `Mode:` row and
+/// replaces `Directory:` with the `Upstream:` it fronts (the proxy's
+/// `local_url` IS the operator's server), a Run service renders its kind with
+/// no Directory row at all (its origin is the command ft spawned — the
+/// `Command PID:` row is the run-specific fact), a Hook service renders
+/// its kind with no Directory/Upstream row (its origin is ft's own webhook
+/// receiver; the `Requests:` file in the Logs section is where the recorded
+/// requests live), and a Drop service renders its kind plus the upload
+/// target's `Directory:` row and a `Token:` row — the drop bucket's write
+/// credential, read back from the service's private token file (the token is
+/// deliberately NOT registry state, so the file read here is the only way
+/// `ft detail` can recover it for the operator; `-` when it cannot be read).
+/// A proxy, run, hook, or drop service runs no traced static server, so the
+/// Logs section lists no `server.log` (a run's command output is teed into
+/// `worker.log`; a hook's request record is `requests.json`; a drop's record
+/// is the bucket directory itself).
 pub fn print_detail(service: &Service) {
     let tunnel_pid = service
         .tunnel_pid
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "-".into());
+    let command_pid = service
+        .command_pid
         .map(|p| p.to_string())
         .unwrap_or_else(|| "-".into());
 
     println!("Name:         {}", service.name);
     println!("ID:           {}", service.id);
     println!("Status:       {}", service.status().as_str());
-    if service.kind == ServiceKind::Proxy {
-        println!("Mode:         {}", service.kind.as_str());
-        println!("Upstream:     {}", service.local_url);
-    } else {
-        println!(
-            "Mode:         {}",
-            if service.foreground {
-                "foreground"
-            } else {
-                "background"
+    match service.kind {
+        ServiceKind::Proxy => {
+            println!("Mode:         {}", service.kind.as_str());
+            println!("Upstream:     {}", service.local_url);
+        }
+        ServiceKind::Run | ServiceKind::Hook => {
+            println!("Mode:         {}", service.kind.as_str());
+        }
+        ServiceKind::Drop => {
+            println!("Mode:         {}", service.kind.as_str());
+            println!(
+                "Directory:    {}",
+                service
+                    .dir
+                    .as_deref()
+                    .map_or_else(|| "-".to_string(), |d| d.display().to_string())
+            );
+        }
+        ServiceKind::Static => {
+            println!(
+                "Mode:         {}",
+                if service.foreground {
+                    "foreground"
+                } else {
+                    "background"
+                }
+            );
+            println!(
+                "Directory:    {}",
+                service
+                    .dir
+                    .as_deref()
+                    .map_or_else(|| "-".to_string(), |d| d.display().to_string())
+            );
+            // The static-origin flags as started (`--spa`/`--cors`/`--token`):
+            // always rendered on/off so the shape is predictable, with the
+            // token row only when one is configured (a `-` placeholder for a
+            // value that never existed would just be noise on the historical
+            // no-flag shape). The token renders because the operator chose it
+            // — same recovery convenience as the drop bucket's token row.
+            println!(
+                "SPA:          {}",
+                if service.static_flags.spa {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
+            println!(
+                "CORS:         {}",
+                if service.static_flags.cors {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
+            if let Some(token) = &service.static_flags.token {
+                println!("Token:        {token}");
             }
-        );
-        println!(
-            "Directory:    {}",
-            service
-                .dir
-                .as_deref()
-                .map_or_else(|| "-".to_string(), |d| d.display().to_string())
-        );
+        }
     }
     println!("Port:         {}", service.port);
     println!("Worker PID:   {}", service.worker_pid);
     println!("Tunnel PID:   {tunnel_pid}");
+    println!("Command PID:  {command_pid}");
     println!("Started:      {}", fmt_started(service));
     println!("Local URL:    {}", service.local_url);
     println!("Public URL:   {}", url_or_pending(service));
+    if service.kind == ServiceKind::Drop {
+        // The upload credential's durable home is the service's private token
+        // file; detail is where the operator recovers it (printed once at
+        // start, this is the second and last place it appears). A missing or
+        // unreadable file renders as `-` rather than failing the whole detail.
+        let token = crate::drop_server::read_token(&service.state_dir)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "-".to_string());
+        println!("Token:        {token}");
+    }
     println!();
     println!("Logs:");
     println!("  {}", service.state_dir.join("worker.log").display());
-    if service.kind != ServiceKind::Proxy {
-        // Only a Static worker runs (and traces requests into) a server.
+    if service.kind == ServiceKind::Static {
+        // Only a Static worker runs (and traces requests into) a server. A
+        // run's command output lands in worker.log instead.
         println!("  {}", service.state_dir.join("server.log").display());
+    }
+    if service.kind == ServiceKind::Hook {
+        // The hook origin's own request record — the data the /__inspect
+        // views serve — is a file sibling of the logs, so it is listed here
+        // where the operator already looks for a service's on-disk artifacts.
+        println!("  {}", service.state_dir.join("requests.json").display());
     }
     println!("  {}", service.state_dir.join("tunnel.log").display());
 }

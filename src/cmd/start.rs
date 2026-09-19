@@ -8,10 +8,14 @@
 //! and the command blocks until cloudflared exits or Ctrl+C is received.
 //!
 //! The foreground machinery here is shared with the proxy flow
-//! (`ft proxy <port> --foreground`, see `cmd/proxy.rs`): a `dir` of `None`
-//! selects proxy semantics — no static server, cloudflared points straight at
-//! the operator's upstream port.
+//! (`ft proxy <port> --foreground`, see `cmd/proxy.rs`) and the run flow
+//! (`ft run --port <p> -- <cmd> --foreground`, see `cmd/run.rs`): a `dir` of
+//! `None` selects proxy semantics — no static server, cloudflared points
+//! straight at the operator's upstream port — and an additional `command`
+//! selects run semantics, where `ft` itself spawns the operator's command as
+//! the local origin and owns it for the foreground lifetime.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +26,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::cloudflared;
 use crate::error::Result;
-use crate::model::{Registry, Service, ServiceKind};
+use crate::model::{Registry, Service, ServiceKind, StaticFlags};
 use crate::name;
 use crate::output;
 use crate::port;
@@ -42,13 +46,18 @@ const LAST_REASON_CAP: u64 = 16 * 1024;
 
 /// Entry point for the START command.
 ///
-/// `dir` defaults to `.` when the caller passes `None`.
+/// `dir` defaults to `.` when the caller passes `None`. `static_flags` carries
+/// the static-origin flags (`--spa`/`--cors`/`--token`); they are refused
+/// outright with an empty `--token` value (an empty secret would either lock
+/// everyone out or — worse — read as "no auth" to a future reader) and are
+/// persisted on the reserved entry so the detached worker re-applies them.
 pub async fn run(
     dir: Option<PathBuf>,
     name: Option<String>,
     port: Option<u16>,
     foreground: bool,
     yes: bool,
+    static_flags: StaticFlags,
 ) -> Result<()> {
     let dir = dir.unwrap_or_else(|| PathBuf::from("."));
     let dir = resolve_dir(&dir)?;
@@ -56,11 +65,21 @@ pub async fn run(
     // filesystem root to the public internet. Dotfiles are already refused by
     // the server (C1), but `$HOME` still exposes most of a user's life.
     confirm_sensitive(&dir, yes)?;
+    // Before any state is touched: an empty (or whitespace-only) --token is a
+    // typo, not a configuration. The value itself is kept verbatim — both the
+    // foreground server and the detached worker read the SAME registry value,
+    // so unlike a file round-trip there is no trim-mismatch to paper over.
+    if let Some(token) = &static_flags.token {
+        ensure!(
+            !token.trim().is_empty(),
+            "--token must be a non-empty secret"
+        );
+    }
 
     if foreground {
-        run_foreground(Some(dir.as_path()), name, port).await
+        run_foreground_with_options(dir.as_path(), name, port, static_flags).await
     } else {
-        run_background(&dir, name, port).await
+        run_background(&dir, name, port, static_flags).await
     }
 }
 
@@ -108,7 +127,13 @@ fn confirm_sensitive(dir: &Path, yes: bool) -> Result<()> {
 /// - any **ancestor** of `$HOME` (e.g. `ft ~..`, `ft /home`, `ft /Users`,
 ///   `ft C:\Users`) — publishing it would expose every user's home non-dotfile
 ///   contents;
-/// - `$HOME` itself.
+/// - `$HOME` itself;
+/// - any directory **overlapping ft's own state tree** (`$XDG_STATE_HOME/
+///   freeoxide/tunnel`, i.e. the root itself, a subtree like `services/`, or
+///   an ancestor that contains it). The state tree is full of secrets a
+///   non-dotfile GET or a WRITE-touching drop bucket would expose publicly —
+///   `registry.json`, worker/tunnel logs, hook request records, and every
+///   service's `drop-token` file — so no part of it may be served.
 ///
 /// Both sides are canonicalised so a symlink alias of `$HOME` (e.g.
 /// `ft ~/house` where `house -> $HOME`) cannot slip past the prompt; if the
@@ -144,13 +169,37 @@ pub(crate) fn is_sensitive_dir(dir: &Path) -> bool {
     // containers or systemd units with no Environment=), fail CLOSED: treat
     // the directory as sensitive so the user must pass --yes rather than us
     // silently publishing something we couldn't reason about.
-    match directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()) {
+    let home_overlapped = match directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()) {
         Some(home) => {
             let home = std::fs::canonicalize(&home).unwrap_or(home);
             home.starts_with(&dir)
         }
         None => true,
-    }
+    };
+
+    // ft's own state tree joins the denylist (shared with the drop callers):
+    // it holds registry.json, worker/tunnel logs, hook request records, and
+    // per-service `drop-token` files — none dotfile-hidden, so serving ANY of
+    // it publicly leaks secrets. The overlap is three-way on purpose: the
+    // root itself, a subtree (`services/`, a per-service dir — drops WRITE
+    // there, and GETs serve the token files), and ancestors (`ft drop
+    // ~/.local/state` would serve registry.json via the `freeoxide/tunnel`
+    // subpath). The root is resolved the same way as `dir` above; when it
+    // does not exist yet it cannot be canonicalised and the lexical absolute
+    // path is compared instead (a fresh machine has no state tree to leak,
+    // but a drop bucket placed where it WILL live would write uploads into
+    // it). If the state root cannot even be determined, fail CLOSED —
+    // matching the $HOME fallback's posture for broken environments.
+    let state_overlapped = match crate::state::StateDir::new() {
+        Ok(state) => {
+            let root =
+                std::fs::canonicalize(state.root()).unwrap_or_else(|_| state.root().to_path_buf());
+            dir == root || dir.starts_with(&root) || root.starts_with(&dir)
+        }
+        Err(_) => true,
+    };
+
+    home_overlapped || state_overlapped
 }
 
 /// Resolve a directory to an absolute, existing, readable path.
@@ -182,7 +231,12 @@ fn is_readable(dir: &Path) -> bool {
 /// `kill(-pgid)`; on Windows it is detached via `CREATE_NEW_PROCESS_GROUP |
 /// DETACHED_PROCESS` and owns a `KILL_ON_JOB_CLOSE` Job Object. Both are hidden
 /// behind [`spawn::spawn_worker`] and [`proc::shutdown_process_group`].
-async fn run_background(dir: &Path, name: Option<String>, port: Option<u16>) -> Result<()> {
+async fn run_background(
+    dir: &Path,
+    name: Option<String>,
+    port: Option<u16>,
+    static_flags: StaticFlags,
+) -> Result<()> {
     let state = StateDir::new()?;
 
     // --- Port -------------------------------------------------------------
@@ -237,6 +291,11 @@ async fn run_background(dir: &Path, name: Option<String>, port: Option<u16>) -> 
             public_url: None,
             worker_pid: 0,
             tunnel_pid: None,
+            // The origin flags ride the entry itself: the worker reloads this
+            // entry before starting (that is where it reads the kind), so it
+            // re-applies exactly these values — no flag rides the argv.
+            static_flags,
+            command_pid: None,
             created_at: crate::model::now_utc(),
             state_dir: service_dir,
             foreground: false,
@@ -435,22 +494,70 @@ impl Drop for EntryGuard {
 /// SIGTERM is what `ft kill` uses to stop a foreground tunnel from another
 /// terminal.
 ///
-/// `dir` selects the origin kind, mirroring the registry invariant (`Static`
-/// services carry a directory, `Proxy` services do not): `Some(dir)` runs ft's
-/// own static server for `dir` (the implicit `ft <dir> --foreground` flow);
-/// `None` runs NO server of our own — cloudflared points straight at the
-/// operator's existing upstream on `port` (the `ft proxy <port> --foreground`
-/// flow). Unlike the background worker, the server + cloudflared live in THIS
-/// process, so the registry entry records `worker_pid` as our own pid and is
-/// marked `foreground: true`. That flag makes `status()` use a plain liveness
-/// probe (our cmdline lacks the `run-worker` token) and makes `ft kill` signal
-/// this single pid rather than its whole process group (which would include
-/// the operator's shell). The entry is removed on every exit path; a hard kill
-/// (SIGKILL/crash) leaves it stale for `ft prune` to reap.
+/// Shared entry kept at the historical signature so the proxy flow's call site
+/// (frozen for this area) stays untouched; the run flow enters through
+/// [`run_foreground_with_command`] and a static start with origin flags through
+/// [`run_foreground_with_options`].
 pub(crate) async fn run_foreground(
     dir: Option<&Path>,
     name: Option<String>,
     port: Option<u16>,
+) -> Result<()> {
+    run_foreground_inner(dir, name, port, None, StaticFlags::default()).await
+}
+
+/// Foreground entry for `ft <dir> --foreground` with static-origin flags.
+///
+/// The same machinery as [`run_foreground`], with the `--spa`/`--cors`/
+/// `--token` values applied to the static server and persisted on the
+/// reserved entry.
+pub(crate) async fn run_foreground_with_options(
+    dir: &Path,
+    name: Option<String>,
+    port: Option<u16>,
+    static_flags: StaticFlags,
+) -> Result<()> {
+    run_foreground_inner(Some(dir), name, port, None, static_flags).await
+}
+
+/// Foreground entry for `ft run --port <p> -- <cmd> --foreground`.
+///
+/// The same machinery as [`run_foreground`], with `ft` spawning `command`
+/// (PORT exported) as the local origin — and owning it for the foreground
+/// lifetime: the command dies with the tunnel on Ctrl-C, SIGTERM, cloudflared
+/// exit, or the command's own exit.
+pub(crate) async fn run_foreground_with_command(
+    name: Option<String>,
+    port: Option<u16>,
+    command: &[OsString],
+) -> Result<()> {
+    run_foreground_inner(None, name, port, Some(command), StaticFlags::default()).await
+}
+
+/// The shared foreground machinery behind both entries.
+///
+/// `dir` selects the static origin, mirroring the registry invariant (`Static`
+/// services carry a directory): `Some(dir)` runs ft's own static server for
+/// `dir` (the implicit `ft <dir> --foreground` flow), applying `static_flags`
+/// (the `--spa`/`--cors`/`--token` values; ignored by the run/proxy flows,
+/// which pass the default). `None` with a `command`
+/// runs the operator's command as ft's child and fronts it (the
+/// `ft run --foreground` flow); `None` without a command runs NO server of our
+/// own — cloudflared points straight at the operator's existing upstream on
+/// `port` (the `ft proxy <port> --foreground` flow). Unlike the background
+/// worker, the server + cloudflared live in THIS process, so the registry
+/// entry records `worker_pid` as our own pid and is marked `foreground: true`.
+/// That flag makes `status()` use a plain liveness probe (our cmdline lacks
+/// the `run-worker` token) and makes `ft kill` signal this single pid rather
+/// than its whole process group (which would include the operator's shell).
+/// The entry is removed on every exit path; a hard kill (SIGKILL/crash) leaves
+/// it stale for `ft prune` to reap.
+async fn run_foreground_inner(
+    dir: Option<&Path>,
+    name: Option<String>,
+    port: Option<u16>,
+    command: Option<&[OsString]>,
+    static_flags: StaticFlags,
 ) -> Result<()> {
     use crate::static_server;
     use std::time::Duration;
@@ -463,12 +570,25 @@ pub(crate) async fn run_foreground(
     let state = StateDir::new()?;
     state.ensure()?;
 
+    // The kind follows the origin, mirroring the registry invariant: a
+    // directory means Static (ft's own server), a command means Run (ft
+    // spawns the origin and owns it), neither means Proxy (the operator's own
+    // upstream is the origin).
+    let kind = if dir.is_some() {
+        ServiceKind::Static
+    } else if command.is_some() {
+        ServiceKind::Run
+    } else {
+        ServiceKind::Proxy
+    };
+
     // Port policy is kind-dependent. Static: ft binds its own server, so an
-    // omitted port is allocated and an explicit one must be free. Proxy: the
-    // port is the operator's upstream — required, never probed for freeness
-    // (it is *supposed* to be in use), and deliberately not probed for
-    // liveness either: cloudflared connects lazily, and a friendly upstream
-    // pre-flight belongs to the CLI layer, not the run path.
+    // omitted port is allocated and an explicit one must be free. Proxy/Run:
+    // the port is the origin's — required, never probed for freeness (it is
+    // *supposed* to be in use once the origin is up), and deliberately not
+    // probed for liveness either: cloudflared connects lazily, and a friendly
+    // pre-flight belongs to the CLI layer, not the run path. (For a run the
+    // port is always Some: the CLI layer requires it — see cmd/run.rs.)
     let port = match dir {
         Some(_) => match port {
             Some(p) => {
@@ -485,11 +605,11 @@ pub(crate) async fn run_foreground(
             Some(p) => {
                 ensure!(
                     p != 0,
-                    "port 0 is reserved; pass the upstream port (1-65535)"
+                    "port 0 is reserved; pass an explicit port (1-65535)"
                 );
                 p
             }
-            None => bail!("a proxy service needs the upstream port to front"),
+            None => bail!("a proxy or run service needs an explicit port to front"),
         },
     };
 
@@ -509,11 +629,14 @@ pub(crate) async fn run_foreground(
             }
             None => {
                 // Static services derive the name from the directory's
-                // basename; a proxy has no directory, so derive it from the
-                // upstream port it fronts.
-                let base = match dir {
-                    Some(d) => name::generate_name(d),
-                    None => format!("proxy-{port}"),
+                // basename; a proxy derives it from the upstream port it
+                // fronts, a run from the port its command will take —
+                // mirroring the background flows' `proxy-{port}`/`run-{port}`
+                // defaults so both modes of each command agree.
+                let base = match (dir, command) {
+                    (Some(d), _) => name::generate_name(d),
+                    (None, Some(_)) => format!("run-{port}"),
+                    (None, None) => format!("proxy-{port}"),
                 };
                 name::unique_name(reg, &base)
             }
@@ -523,17 +646,23 @@ pub(crate) async fn run_foreground(
         reg.services.push(Service {
             id,
             name: name.clone(),
-            kind: if dir.is_some() {
-                ServiceKind::Static
-            } else {
-                ServiceKind::Proxy
-            },
+            kind,
             dir: dir.map(|d| d.to_path_buf()),
             port,
             local_url: format!("http://127.0.0.1:{port}"),
             public_url: None,
             worker_pid: std::process::id(),
             tunnel_pid: None,
+            // The command child is spawned (and its pid recorded) below; a
+            // foreground entry starts like a background one, with no child
+            // recorded yet.
+            command_pid: None,
+            // The static-origin flags ride the entry here too, so `ft detail`
+            // shows what the operator started with and the registry stays the
+            // single source of truth. Defaulted (all off) for the run/proxy
+            // foreground flows, which pass no flags. (Cloned: the same value
+            // also configures the in-process server below.)
+            static_flags: static_flags.clone(),
             created_at: crate::model::now_utc(),
             state_dir: service_dir,
             foreground: true,
@@ -571,7 +700,10 @@ pub(crate) async fn run_foreground(
     // server at all — `server_handle` stays `None` below and the drain at the
     // end is skipped.
     let mut server_handle = dir.map(|dir| {
-        let router = static_server::router(dir.to_path_buf());
+        // The static-origin flags (defaulted for the run/proxy foreground
+        // flows, where `dir` is None and this closure never runs) configure
+        // the same router the detached worker would build from the entry.
+        let router = static_server::router_with(dir.to_path_buf(), static_flags.clone());
         // `serve` installs its own Ctrl-C handler for graceful shutdown: on
         // Ctrl-C it stops accepting and drains in-flight requests. We keep the
         // JoinHandle so we can bound that drain below.
@@ -582,14 +714,86 @@ pub(crate) async fn run_foreground(
         })
     });
 
+    // Run only: open the command's log sink BEFORE spawning the child, so a
+    // failure to open worker.log can never orphan an already-running command.
+    let command_writer = match command {
+        Some(_) => {
+            let command_log = state.worker_log(&name);
+            Some(Arc::new(Mutex::new(
+                crate::fsutil::open_private_append_async(&command_log)
+                    .await
+                    .with_context(|| format!("opening worker log {}", command_log.display()))?,
+            )))
+        }
+        None => None,
+    };
+
+    // Run only: spawn the operator's command as THIS process's child — the
+    // local origin cloudflared will front. `PORT` is exported so well-behaved
+    // tools pick the port up. A run never has a static server task (dir is
+    // None by construction), so a spawn failure here has nothing else to
+    // unwind; the reserved entry is released by the guard on return.
+    let (command_pid, mut command_monitor, command_out) = match command {
+        Some(cmd) => {
+            let mut child = crate::proc::spawn_command_child(cmd, port)?;
+            // A freshly spawned, unreaped child always reports its pid (see
+            // the matching note in worker.rs).
+            let pid = child.id();
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            let monitor = crate::proc::spawn_wait_monitor(child);
+            (pid, monitor, (stdout, stderr))
+        }
+        None => (
+            None,
+            crate::proc::command_monitor_placeholder(),
+            (None, None),
+        ),
+    };
+    // Record the command child's pid the moment it exists (Run only). Warn on
+    // failure rather than `?`: with the child already running, a registry
+    // write failure must not abandon it — the child is torn down by the
+    // shutdown path below on every exit anyway.
+    if let Some(pid) = command_pid
+        && let Err(e) = Registry::update(&state, |reg| {
+            if let Some(svc) = reg.find_mut(&id.to_string()) {
+                svc.command_pid = Some(pid);
+            }
+        })
+    {
+        tracing::warn!(%e, id, "failed to record the command pid on the registry entry");
+    }
+
+    // Tee the command's output to the terminal AND worker.log (mirroring how
+    // cloudflared's output below is teed to stdout AND tunnel.log) so
+    // `ft logs` keeps working after the foreground session ends.
+    let (command_stdout, command_stderr) = command_out;
+    let mut command_tasks = Vec::new();
+    if let Some(command_writer) = command_writer {
+        if let Some(out) = command_stdout {
+            command_tasks.push(tokio::spawn(drain_to_log(
+                BufReader::new(out),
+                command_writer.clone(),
+            )));
+        }
+        if let Some(err) = command_stderr {
+            command_tasks.push(tokio::spawn(drain_to_log(
+                BufReader::new(err),
+                command_writer,
+            )));
+        }
+    }
+
     let mut child = match cloudflared::spawn(port, PathBuf::new()) {
         Ok(c) => c,
         Err(e) => {
             // Abort the just-spawned server task (if any); the entry is
-            // released by the guard on return.
+            // released by the guard on return. The command child (run only)
+            // must not outlive a tunnel that never came to be.
             if let Some(server) = server_handle.as_mut() {
                 server.abort();
             }
+            crate::proc::shutdown_child_command(command_pid, &mut command_monitor).await;
             return Err(e);
         }
     };
@@ -624,10 +828,12 @@ pub(crate) async fn run_foreground(
         )));
     }
 
-    // Keep the foreground alive until cloudflared exits, Ctrl-C is received, or
-    // (Unix) SIGTERM arrives. Racing child.wait() ensures that if cloudflared
-    // dies before the URL is found (or any time later) we tear down instead of
-    // hanging forever.
+    // Keep the foreground alive until cloudflared exits, the command child
+    // (run only) exits, Ctrl-C is received, or (Unix) SIGTERM arrives. Racing
+    // child.wait() ensures that if cloudflared dies before the URL is found
+    // (or any time later) we tear down instead of hanging forever; racing the
+    // command monitor ensures a dev server that dies takes its tunnel down
+    // with it instead of serving 502s.
     #[cfg(unix)]
     let exit_reason = tokio::select! {
         status = child.wait() => {
@@ -636,6 +842,10 @@ pub(crate) async fn run_foreground(
                 Err(e) => tracing::error!(%e, "waiting on cloudflared failed"),
             }
             ReaderExit::ChildExited
+        }
+        _ = &mut command_monitor => {
+            tracing::info!("command child exited, shutting down foreground tunnel");
+            ReaderExit::CommandExited
         }
         _ = sig_term.recv() => {
             tracing::info!("received SIGTERM, shutting down foreground tunnel");
@@ -655,6 +865,10 @@ pub(crate) async fn run_foreground(
             }
             ReaderExit::ChildExited
         }
+        _ = &mut command_monitor => {
+            tracing::info!("command child exited, shutting down foreground tunnel");
+            ReaderExit::CommandExited
+        }
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("received Ctrl-C, shutting down foreground tunnel");
             ReaderExit::Signal
@@ -667,6 +881,16 @@ pub(crate) async fn run_foreground(
     // via [`cloudflared::shutdown`].
     if matches!(exit_reason, ReaderExit::Signal) {
         cloudflared::shutdown(tunnel_pid, &mut child).await;
+    }
+
+    // The command child must never outlive this foreground tunnel on ANY exit
+    // (Ctrl-C, SIGTERM, cloudflared exiting, or its own exit — the shutdown
+    // skips itself when the monitor already observed that). A no-op for the
+    // non-run flows (pending placeholder).
+    crate::proc::shutdown_child_command(command_pid, &mut command_monitor).await;
+
+    for task in command_tasks {
+        task.abort();
     }
 
     for task in tasks {
@@ -692,6 +916,20 @@ pub(crate) async fn run_foreground(
         }
     }
 
+    // The command itself died: tear-down is done (above), so report it and
+    // fail. A foreground tunnel whose origin is gone serves only 502s — the
+    // "server never came up beats a 502-ing tunnel" rule — and the operator
+    // watching the terminal deserves the exit as a signal, not a silently
+    // idle process. (Ctrl-C/SIGTERM/cloudflared-exit flows return Ok, as
+    // they always have.)
+    if matches!(exit_reason, ReaderExit::CommandExited) {
+        let bin = command
+            .and_then(|c| c.first())
+            .map(|b| b.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        bail!("command '{bin}' exited — tunnel torn down");
+    }
+
     // The `_entry` guard removes our registry entry on return (every exit path).
     Ok(())
 }
@@ -699,7 +937,29 @@ pub(crate) async fn run_foreground(
 /// Why the foreground keep-alive loop ended — drives cloudflared teardown.
 enum ReaderExit {
     ChildExited,
+    /// The run flow's command child exited — the origin is gone.
+    CommandExited,
     Signal,
+}
+
+/// Read `lines` to EOF, printing each line to stdout AND appending it to the
+/// given log — the command-child counterpart of [`drain_and_announce`], minus
+/// the URL extraction (a run's own output never carries the tunnel URL).
+async fn drain_to_log<R>(reader: BufReader<R>, log_writer: Arc<tokio::sync::Mutex<tokio::fs::File>>)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    let mut lines = reader.lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        println!("{line}");
+        {
+            let mut f = log_writer.lock().await;
+            let _ = f.write_all(line.as_bytes()).await;
+            let _ = f.write_all(b"\n").await;
+            let _ = f.flush().await;
+        }
+    }
 }
 
 /// Read `lines` to EOF, mirror each line to stdout AND `tunnel.log`, and publish
@@ -754,7 +1014,7 @@ async fn drain_and_announce<R>(
 #[cfg(test)]
 mod tests {
     use super::{EntryGuard, is_sensitive_dir};
-    use crate::model::{Registry, Service, ServiceKind};
+    use crate::model::{Registry, Service, ServiceKind, StaticFlags};
     use crate::state::StateDir;
     #[cfg(unix)]
     use std::path::Path;
@@ -817,6 +1077,8 @@ mod tests {
                 public_url: None,
                 worker_pid: 0,
                 tunnel_pid: None,
+                command_pid: None,
+                static_flags: StaticFlags::default(),
                 created_at: crate::model::now_utc(),
                 state_dir: PathBuf::from("/tmp"),
                 foreground: true,
