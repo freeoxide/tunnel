@@ -81,7 +81,8 @@ const MAX_REQUEST_BODY: usize = 64 * 1024;
 pub(crate) const DEFAULT_KEEP: u16 = 200;
 
 /// Maximum `--keep` the CLI accepts (1..=1000); the store-read ceiling is
-/// computed at this max so it never depends on the loading keep.
+/// computed at this max so it never depends on the loading keep, and
+/// [`HookLog::load`] clamps any larger argv-borne keep to it.
 const MAX_KEEP: usize = 1000;
 
 /// Name of the per-service request store inside the service's state dir — a
@@ -280,6 +281,9 @@ impl HookLog {
     /// read ceiling is keep-independent, so lowering `--keep` loads the
     /// fatter old store and truncates it — never wipes it.
     pub fn load(path: PathBuf, keep: usize) -> std::io::Result<Self> {
+        // keep is argv-borne and unvalidated on the hidden run-worker path:
+        // clamp so over-max retention can't write past the reload ceiling.
+        let keep = keep.min(MAX_KEEP);
         let ceiling = absolute_read_bound();
         // Past the ceiling by METADATA: not a store this server wrote at any
         // supported keep; rejected without reading a tampered giant at all.
@@ -807,6 +811,32 @@ mod tests {
         assert_eq!(snap.len(), 1, "load-and-truncate, not wipe");
         assert_eq!(snap[0].seq, 5, "the NEWEST record survives the truncation");
         assert_eq!(snap[0].body.len(), MAX_REQUEST_BODY);
+    }
+
+    #[test]
+    fn load_clamps_an_over_max_keep_to_the_supported_ceiling() {
+        // The hidden run-worker --keep carries no CLI range (only `ft hook`
+        // validates 1..=1000); an over-max keep would truncate nothing and
+        // could write a store past the absolute ceiling — which its own
+        // reload then refuses. load() clamps keep to MAX_KEEP first.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("requests.json");
+        let over_max = MAX_KEEP + 200;
+        let mut log = HookLog::load(path.clone(), over_max).expect("load");
+        assert_eq!(
+            log.keep, MAX_KEEP,
+            "the keep must clamp to the supported max"
+        );
+        for seq in 1..=3u64 {
+            let head = parts("POST", &format!("/{seq}"), &[]);
+            log.record(RecordedRequest::capture(seq, &head, b"x"))
+                .expect("record");
+        }
+        // The store written under the clamped keep reloads cleanly under the
+        // same over-max arg (it can never outgrow the ceiling).
+        let reloaded = HookLog::load(path, over_max).expect("reload");
+        assert_eq!(reloaded.keep, MAX_KEEP, "the clamp holds across reloads");
+        assert_eq!(reloaded.snapshot().len(), 3, "records survive the reload");
     }
 
     #[test]
