@@ -29,7 +29,11 @@
 //! each recorded body is capped at [`MAX_REQUEST_BODY`] bytes. The store
 //! therefore cannot grow without bound: at most `keep` records of at most
 //! ~`MAX_REQUEST_BODY` + per-record overhead each (200 × 64 KiB ≈ 12.5 MiB by
-//! default; the CLI accepts up to 1000, ≈ 64 MiB worst case).
+//! default; the CLI accepts up to 1000, ≈ 64 MiB worst case). The bound is
+//! enforced on RELOAD too: [`HookLog::load`] reads at most
+//! `keep × (MAX_REQUEST_BODY + per-record overhead)` bytes, so even a file
+//! tampered past what this server can write (a log redirected over the
+//! store) is treated as corruption rather than slurped into memory.
 //!
 //! # What is deliberately NOT recorded
 //!
@@ -44,7 +48,7 @@
 
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -197,6 +201,36 @@ pub struct HookLog {
     requests: Vec<RecordedRequest>,
 }
 
+/// Per-record allowance for everything except the capped body: the request
+/// line (path, query), the allowlisted headers, method/timestamp/flags, and
+/// the JSON syntax around them. Generous by design — a legitimate record
+/// uses a fraction of it — so only a store this server could not have
+/// written can ever cross the total bound below.
+const STORE_RECORD_OVERHEAD: usize = 96 * 1024;
+
+/// Upper bound on a store this server could have written: `keep` records of
+/// at most [`MAX_REQUEST_BODY`] body bytes plus the per-record allowance
+/// above. Saturating in both steps so an absurd `keep` cannot overflow; u64
+/// so [`read_store_blob`]'s `File::take` can use it directly.
+fn store_read_bound(keep: usize) -> u64 {
+    (keep as u64).saturating_mul(MAX_REQUEST_BODY as u64 + STORE_RECORD_OVERHEAD as u64)
+}
+
+/// Read the persisted store with the hard size bound above, mirroring
+/// `registry::read_registry_blob`: at most `bound + 1` bytes are ever read
+/// (the +1 lets the caller tell "at the bound" from "past it" by length
+/// alone). Bounding the READ — not just failing the parse afterwards — is
+/// the point: without it, a stray huge file (e.g. a log redirected over the
+/// store) would be slurped whole into memory before the parser rejected it.
+fn read_store_blob(path: &Path, keep: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(store_read_bound(keep).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 impl HookLog {
     /// Load the store at `path`, or start empty when it does not exist yet.
     ///
@@ -217,7 +251,23 @@ impl HookLog {
     /// A loaded store is re-sorted by seq and re-truncated to `keep`, so a
     /// hand-edited file cannot grow retention behind the operator's back.
     pub fn load(path: PathBuf, keep: usize) -> std::io::Result<Self> {
-        let mut requests = match std::fs::read(&path) {
+        // The read itself is size-bounded (see [`read_store_blob`]): without
+        // the bound, a stray multi-gigabyte file at the store's path would be
+        // slurped whole into memory at startup before the parser rejected it.
+        let bound = store_read_bound(keep);
+        let mut requests = match read_store_blob(&path, keep) {
+            // Oversized = not a store this server wrote (every record it
+            // writes is body-capped, so `keep` legit records can never reach
+            // the bound): route it through the SAME corrupt-store recovery as
+            // a parse failure, NOT the read-error arm below, which exists to
+            // protect a store that may be intact behind an I/O error.
+            Ok(bytes) if bytes.len() as u64 > bound => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "hook request store is larger than the keep x record bound; starting a new one"
+                );
+                Vec::new()
+            }
             Ok(bytes) if !bytes.iter().all(u8::is_ascii_whitespace) => {
                 match serde_json::from_slice::<Vec<RecordedRequest>>(&bytes) {
                     Ok(parsed) => parsed,
@@ -272,10 +322,16 @@ impl HookLog {
 
     /// Allocate the sequence number for the next record (the field and the
     /// method share a name on purpose: the method is the only writer of the
-    /// counter, so callers can never observe a seq twice).
+    /// counter). The increment saturates like load does: a raw `+ 1` at a
+    /// hand-edited u64::MAX counter would panic in debug and wrap to 0 in
+    /// release, stamping the next record as the OLDEST and corrupting the
+    /// newest-first order this counter exists to define. At the saturation
+    /// point duplicate seqs become unavoidable; ordering stays well-defined
+    /// because insertion order (newest-first in memory) survives reloads via
+    /// the stable seq sort.
     fn next_seq(&mut self) -> u64 {
         let seq = self.next_seq;
-        self.next_seq += 1;
+        self.next_seq = self.next_seq.saturating_add(1);
         seq
     }
 
@@ -641,11 +697,7 @@ mod tests {
         // saturate the counter there, because the old `r.seq + 1` panicked
         // in debug builds (the overflow check acting as a debug_assert) and
         // silently wrapped to 0 in release — stamping the next record as
-        // the OLDEST and corrupting newest-first ordering. The saturated
-        // value is what the test observes (release-mode semantics); the
-        // append is explicitly seq-stamped at u64::MAX because
-        // `next_seq()`'s own increment would still overflow in debug at
-        // MAX, and that method is outside this fix's scope.
+        // the OLDEST and corrupting newest-first ordering.
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("requests.json");
         {
@@ -661,15 +713,52 @@ mod tests {
             u64::MAX,
             "the reloaded counter must saturate at u64::MAX, not wrap to 0"
         );
-        // Append through the store's own record path and confirm it
-        // persists and round-trips without a panic.
+        // Append through the store's own counter — the increment that used
+        // to overflow at MAX — and confirm it saturates, persists, and
+        // round-trips without a panic.
+        let seq = log.next_seq();
+        assert_eq!(
+            seq,
+            u64::MAX,
+            "next_seq saturates at u64::MAX instead of overflowing"
+        );
         let head = parts("POST", "/after", &[]);
-        log.record(RecordedRequest::capture(u64::MAX, &head, b"after"))
+        log.record(RecordedRequest::capture(seq, &head, b"after"))
             .expect("record at MAX seq");
         assert_eq!(log.len(), 2);
         let reloaded = HookLog::load(path, 5).expect("reload after the append");
         let paths: Vec<String> = reloaded.snapshot().into_iter().map(|r| r.path).collect();
         assert_eq!(paths, vec!["/after", "/seed"]);
+    }
+
+    #[test]
+    fn load_treats_an_oversized_store_as_corruption() {
+        // A store larger than keep x (body cap + per-record allowance) is
+        // not one this server wrote (every record it persists is capped), so
+        // it takes the corrupt-store recovery — warn and start empty — and
+        // the LOAD reads only bound+1 bytes of it, never slurping the whole
+        // file (the registry's stray-huge-file scenario: a log redirected
+        // over the store path). It must not take the read-error arm either,
+        // which exists to protect a store that may be intact behind an I/O
+        // error — this one provably is not intact.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("requests.json");
+        // Valid JSON the OLD unbounded code loaded: one record whose body
+        // alone exceeds the body cap. With keep = 1 the bound is one record
+        // of cap + overhead, so this file crosses it.
+        let fat_body = "x".repeat(MAX_REQUEST_BODY + STORE_RECORD_OVERHEAD);
+        let json = format!(
+            "[{{\"seq\":1,\"received_at\":\"2024-01-01T00:00:00Z\",\"method\":\"POST\",\
+             \"path\":\"/x\",\"query\":null,\"headers\":[],\"body\":\"{fat_body}\",\
+             \"body_len\":0,\"truncated\":false}}]"
+        );
+        assert!(
+            json.len() as u64 > store_read_bound(1),
+            "the seeded store must be over the keep=1 bound"
+        );
+        std::fs::write(&path, json).expect("seed oversized store");
+        let log = HookLog::load(path, 1).expect("an oversized store still loads (as empty)");
+        assert_eq!(log.len(), 0, "oversized store must load as empty");
     }
 
     #[test]
