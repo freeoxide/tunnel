@@ -20,7 +20,7 @@
 //! `last_reason`/`last_line` and the poll loop). Keep in sync with
 //! `cmd/start.rs::run_foreground_inner` if its teardown order changes.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -448,7 +448,7 @@ async fn run_foreground(port: u16, name: Option<String>, keep: u16) -> Result<()
         }
     });
 
-    let mut child = match cloudflared::spawn(port, PathBuf::new()) {
+    let mut child = match cloudflared::spawn(port) {
         Ok(c) => c,
         Err(e) => {
             // Abort the just-spawned server task; the entry is released by

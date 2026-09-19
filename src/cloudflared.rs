@@ -86,9 +86,8 @@ pub fn is_tunnel_url(url: &str) -> bool {
 ///
 /// The child's `stdout` and `stderr` are piped; the caller is responsible
 /// for reading them line by line, applying [`extract_url`], and teeing the
-/// output to `tunnel.log`. `tunnel_log` is accepted for API symmetry but is
-/// not opened here so this function stays focused on spawning.
-pub fn spawn(port: u16, _tunnel_log: PathBuf) -> Result<Child> {
+/// output to `tunnel.log`.
+pub fn spawn(port: u16) -> Result<Child> {
     let cloudflared = ensure_installed()?;
 
     let mut cmd = Command::new(cloudflared);

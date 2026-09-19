@@ -495,7 +495,7 @@ async fn run_foreground(
     // cloudflared's first log line).
     output::print_drop_token(&token, &format!("http://127.0.0.1:{port}"));
 
-    let mut child = match cloudflared::spawn(port, PathBuf::new()) {
+    let mut child = match cloudflared::spawn(port) {
         Ok(c) => c,
         Err(e) => {
             // Abort the just-spawned server task; the entry is released by

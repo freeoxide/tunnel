@@ -784,7 +784,7 @@ async fn run_foreground_inner(
         }
     }
 
-    let mut child = match cloudflared::spawn(port, PathBuf::new()) {
+    let mut child = match cloudflared::spawn(port) {
         Ok(c) => c,
         Err(e) => {
             // Abort the just-spawned server task (if any); the entry is

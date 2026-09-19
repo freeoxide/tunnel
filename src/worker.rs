@@ -450,7 +450,7 @@ pub async fn run(
         }
     }
 
-    let mut child = match cloudflared::spawn(port, tunnel_log.clone()) {
+    let mut child = match cloudflared::spawn(port) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(%e, "failed to spawn cloudflared");
