@@ -316,9 +316,20 @@ mod tests {
     use super::{Cli, Command};
     use clap::Parser as _;
 
+    /// clap reads the one process env; this serializes the FT_TOKEN removal
+    /// in `parse` with every parse, so parallel test threads cannot race it.
+    static FT_TOKEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Parse `ft <args>` (the binary name is prepended for clap's usage
-    /// strings, exactly like a real invocation).
+    /// strings, exactly like a real invocation). FT_TOKEN is cleared first:
+    /// an ambient exported value would fill the env-backed `--token` fields
+    /// and flip the token-absence asserts (the env channel itself is pinned
+    /// hermetically by the integration tests' subprocess runs).
     fn parse(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
+        let _guard = FT_TOKEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the test binary's only env mutation, and every clap parse
+        // the tests execute runs under this same lock.
+        unsafe { std::env::remove_var("FT_TOKEN") };
         Cli::try_parse_from(std::iter::once("ft").chain(args.iter().copied()))
     }
 
