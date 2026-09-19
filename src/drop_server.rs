@@ -272,7 +272,8 @@ pub(crate) struct DropStore {
 impl DropStore {
     /// Open (not create) `root` as an upload bucket: canonicalise it (the
     /// confinement base must be the REAL path), then measure existing content
-    /// so it counts against the caps from the first upload.
+    /// so it counts against the caps from the first upload. Startup-path sync
+    /// I/O, like the hook store's load — must not migrate to a request path.
     pub(crate) fn open(
         root: &Path,
         token: String,
@@ -602,8 +603,9 @@ fn store_write(store: &DropStore, name: &str, bytes: &[u8]) -> Result<(), StoreE
     let tmp = store.temp_path(name);
     // Unlink any stale temp BEFORE the truncate-open: a crash between the
     // hard_link below and its unlink leaves `tmp` hard-linked to the PUBLISHED
-    // file, and truncating through that link would silently overwrite it.
-    // A real unlink failure fails the upload loudly instead.
+    // file, and truncating through that link would silently overwrite it. This
+    // unlink cannot race a live writer (uploads serialize on this store's
+    // lock; temps are token-scoped); a real failure fails the upload loudly.
     if let Err(e) = std::fs::remove_file(&tmp)
         && e.kind() != std::io::ErrorKind::NotFound
     {

@@ -145,7 +145,8 @@ async fn run_background(
     // `created_at` put the entry inside `model::START_GRACE`, so a concurrent
     // `ft kill`/`ft prune` refuses to reap it during the reserve→spawn→record
     // window below (do NOT add pid-0 staleness handling of our own —
-    // `Service::start_in_progress` owns it).
+    // `Service::start_in_progress` owns it). Every exit below removes the
+    // entry by id, bypassing the grace guard — the window resolves quickly.
     let (id, name, service_dir) = reserve_entry(&state, &dir, port, name, 0, false)?;
 
     // Written BEFORE the worker is spawned (it reads the token at startup and
