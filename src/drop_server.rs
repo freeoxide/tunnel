@@ -146,6 +146,10 @@ const MAX_NAME_BYTES: usize = 255 - TEMP_NAME_OVERHEAD;
 /// shown by `ft detail`. 0600 via [`crate::fsutil`], like the logs.
 pub(crate) const TOKEN_FILENAME: &str = "drop-token";
 
+/// Hard bound on a token-file read: minted tokens are 65 bytes; anything this
+/// large is not a token (see [`read_token`]).
+const TOKEN_READ_BOUND: u64 = 4096;
+
 /// Generate a fresh access token from the OS CSPRNG: 32 random bytes rendered
 /// as 64 lowercase hex chars. There is deliberately NO weak fallback (time-
 /// or pid-mixed values): the token is the only thing standing between the
@@ -250,15 +254,32 @@ pub(crate) fn store_token(dir: &Path, token: &str) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
-/// Read the token back. `Ok(None)` = no token file (never started with one);
-/// `Err` = a real read error, which callers must not swallow as "no token"
-/// (the file may be intact behind a permissions problem).
+/// Read the token back, bounded at [`TOKEN_READ_BOUND`] so a stray huge file
+/// at the token path cannot be slurped into memory. `Ok(None)` = no token
+/// file; `Err` = a real read error (or an over-bound/undecodable file),
+/// which callers must not swallow as "no token".
 pub(crate) fn read_token(dir: &Path) -> std::io::Result<Option<String>> {
-    match std::fs::read_to_string(dir.join(TOKEN_FILENAME)) {
-        Ok(s) => Ok(Some(s.trim().to_string())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+    use std::io::Read as _;
+    let file = match std::fs::File::open(dir.join(TOKEN_FILENAME)) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut bytes = Vec::new();
+    file.take(TOKEN_READ_BOUND + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > TOKEN_READ_BOUND {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the drop token file is implausibly large",
+        ));
     }
+    let text = String::from_utf8(bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the drop token file is not valid UTF-8",
+        )
+    })?;
+    Ok(Some(text.trim().to_string()))
 }
 
 /// Validate an upload name. Returns the unchanged name on success — the
@@ -989,6 +1010,19 @@ mod tests {
             read_token(tmp.path()).expect("read"),
             None,
             "no token file is None, not Err"
+        );
+    }
+
+    #[test]
+    fn read_token_is_bounded_against_a_stray_huge_file() {
+        // A stray huge file at the token path is an Err, not a slurp — the
+        // same read-bound discipline as the registry/hook stores.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let huge = "x".repeat(TOKEN_READ_BOUND as usize + 1);
+        std::fs::write(tmp.path().join(TOKEN_FILENAME), &huge).expect("plant huge token");
+        assert!(
+            read_token(tmp.path()).is_err(),
+            "an over-bound token file must Err, not read"
         );
     }
 
