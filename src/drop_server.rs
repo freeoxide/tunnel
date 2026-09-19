@@ -614,7 +614,10 @@ fn store_write(store: &DropStore, name: &str, bytes: &[u8]) -> Result<(), StoreE
         opts.write(true).create(true).truncate(true);
         crate::fsutil::apply_private_mode(&mut opts);
         let mut file = opts.open(&tmp)?;
-        file.write_all(bytes)
+        file.write_all(bytes)?;
+        // Durable bytes BEFORE the publish: a crash must never leave an
+        // announced file whose contents never reached disk.
+        file.sync_all()
     };
     if let Err(e) = write() {
         let _ = std::fs::remove_file(&tmp);
@@ -635,7 +638,7 @@ fn store_write(store: &DropStore, name: &str, bytes: &[u8]) -> Result<(), StoreE
             StoreError::Io(e)
         });
     }
-    match std::fs::remove_file(&tmp) {
+    let res = match std::fs::remove_file(&tmp) {
         Ok(()) => {
             used.bytes += bytes.len() as u64;
             used.files += 1;
@@ -649,7 +652,16 @@ fn store_write(store: &DropStore, name: &str, bytes: &[u8]) -> Result<(), StoreE
             tracing::warn!(%e, tmp = %tmp.display(), "stored the upload but could not remove the temp file");
             Ok(())
         }
+    };
+    // Best-effort durability of the publish's directory entry (Unix only),
+    // before the 201 announces the file.
+    #[cfg(unix)]
+    {
+        if let Ok(dir) = std::fs::File::open(&store.root) {
+            let _ = dir.sync_all();
+        }
     }
+    res
 }
 
 /// `GET /` (and HEAD): the HTML listing of the bucket via the shared page
