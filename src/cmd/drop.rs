@@ -44,7 +44,7 @@ use super::{POLL_INTERVAL, POLL_TIMEOUT};
 use crate::cloudflared;
 use crate::cmd::start::{
     EntryGuard, SERVER_SHUTDOWN_TIMEOUT, drain_and_announce, fail_start, fail_timeout,
-    is_sensitive_dir, resolve_dir,
+    is_sensitive_dir, remove_reservation, resolve_dir,
 };
 use crate::drop_server::{self, DropStore};
 use crate::error::Result;
@@ -166,11 +166,7 @@ async fn run_background(
         Ok(pid) => pid,
         Err(e) => {
             // Release the reserved entry on spawn failure.
-            if let Err(cleanup_err) = Registry::update(&state, |reg| {
-                reg.remove(id);
-            }) {
-                tracing::warn!(%cleanup_err, id, "failed to clean up registry entry after spawn failure");
-            }
+            remove_reservation(&state, id);
             return Err(e);
         }
     };
