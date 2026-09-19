@@ -213,8 +213,6 @@ pub(crate) async fn shutdown_child_command(
     }
     #[cfg(unix)]
     {
-        use nix::sys::signal::{Signal, kill};
-        use nix::unistd::Pid;
         // Negative pid = whole process group. Safe to include the direct
         // child and every descendant: the group was created for this command
         // subtree alone at spawn time (own_process_group) and is guarded
@@ -725,14 +723,6 @@ fn memmem(haystack: &[u8], needle: &[u8]) -> bool {
         return true;
     }
     haystack.windows(needle.len()).any(|w| w == needle)
-}
-
-/// Generic-Unix fallback with no portable cmdline reader (e.g. FreeBSD). Unused
-/// on Linux/macOS/Windows; kept so the module links on those targets.
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-#[allow(dead_code)]
-fn cmdline_contains(_pid: u32, _needle: &str) -> bool {
-    false
 }
 
 #[cfg(all(test, unix))]

@@ -143,12 +143,15 @@ pub fn spawn_worker_with_command(
     spawn_worker_full(id, name, dir, port, command, None, None)
 }
 
-/// The single spawn path behind every entry point: each public wrapper pins
-/// the optional values its flow does not use (`command` empty / `keep` and
-/// `max_size` None), so historical argv shapes stay byte-identical while the
-/// hook flow adds only `--keep` and the drop flow only `--max-size`.
-#[cfg(unix)]
-fn spawn_worker_full(
+/// The platform-neutral setup behind every spawn: open the worker log twice
+/// (stdout and stderr each get an owned handle that the child can dup; append
+/// and create so restarts are additive — mode 0600 on Unix, since the worker
+/// log can contain request/paths detail), resolve the current executable, and
+/// wire the `run-worker` argv, the `FT_WORKER_TOKEN` handshake env, and the
+/// stdio. The platform-specific detachment — `setsid` pre_exec on Unix,
+/// creation flags on Windows — is layered on by the two `spawn_worker_full`
+/// variants, which share this builder so their setup cannot drift apart.
+fn worker_command(
     id: u64,
     name: &str,
     dir: Option<&Path>,
@@ -156,8 +159,7 @@ fn spawn_worker_full(
     command: &[OsString],
     keep: Option<u16>,
     max_size: Option<u64>,
-) -> Result<u32> {
-    use std::os::unix::process::CommandExt;
+) -> Result<std::process::Command> {
     use std::process::{Command, Stdio};
 
     use anyhow::Context;
@@ -165,9 +167,6 @@ fn spawn_worker_full(
     let state = StateDir::new()?;
     let worker_log = state.worker_log(name);
 
-    // Open the log file twice so stdout and stderr each get an owned handle
-    // that the child can dup. Append (and create) so restarts are additive.
-    // Mode 0600: the worker log can contain request/paths detail.
     let stdout_file = crate::fsutil::open_private_append(&worker_log)
         .with_context(|| format!("opening worker log {}", worker_log.display()))?;
     let stderr_file = crate::fsutil::open_private_append(&worker_log)
@@ -185,6 +184,28 @@ fn spawn_worker_full(
     .stdin(Stdio::null())
     .stdout(Stdio::from(stdout_file))
     .stderr(Stdio::from(stderr_file));
+    Ok(cmd)
+}
+
+/// The single spawn path behind every entry point: each public wrapper pins
+/// the optional values its flow does not use (`command` empty / `keep` and
+/// `max_size` None), so historical argv shapes stay byte-identical while the
+/// hook flow adds only `--keep` and the drop flow only `--max-size`.
+#[cfg(unix)]
+fn spawn_worker_full(
+    id: u64,
+    name: &str,
+    dir: Option<&Path>,
+    port: u16,
+    command: &[OsString],
+    keep: Option<u16>,
+    max_size: Option<u64>,
+) -> Result<u32> {
+    use std::os::unix::process::CommandExt;
+
+    use anyhow::Context;
+
+    let mut cmd = worker_command(id, name, dir, port, command, keep, max_size)?;
 
     // New session via setsid(): the child becomes a session leader AND the
     // leader of a fresh process group whose id equals its pid — so a later
@@ -236,7 +257,6 @@ fn spawn_worker_full(
     max_size: Option<u64>,
 ) -> Result<u32> {
     use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
 
     use anyhow::Context;
 
@@ -246,26 +266,8 @@ fn spawn_worker_full(
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const DETACHED_PROCESS: u32 = 0x0000_0004;
 
-    let state = StateDir::new()?;
-    let worker_log = state.worker_log(name);
-    let stdout_file = crate::fsutil::open_private_append(&worker_log)
-        .with_context(|| format!("opening worker log {}", worker_log.display()))?;
-    let stderr_file = crate::fsutil::open_private_append(&worker_log)
-        .with_context(|| format!("opening worker log {}", worker_log.display()))?;
-
-    let exe =
-        std::env::current_exe().context("locating the current executable to spawn the worker")?;
-
-    let token = worker_token();
-    let mut cmd = Command::new(exe);
-    cmd.args(run_worker_args(
-        id, name, dir, port, command, keep, max_size,
-    ))
-    .env("FT_WORKER_TOKEN", &token)
-    .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS)
-    .stdin(Stdio::null())
-    .stdout(Stdio::from(stdout_file))
-    .stderr(Stdio::from(stderr_file));
+    let mut cmd = worker_command(id, name, dir, port, command, keep, max_size)?;
+    cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
 
     let pid = cmd
         .spawn()
