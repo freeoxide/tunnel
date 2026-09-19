@@ -223,9 +223,8 @@ fn apply<'a>(reg: &mut Registry, candidates: &'a [Judgment]) -> Vec<(Service, &'
 /// and — only if that failed — again after [`REPROBE_DELAY`]. A single
 /// refused connect is not proof the origin is gone: a restarting dev server
 /// drops the port briefly and comes back healthy; two probes ~750 ms apart
-/// ride that window out. Reuses doctor's `origin_alive` (kept in sync with
-/// proxy.rs's pre-flight); the blocking connect is fine here — it runs
-/// before the registry lock, with no other concurrent I/O.
+/// ride that window out. The blocking connect is fine here — it runs before
+/// the registry lock, with no other concurrent I/O.
 async fn origin_dead_after_double_probe(port: u16) -> bool {
     if origin_alive(port) {
         return false;
