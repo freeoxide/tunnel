@@ -97,7 +97,7 @@ pub(crate) fn spawn_command_child(
 
     let child = cmd
         .spawn()
-        .with_context(|| format!("failed to spawn command {:?}", bin))?;
+        .with_context(|| format!("failed to spawn command {bin:?}"))?;
     Ok(child)
 }
 

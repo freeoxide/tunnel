@@ -322,13 +322,11 @@ fn render_listing(candidate: &Path, root: &Path) -> Option<String> {
 pub(crate) fn html_page(escaped_title: &str, escaped_body: &str) -> String {
     format!(
         "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n\
-         <title>{title}</title>\n\
+         <title>{escaped_title}</title>\n\
          <style>body{{font-family:system-ui,sans-serif;max-width:42em;margin:2em auto;padding:0 1em}}\
          h1{{font-size:1.3em}}li{{list-style:none;padding:.15em 0}}\
          .dir{{font-weight:600}}</style>\n</head>\n<body>\n\
-         <h1>{title}</h1>\n<hr>\n{body}</body>\n</html>\n",
-        title = escaped_title,
-        body = escaped_body,
+         <h1>{escaped_title}</h1>\n<hr>\n{escaped_body}</body>\n</html>\n"
     )
 }
 
