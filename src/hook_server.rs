@@ -1,55 +1,45 @@
 //! Webhook receiver/inspector origin.
 //!
-//! Serves an ft-owned HTTP origin on the loopback interface that RECORDS every
-//! request arriving through the cloudflared tunnel — method, path, query, a
-//! selected set of headers, and the (size-capped) body — into a private JSON
-//! store on disk, and answers each one with a plain `200 OK`. It is an origin
-//! like the static server, never middleware in a proxied traffic path: the
-//! public surface is still cloudflared only, and this server is bound to
-//! `127.0.0.1` behind it.
+//! Serves an ft-owned loopback HTTP origin that RECORDS every request
+//! arriving through the tunnel — method, path, query, selected headers, and
+//! the size-capped body — into a private JSON store on disk, answering each
+//! with `200 OK`. Like the static server it is an origin, never middleware
+//! in a proxied path: bound to `127.0.0.1` behind cloudflared only.
 //!
 //! # Inspection surfaces
 //!
 //! - `GET /__inspect` — generated HTML view of the recorded requests,
-//!   newest-first, rendered with the same page scaffold as the static
-//!   directory listing (see [`crate::static_server::html_page`]).
+//!   newest-first, on the shared page scaffold.
 //! - `GET /__inspect.json` — the same records as a JSON array (newest-first)
-//!   for scripts: `curl <tunnel>/__inspect.json | jq '.[0].path'`.
+//!   for scripts.
 //!
-//! The inspection endpoints are deliberately NOT recorded themselves — every
-//! refresh would otherwise churn the log it displays — and non-GET methods on
-//! them are answered 405 unrecorded. Every OTHER method/path combination is
-//! recorded and acknowledged, so a webhook sender sees a 2xx regardless of
-//! what path it posts to.
+//! The inspection endpoints are deliberately NOT recorded (every refresh
+//! would churn the log it displays); non-GET methods on them 405 unrecorded.
+//! Every OTHER method/path combination is recorded and acknowledged, so a
+//! webhook sender sees a 2xx whatever path it posts to.
 //!
 //! # Retention (bounded disk)
 //!
 //! The store keeps only the NEWEST `keep` requests (default
-//! [`DEFAULT_KEEP`], overridable per service via `ft hook --keep <n>`), and
-//! each recorded body is capped at [`MAX_REQUEST_BODY`] bytes. The store
-//! therefore cannot grow without bound: at most `keep` records, each at
-//! most ~1.2 MiB of SERIALIZED JSON — the 64 KiB body can expand to 6x its
-//! byte count (serde_json escapes control bytes as `\u00XX`, and a binary
-//! body of NULs is the honest worst case), and the whole request head
-//! (path, query, headers — none of it truncated on capture) takes up to
-//! hyper's ~408 KiB wire budget and doubles under the same escaping at its
-//! quote/backslash-heavy worst. That is 200 × ~1.2 MiB ≈ 235 MiB by
-//! default and ≈ 1.2 GiB at the CLI's keep=1000 ceiling. The bound is
-//! enforced on RELOAD too: [`HookLog::load`] reads at most that many
-//! bytes, so even a file tampered past what this server can write (a log
-//! redirected over the store) is treated as corruption rather than
-//! slurped into memory.
+//! [`DEFAULT_KEEP`], overridable via `ft hook --keep <n>`), each body capped
+//! at [`MAX_REQUEST_BODY`] bytes. Worst case per record: ~1.2 MiB serialized
+//! — the 64 KiB body can expand to 6x (serde_json escapes control bytes as
+//! `\u00XX`; a NUL body is the honest worst case) and the whole captured
+//! head (path, query, headers — never truncated on capture) takes up to
+//! hyper's ~408 KiB wire budget, doubling under escaping at its
+//! quote/backslash-heavy worst. That is 200 × ~1.2 MiB ≈ 235 MiB by default,
+//! ≈ 1.2 GiB at keep=1000. The bound is enforced on RELOAD too:
+//! [`HookLog::load`] reads at most that many bytes, so a file tampered past
+//! what this server can write is treated as corruption, not slurped.
 //!
 //! # What is deliberately NOT recorded
 //!
-//! Header capture is an ALLOWLIST (see [`RECORDED_HEADERS`]) so that
+//! Header capture is an ALLOWLIST ([`RECORDED_HEADERS`]) so
 //! credential-bearing headers — `Authorization`, `Cookie`, webhook
-//! `*-signature`/`*-secret`/`*-token` headers — can never be copied into the
-//! on-disk store or the inspection view, which anyone holding the tunnel URL
-//! can read. Bodies are recorded (that is the point of an inspector: seeing
-//! what the sender actually sent), which is also why `ft hook` exists: the
-//! payload is already public to anyone with the tunnel URL, and the operator
-//! opted into inspecting it.
+//! `*-signature`/`*-secret`/`*-token` — can never reach the on-disk store or
+//! the inspection view, which anyone holding the tunnel URL can read. Bodies
+//! ARE recorded (that is the point of an inspector, and the payload is
+//! already public to anyone with the tunnel URL).
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -73,31 +63,24 @@ use tower_http::timeout::TimeoutLayer;
 use crate::static_server::{escape_html, html_page};
 
 /// Hard upper bound on any single request, mirroring the static server's
-/// layering: cloudflared publishes this loopback server to the public
-/// internet, so the timeout bounds slow/stalled clients (and the graceful
-/// drain on shutdown), and the body-limit layer stops an abusive client from
-/// streaming unbounded bytes before the handler runs.
+/// layering: the timeout bounds slow/stalled clients (and the graceful
+/// drain), the body-limit layer stops unbounded streaming before the handler.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Hard cap on a recorded request body. Generous enough for realistic webhook
-/// JSON payloads, small enough that `keep` records can never amount to much
-/// disk (see the module docs). The [`RequestBodyLimitLayer`] enforces this
-/// before the handler (rejecting oversized requests with 413); the capture
-/// path truncates at the same value as defense in depth.
+/// Hard cap on a recorded request body. Generous for realistic webhook
+/// payloads, small enough that `keep` records cannot amount to much disk
+/// (see the module docs). The limit layer enforces this before the handler
+/// (413); the capture path truncates at the same value as defense in depth.
 const MAX_REQUEST_BODY: usize = 64 * 1024;
 
 /// Default retention: how many recorded requests a hook store keeps
-/// (newest-first). Documented bound so the disk cannot fill: 200 records ×
-/// ≤~1.2 MiB serialized each (the 64 KiB body's worst-case escaping plus
-/// the whole hyper-capped, escape-expanded request head) ≈ 235 MiB per
-/// service, worst case. `ft hook --keep <n>` overrides it (1..=1000). u16
-/// because that is what the worker argv carries; convert with
-/// `usize::from` at the storage boundary.
+/// (newest-first). Worst case ≈ 235 MiB per service (see the module docs).
+/// `ft hook --keep <n>` overrides it (1..=1000). u16 because that is what
+/// the worker argv carries; convert with `usize::from` at the boundary.
 pub(crate) const DEFAULT_KEEP: u16 = 200;
 
-/// Name of the per-service request store inside the service's state dir. A
-/// service-dir sibling of `worker.log`/`tunnel.log` (never a new log file —
-/// `ft logs` stays coherent and reads only those two).
+/// Name of the per-service request store inside the service's state dir — a
+/// sibling of `worker.log`/`tunnel.log` so `ft logs` stays coherent.
 pub(crate) const REQUESTS_FILENAME: &str = "requests.json";
 
 /// The HTML inspection view path.
@@ -107,12 +90,9 @@ const INSPECT_PATH: &str = "/__inspect";
 /// as one resource with two representations).
 const JSON_PATH: &str = "/__inspect.json";
 
-/// Headers copied into a record. An allowlist, not a denylist: the store and
-/// the inspection view are readable by anyone holding the public tunnel URL,
-/// so the safe default is to copy only headers known to be useful for
-/// debugging a webhook delivery and to structurally exclude everything else —
-/// a future credential-bearing header (`X-Signature`, `X-Secret`, …) cannot
-/// leak by being forgotten on a denylist.
+/// Headers copied into a record. An allowlist, not a denylist: only headers
+/// known useful for debugging a webhook delivery are copied, so a future
+/// credential-bearing header cannot leak by being forgotten on a denylist.
 const RECORDED_HEADERS: &[&str] = &[
     "accept",
     "content-length",
@@ -209,47 +189,38 @@ pub struct HookLog {
 }
 
 /// Worst-case JSON expansion serde_json applies to a single recorded body
-/// byte: control bytes 0x00-0x1F serialize as the 6-byte `\u00XX` escape
-/// (the five short-escaped controls — `\b` `\f` `\n` `\r` `\t` — and the
-/// `"`/`\` pairs expand only 1→2, so 6 is the strict ceiling). A body of
-/// NULs is fully legitimate on this origin (NUL is valid UTF-8, so a
-/// binary webhook payload decodes losslessly to NUL characters), so the
-/// read bound MUST budget the expansion: an escape-unaware bound
-/// misclassifies such a store as oversized on reload and wipes it —
+/// byte: control bytes 0x00-0x1F serialize as the 6-byte `\u00XX` escape;
+/// the short-escaped controls and `"`/`\` pairs expand only 1→2, so 6 is
+/// the strict ceiling. NUL bodies are legitimate here (valid UTF-8), so the
+/// read bound MUST budget the expansion — an escape-unaware bound
+/// misclassifies such a store as oversized on reload and wipes it:
 /// remotely triggerable record loss on the deliberately token-less origin.
 const JSON_ESCAPE_FACTOR: usize = 6;
 
 /// The whole-wire budget hyper gives a request head (request line + all
 /// headers) under axum::serve's default builder: hyper's
-/// `DEFAULT_MAX_BUFFER_SIZE`, 8 KiB initial buffer + 4 KiB × the
-/// 100-header default = 417,792 bytes (~408 KiB). No cap of our own sits
-/// below it — [`HookLog`] capture
-/// truncates neither the path/query nor header values — so the read bound
-/// must assume a recorded head up to this size. Sizing to OUR OWN parser
-/// budget (not a proxy's) is what makes the bound total: anything a front
-/// like cloudflared forwards still has to fit what hyper here accepts.
-/// If hyper's default ever grows, this must grow with it (see
-/// [`STORE_RECORD_OVERHEAD`]'s derivation).
+/// `DEFAULT_MAX_BUFFER_SIZE`, 8 KiB initial + 4 KiB × the 100-header
+/// default = 417,792 bytes (~408 KiB). No cap of our own sits below it —
+/// capture truncates neither the path/query nor header values — so the read
+/// bound must assume a recorded head up to this size. Sized to OUR OWN
+/// parser budget (not a proxy's): anything cloudflared forwards still has
+/// to fit what hyper here accepts. If hyper's default ever grows, this must
+/// grow with it.
 const HYPER_HEAD_BUDGET: usize = 417_792;
 
-/// Per-record serialized-head allowance: head material up to
-/// [`HYPER_HEAD_BUDGET`] bytes can be quote/backslash-heavy — the http
-/// crate admits raw `"` in the request path and both `"` and `\` in
-/// header values (passing them through `HeaderValue::to_str` verbatim) —
-/// and serde_json expands each such byte 1→2. Control bytes cannot occur
-/// in head material except TAB in header values (httparse admits it, hyper
-/// passes values unchecked, and `HeaderValue::to_str` accepts it) — and
-/// serde_json short-escapes TAB 1→2 as well, so 2x is the head's
-/// strict expansion ceiling; the +2 KiB
-/// slack covers the record's JSON structural bytes (field names,
-/// brackets, seq/timestamp). (The path/query portion is even tighter
-/// bounded on its own — the http crate caps a whole Uri at
-/// u16::MAX - 1 = 65,534 bytes — but headers alone can fill the wire
-/// budget, so the head-budget-sized allowance is the honest ceiling.)
-/// With the body term this makes [`store_read_bound`] a true upper bound
-/// on what the origin itself can record — an allowance below it would
-/// again misclassify legitimate stores as oversized on reload and wipe
-/// them (the round-1/round-2 judge findings).
+/// Per-record serialized-head allowance: [`HYPER_HEAD_BUDGET`] × 2 because
+/// head material can be quote/backslash-heavy — the http crate admits raw
+/// `"` in the request path and both `"` and `\` in header values — and
+/// serde_json expands each such byte 1→2. Control bytes cannot occur in
+/// head material except TAB in header values (httparse admits it;
+/// short-escaped 1→2 as well), so 2x is the head's strict expansion
+/// ceiling; the +2 KiB slack covers the record's JSON structural bytes
+/// (field names, brackets, seq/timestamp). The path/query portion is
+/// separately capped (http caps a whole Uri at 65,534 bytes), but headers
+/// alone can fill the wire budget. With the body term this makes
+/// [`store_read_bound`] a true upper bound on what the origin can record —
+/// a smaller allowance would misclassify legitimate stores as oversized on
+/// reload and wipe them.
 const STORE_RECORD_OVERHEAD: usize = HYPER_HEAD_BUDGET * 2 + 2 * 1024;
 
 /// Upper bound on a store this server could have written: `keep` records
@@ -281,36 +252,28 @@ fn read_store_blob(path: &Path, keep: usize) -> std::io::Result<Vec<u8>> {
 impl HookLog {
     /// Load the store at `path`, or start empty when it does not exist yet.
     ///
-    /// Two failure modes are deliberately treated differently:
+    /// Two failure modes are treated differently:
     /// - a **corrupt (unparseable) store** degrades to empty rather than
-    ///   failing the origin: the atomic tmp+rename write means corruption
-    ///   implies disk trouble, and bricking the service forever until a human
-    ///   deletes the file is worse than restarting the log — webhook senders
-    ///   re-deliver, so the data is recoverable at the source;
-    /// - a **read error other than NotFound** (permissions drift, EIO, a
-    ///   directory where the store should be, …) is returned as `Err` and
-    ///   fails the load: the store may be perfectly intact behind the error,
-    ///   and starting empty here would let the next append's atomic rename
-    ///   destroy it — unlogged record loss. Failing fast (at worker/foreground
-    ///   startup, before anything can be renamed over it) surfaces the disk
-    ///   problem while nothing has been lost yet.
+    ///   failing the origin: corruption implies disk trouble (the write is
+    ///   atomic), and bricking the service until a human deletes the file is
+    ///   worse than restarting the log — webhook senders re-deliver;
+    /// - a **read error other than NotFound** fails the load with `Err`: the
+    ///   store may be intact behind the error, and starting empty would let
+    ///   the next append's atomic rename destroy it — unlogged record loss.
+    ///   Failing fast (at startup, before anything can be renamed over it)
+    ///   surfaces the disk problem while nothing is lost yet.
     ///
     /// A loaded store is re-sorted by seq and re-truncated to `keep`, so a
     /// hand-edited file cannot grow retention behind the operator's back.
     pub fn load(path: PathBuf, keep: usize) -> std::io::Result<Self> {
-        // The read itself is size-bounded (see [`read_store_blob`]): without
-        // the bound, a stray multi-gigabyte file at the store's path would be
-        // slurped whole into memory at startup before the parser rejected it.
         let bound = store_read_bound(keep);
         let mut requests = match read_store_blob(&path, keep) {
-            // Oversized = not a store this server wrote (every record it
-            // writes is body-capped, and the bound budgets serde_json's
-            // worst-case escaping of BOTH the body and the whole
-            // hyper-capped head — see [`store_read_bound`] — so `keep`
-            // legit records can never reach it): route it through
-            // the SAME corrupt-store recovery as a parse failure, NOT the
-            // read-error arm below, which exists to protect a store that
-            // may be intact behind an I/O error.
+            // Oversized = not a store this server wrote (every record is
+            // body-capped and the bound budgets serde_json's worst-case
+            // escaping of body AND head, so `keep` legit records can never
+            // reach it): the SAME corrupt-store recovery as a parse failure,
+            // not the read-error arm, which protects a store that may be
+            // intact behind an I/O error.
             Ok(bytes) if bytes.len() as u64 > bound => {
                 tracing::warn!(
                     path = %path.display(),
@@ -336,16 +299,13 @@ impl HookLog {
             // on the next append.
             Err(e) => return Err(e),
         };
-        // Restore the newest-first invariant by seq (not by trusting on-disk
-        // order) and re-apply retention so the bound holds from load, not
-        // just from the next append.
+        // Restore the newest-first invariant by seq (not on-disk order) and
+        // re-apply retention so the bound holds from load.
         requests.sort_by_key(|r| std::cmp::Reverse(r.seq));
         requests.truncate(keep);
-        // Saturate rather than `+ 1`: a hand-edited store can carry
-        // seq = u64::MAX, where the raw add trips the debug overflow check
-        // (panicking the origin at startup) and wraps to 0 in release,
-        // stamping the next record as the oldest — corrupting the
-        // newest-first order this counter exists to define.
+        // Saturate rather than `+ 1`: a hand-edited seq = u64::MAX would
+        // panic in debug and wrap to 0 in release, stamping the next record
+        // as the OLDEST — corrupting the newest-first order.
         let next_seq = requests
             .first()
             .map(|r| r.seq.saturating_add(1))
@@ -359,36 +319,29 @@ impl HookLog {
     }
 
     /// Record `req` (already seq-stamped) and persist the store. The write is
-    /// tmp+rename atomic so a crash mid-append can never leave a corrupt
-    /// store, and the tmp file is created with private permissions (see
-    /// [`crate::fsutil::apply_private_mode`]) — the store carries request
-    /// paths and bodies, exactly the class of data the logs' 0600 discipline
-    /// exists for.
+    /// tmp+rename atomic (a crash mid-append cannot corrupt), with private
+    /// perms — the store carries request paths and bodies, the same class
+    /// of data as the logs' 0600 discipline.
     fn record(&mut self, req: RecordedRequest) -> std::io::Result<()> {
         self.requests.insert(0, req);
         self.requests.truncate(self.keep);
         self.persist()
     }
 
-    /// Allocate the sequence number for the next record (the field and the
-    /// method share a name on purpose: the method is the only writer of the
-    /// counter). The increment saturates like load does: a raw `+ 1` at a
-    /// hand-edited u64::MAX counter would panic in debug and wrap to 0 in
-    /// release, stamping the next record as the OLDEST and corrupting the
-    /// newest-first order this counter exists to define. At the saturation
-    /// point duplicate seqs become unavoidable; ordering stays well-defined
-    /// because insertion order (newest-first in memory) survives reloads via
-    /// the stable seq sort.
+    /// Allocate the next record's sequence number. Saturates like load: a
+    /// raw `+ 1` at a hand-edited u64::MAX would panic in debug and wrap to
+    /// 0 in release, stamping the next record as the OLDEST. At saturation
+    /// duplicate seqs are unavoidable; ordering stays well-defined because
+    /// the stable seq sort preserves in-memory (newest-first) order.
     fn next_seq(&mut self) -> u64 {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
         seq
     }
 
-    /// Point-in-time copy for the inspection views. Cloning (rather than
-    /// holding the lock across rendering) keeps the recorder lock-free for
-    /// the duration of HTML/JSON serialization; the clone is bounded by
-    /// `keep` × the body cap, so it is cheap at the documented bounds.
+    /// Point-in-time copy for the inspection views: cloning keeps the
+    /// recorder lock-free during rendering, and is bounded by `keep` × the
+    /// body cap.
     fn snapshot(&self) -> Vec<RecordedRequest> {
         self.requests.clone()
     }
@@ -415,29 +368,25 @@ impl HookLog {
     }
 }
 
-/// Lock a shared [`HookLog`], recovering from poisoning.
-///
-/// A panic in one request's recording path must not wedge the recorder into a
-/// permanent 500: the in-memory state stays structurally valid across a panic
-/// (insert + truncate are infallible; only persist can fail and it does so
-/// with a Result), so the guard is recovered and recording continues.
+/// Lock a shared [`HookLog`], recovering from poisoning: a panic in one
+/// request's recording path must not wedge the recorder into a permanent 500
+/// — the in-memory state stays structurally valid across a panic (insert +
+/// truncate are infallible; persist returns a Result), so recording
+/// continues.
 fn lock(log: &Mutex<HookLog>) -> MutexGuard<'_, HookLog> {
     log.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Build the hook origin's [`Router`] over an opened [`HookLog`].
-///
-/// Layering mirrors the static server, outermost last: the timeout bounds
-/// slow public clients and the drain, the body limit caps uploads before any
-/// handler, and `nosniff` is stamped on every response. There is deliberately
-/// NO TraceLayer: the static server traces requests into `server.log` because
-/// it has no other record of them, while the hook origin's request record IS
-/// its log (`requests.json`) — a second per-request trace would duplicate it
-/// into worker.log for no gain.
+/// Build the hook origin's [`Router`] over an opened [`HookLog`]. Layering
+/// mirrors the static server (timeout bounds slow clients and the drain,
+/// body limit caps before any handler, nosniff everywhere) except there is
+/// deliberately NO TraceLayer: the hook origin's request record IS its log
+/// (`requests.json`) — a second per-request trace would duplicate it into
+/// worker.log for no gain.
 pub fn router(log: Arc<Mutex<HookLog>>) -> Router {
     Router::new()
         // The inspection routes are matched BEFORE the recording fallback, so
-        // they (and only they) never land in the store — see the module docs.
+        // they (and only they) never land in the store.
         .route(JSON_PATH, get(inspect_json))
         .route(INSPECT_PATH, get(inspect_html))
         .fallback(record)
@@ -453,26 +402,22 @@ pub fn router(log: Arc<Mutex<HookLog>>) -> Router {
         ))
 }
 
-/// The fallback handler: record the request, acknowledge it with 200.
-///
-/// Every method and path lands here (the two inspection GETs are matched
-/// earlier), so a webhook sender gets a 2xx whatever path it posts to. A
-/// persistence failure is surfaced as 500 rather than swallowed: the whole
-/// purpose of this origin is recording, so "acknowledged but written
-/// nowhere" would be a silent lie to the operator — a 500 lets the sender's
-/// retry logic do its job.
+/// The fallback handler: record the request, acknowledge it with 200. Every
+/// method and path lands here (the two inspection GETs are matched earlier),
+/// so a webhook sender gets a 2xx whatever path it posts to. A persistence
+/// failure is surfaced as 500 rather than swallowed — "acknowledged but
+/// written nowhere" would be a silent lie; a 500 lets the sender's retry
+/// logic do its job.
 async fn record(State(log): State<Arc<Mutex<HookLog>>>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
-    // Second enforcement of the body cap, after [`RequestBodyLimitLayer`]:
-    // the layer pre-rejects oversized requests that declare a Content-Length
-    // (413 without running this handler), but a chunked body carries none —
-    // for those the read below is the enforcement, bounded at the cap.
+    // Second enforcement of the body cap after [`RequestBodyLimitLayer`]: the
+    // layer pre-rejects a declared oversize (Content-Length), but a chunked
+    // body carries none — for those this bounded read is the enforcement.
     let bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
         Ok(bytes) => bytes,
-        // Under this router a body-read failure means the payload blew the
-        // cap (chunked, no Content-Length for the layer to pre-reject) or the
-        // client died mid-send; both callers deserve the same "don't resend
-        // this unrecorded payload" signal, so both answer 413.
+        // A read failure means the chunked payload blew the cap or the client
+        // died mid-send; both get the same "don't resend this unrecorded
+        // payload" signal (413).
         Err(e) => {
             tracing::warn!(%e, "request body unreadable (over the cap or aborted)");
             return (
@@ -482,9 +427,8 @@ async fn record(State(log): State<Arc<Mutex<HookLog>>>, request: Request) -> Res
                 .into_response();
         }
     };
-    // The blocking fs work (serialize + tmp write + rename) happens off the
-    // async worker threads, consistent with the repo's spawn_blocking
-    // discipline for disk I/O on request paths.
+    // Blocking fs work (serialize + tmp write + rename) off the async
+    // threads, per the repo's spawn_blocking discipline for request paths.
     let persisted = tokio::task::spawn_blocking(move || {
         let mut log = lock(&log);
         let seq = log.next_seq();
@@ -514,14 +458,12 @@ async fn record(State(log): State<Arc<Mutex<HookLog>>>, request: Request) -> Res
 }
 
 /// Take a point-in-time snapshot off the async worker thread. The record
-/// path holds this lock across persist's serialize + tmp write + rename
-/// (inside its own `spawn_blocking`), so an async-side `lock()` here could
-/// park a tokio worker for that entire window — the std::sync-in-async
-/// anti-pattern the record path already avoids; the inspect views must not
-/// reintroduce it. The closure only clones a Vec (infallible), so the
-/// JoinHandle error arm is structurally unreachable and degrades to an
-/// empty view rather than a 500, mirroring the static server's graceful
-/// `unwrap_or` handling of its blocking tasks.
+/// path holds this lock across persist's serialize + write + rename (inside
+/// its own `spawn_blocking`), so an async-side `lock()` here could park a
+/// tokio worker for that window — the std::sync-in-async anti-pattern the
+/// record path already avoids. The closure only clones a Vec, so the
+/// JoinHandle error arm is unreachable and degrades to an empty view
+/// rather than a 500.
 async fn snapshot_offline(log: &Arc<Mutex<HookLog>>) -> Vec<RecordedRequest> {
     let log = Arc::clone(log);
     tokio::task::spawn_blocking(move || lock(&log).snapshot())
@@ -567,10 +509,8 @@ fn render_inspection(requests: &[RecordedRequest]) -> String {
             body.push_str("</pre>\n");
         }
         if !r.body.is_empty() {
-            // The body is wrapped in a fenced pre so a body that is itself
-            // HTML cannot confuse the rendering even before escaping —
-            // escape_html already neutralizes it, the fence just keeps the
-            // layout sane for multi-line payloads.
+            // The fenced pre keeps multi-line payloads laid out sanely;
+            // escape_html already neutralizes HTML bodies.
             body.push_str(&format!("<pre>{}</pre>\n", escape_html(&r.body)));
         }
         body.push_str("</li>\n");
@@ -710,9 +650,8 @@ mod tests {
 
     #[test]
     fn hook_log_keeps_only_the_newest_requests() {
-        // Retention bound: appending past `keep` must evict the OLDEST
-        // records (disk cannot fill), leaving exactly the newest, still
-        // newest-first — on disk as well as in memory.
+        // Appending past `keep` evicts the OLDEST records, newest-first, on
+        // disk as well as in memory.
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("requests.json");
         let mut log = HookLog::load(path.clone(), 3).expect("load");
@@ -732,10 +671,8 @@ mod tests {
 
     #[test]
     fn hook_log_persists_and_reloads_with_continuing_seqs() {
-        // A restart must neither lose recorded requests nor restart the seq
-        // counter (the seq defines newest-first ordering, so a restart that
-        // reset it would corrupt the ordering of NEW records relative to OLD
-        // ones).
+        // A restart must neither lose records nor restart the seq counter
+        // (seq defines newest-first ordering).
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("requests.json");
         {
@@ -759,11 +696,9 @@ mod tests {
 
     #[test]
     fn load_saturates_a_hand_edited_max_seq_counter_and_still_appends() {
-        // A hand-edited store can carry seq = u64::MAX; the reload must
-        // saturate the counter there, because the old `r.seq + 1` panicked
-        // in debug builds (the overflow check acting as a debug_assert) and
-        // silently wrapped to 0 in release — stamping the next record as
-        // the OLDEST and corrupting newest-first ordering.
+        // A hand-edited seq = u64::MAX: the reload must saturate, because the
+        // old `r.seq + 1` panicked in debug and wrapped to 0 in release —
+        // stamping the next record as the OLDEST.
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("requests.json");
         {
@@ -799,24 +734,15 @@ mod tests {
 
     #[test]
     fn load_treats_an_oversized_store_as_corruption() {
-        // A store larger than keep x (escape-expanded body cap + the
-        // hyper-head-budget-aware per-record head allowance) is not one this
-        // server wrote (every record it persists is body-capped and
-        // head-budget-capped by our own parser, with the bound already
-        // budgeting serde_json's escaping of both), so it takes the
-        // corrupt-store recovery — warn and start empty — and the LOAD reads
-        // only bound+1 bytes of it, never slurping the whole file (the
-        // registry's stray-huge-file scenario: a log redirected over the
-        // store path). It must not take the read-error arm either, which
-        // exists to protect a store that may be intact behind an I/O
-        // error — this one provably is not intact.
+        // A store larger than keep × (escape-expanded body cap + head
+        // allowance) is not one this server wrote: corrupt-store recovery
+        // (warn, start empty), never the read-error arm (which protects a
+        // store that may be intact — this one provably is not), and never a
+        // whole-file slurp.
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("requests.json");
-        // Valid JSON the OLD unbounded code loaded: one record whose
-        // serialized size alone exceeds the full escape-aware per-record
-        // bound (plain 'x's do not escape, so the byte count is honest).
-        // With keep = 1 the bound is exactly one record of 6x cap +
-        // overhead, so this file crosses it.
+        // Valid JSON whose single record exceeds the keep=1 per-record bound
+        // (plain 'x's do not escape, so the byte count is honest).
         let fat_body = "x".repeat(MAX_REQUEST_BODY * JSON_ESCAPE_FACTOR + STORE_RECORD_OVERHEAD);
         let json = format!(
             "[{{\"seq\":1,\"received_at\":\"2024-01-01T00:00:00Z\",\"method\":\"POST\",\
@@ -834,16 +760,11 @@ mod tests {
 
     #[test]
     fn a_control_byte_body_at_the_cap_survives_reload() {
-        // Regression for the escape-unaware bound (judge-found): a body of
-        // NULs at the exact cap is fully legitimate — NUL is valid UTF-8,
-        // so capture decodes it losslessly — but serde_json serializes each
-        // NUL as the 6-byte \u0000 escape, so the persisted store is ~6x
-        // the capped body size. It EXCEEDS the naive byte-count bound (cap
-        // + overhead) the old store_read_bound used — which made load()
-        // classify this legitimate store as oversized and wipe it via the
-        // corrupt-store recovery, remotely triggerable on the token-less
-        // hook origin — and sits well INSIDE the escape-aware bound. The
-        // reload must keep the record intact.
+        // Regression (round 1): a NUL body at the cap is legitimate (NUL is
+        // valid UTF-8) but serde_json escapes each NUL as 6 bytes, so the
+        // store is ~6x the cap — past the old escape-unaware bound, which
+        // wiped such legitimate stores on reload (remotely triggerable on
+        // the token-less origin), and inside the escape-aware one.
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("requests.json");
         {
@@ -853,11 +774,9 @@ mod tests {
             log.record(RecordedRequest::capture(1, &head, &body))
                 .expect("record");
         }
-        // The fixture really is the adversarial case: past the round-1
-        // naive per-record byte count (cap + a 96 KiB head allowance —
-        // hardcoded here as history, since STORE_RECORD_OVERHEAD has since
-        // been sized to the true head worst case), within the
-        // escape-aware one.
+        // The fixture is the adversarial case: past the round-1 naive
+        // per-record byte count (cap + 96 KiB head allowance, hardcoded
+        // here as history), within the escape-aware bound.
         let persisted_len = std::fs::metadata(&path).expect("store exists").len();
         assert!(
             persisted_len > (MAX_REQUEST_BODY + 96 * 1024) as u64,
@@ -876,24 +795,19 @@ mod tests {
 
     #[test]
     fn a_quote_heavy_head_with_a_nul_body_survives_reload() {
-        // Regression for the head half of the bound (judge-found, round 2):
-        // the http crate admits raw '"' in the request path and both '"'
-        // and '\' in header values, capture() truncates none of it, and
-        // serde_json expands each such byte 1→2 — so a quote-heavy head is
-        // fully legitimate recorded material that the round-2 96 KiB
-        // serialized-head allowance could not hold. Combined with a NUL
-        // body at the cap, the record persists PAST the round-2 keep=1
-        // bound (body x6 + 96 KiB, hardcoded below as history) that
-        // load() used to wipe it by — remotely reachable through the
-        // tunnel edge's header limits, trivially via loopback — while
-        // staying inside the head-budget-aware bound. The reloaded store
-        // must keep it.
+        // Regression (round 2, head half): the http crate admits raw '"'
+        // in the path and both '"' and '\' in header values, capture()
+        // truncates none of it, and serde_json expands each such byte 1→2 —
+        // so a quote-heavy head is legitimate recorded material the round-2
+        // 96 KiB head allowance could not hold. Combined with a NUL body at
+        // the cap, the record persists past the round-2 keep=1 bound that
+        // load() used to wipe it by, while staying inside the
+        // head-budget-aware bound.
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("requests.json");
-        // ~120 KiB of raw quote material — under hyper's real ~408 KiB wire
-        // budget (and under the http crate's separate whole-Uri cap of
-        // u16::MAX - 1 = 65,534 bytes, which bounds the path portion), so
-        // this fixture is a head the origin itself accepts.
+        // ~120 KiB of raw quote material — under hyper's ~408 KiB wire
+        // budget (and the http crate's 65,534-byte whole-Uri cap for the
+        // path portion), so the origin itself accepts this head.
         let quote_path = format!("/{}", "\"".repeat(60_000));
         let quote_header = "\"".repeat(60_000);
         let head = parts("POST", &quote_path, &[("user-agent", &quote_header)]);
@@ -947,19 +861,15 @@ mod tests {
         assert_eq!(log.len(), 0);
     }
 
-    /// A read error that is NOT NotFound (here: a regular file occupying the
-    /// store's parent-directory slot, so the read fails with ENOTDIR on every
-    /// Unix; Windows path semantics differ, so this is platform-gated like
-    /// the other fs-behaviour tests).
+    /// A read error that is NOT NotFound (a regular file occupying the
+    /// store's parent-directory slot → ENOTDIR on Unix; Windows path
+    /// semantics differ, hence the gate).
     #[cfg(unix)]
     #[test]
     fn load_fails_fast_on_a_non_not_found_read_error_without_clobbering() {
-        // The judge-required split: a non-NotFound read error must surface as
-        // Err, because the store may be perfectly intact behind the error and
-        // silently starting empty would let the next append's atomic rename
-        // destroy it — unlogged record loss. Nothing is clobbered by the
-        // failed load: no store file was touched, and the on-disk bytes the
-        // error hid are exactly as they were.
+        // The judge-required split: a non-NotFound read error surfaces as Err
+        // — the store may be intact behind it, and an empty fallback would
+        // let the next append's rename destroy it. Nothing is clobbered.
         let tmp = tempfile::tempdir().expect("tempdir");
         let blocker = tmp.path().join("blocker");
         std::fs::write(&blocker, b"intact").expect("write blocker file");
@@ -982,10 +892,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn hook_log_store_is_private_and_stays_private() {
-        // The store carries request paths and bodies — the same class of
-        // data as the logs' 0600 discipline. The first append must create it
-        // owner-only, and a pre-existing loose-perms file must be re-sealed
-        // by the next atomic rename over it.
+        // Same 0600 discipline as the logs: the first append creates the
+        // store owner-only, and a pre-existing loose-perms file is re-sealed
+        // by the next rename over it.
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("requests.json");
@@ -1148,12 +1057,9 @@ mod tests {
 
     #[tokio::test]
     async fn non_get_on_the_inspect_paths_is_405_and_unrecorded() {
-        // The module docs promise that non-GET methods on the inspection
-        // endpoints are answered 405 unrecorded; this pins the axum
-        // method-routing contract behind that promise — `get(...)` routes
-        // reject other methods themselves, so the request never reaches the
-        // recording fallback and an inspection probe can never land in the
-        // store — guarding that behavior against axum upgrades.
+        // `get(...)` routes reject other methods themselves, so the request
+        // never reaches the recording fallback — pinned against axum
+        // upgrades.
         let tmp = tempfile::tempdir().expect("tempdir");
         let log = Arc::new(Mutex::new(
             HookLog::load(tmp.path().join("requests.json"), usize::from(DEFAULT_KEEP))
@@ -1201,12 +1107,10 @@ mod tests {
 
     #[tokio::test]
     async fn origin_serves_over_a_real_socket_and_pre_rejects_declared_oversize() {
-        // A real-TCP smoke (the oneshot tests above bypass the HTTP server):
-        // a genuine POST is recorded and answered 200, and an oversize body
-        // that DECLARES its Content-Length is pre-rejected 413 by the limit
-        // layer before the handler reads a byte — the path only a real
-        // request with a Content-Length header can reach. This is also the
-        // seam the screenshot/inspection flow drives when exercising the UI.
+        // Real-TCP smoke (oneshot bypasses the HTTP server): a genuine POST
+        // is recorded and answered 200, and a DECLARED oversize
+        // Content-Length is pre-rejected 413 by the limit layer before the
+        // handler reads a byte.
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let tmp = tempfile::tempdir().expect("tempdir");
         let log = Arc::new(Mutex::new(

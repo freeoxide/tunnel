@@ -2,64 +2,55 @@
 //!
 //! Serves the contents of a directory over HTTP on the loopback interface
 //! using [`tower_http::services::ServeDir`], fronted by a confinement guard
-//! and a [`TraceLayer`]. Only `127.0.0.1` is ever bound — the server is never
-//! exposed publicly; the public surface is provided by the cloudflared
-//! tunnel. A directory that has no `index.html` of its own is answered with a
-//! generated HTML listing (see [`serve_or_list`]) instead of a 404.
+//! and a [`TraceLayer`]. Only `127.0.0.1` is ever bound — the public surface
+//! is the cloudflared tunnel. A directory with no `index.html` of its own is
+//! answered with a generated HTML listing (see [`serve_or_list`]) instead of
+//! a 404.
 //!
 //! # Confinement
 //!
 //! Because cloudflared publishes whatever this server returns to the public
-//! internet, the served tree must be exactly what the operator intended. The
-//! [`confine`] guard (run before ServeDir) enforces three rules:
+//! internet, the [`confine`] guard (run before ServeDir) enforces three
+//! rules:
 //!
 //! - **dotfiles are denied** — any path segment beginning with `.` (`.env`,
-//!   `.git/config`, `.ssh/...`, `.`, `..`) returns 404 by default, so the most
-//!   common accidental exposures of a public static host are off by default.
+//!   `.git/config`, `.`, `..`) 404s by default.
 //! - **symlink escape is blocked** — each request's resolved path is
-//!   canonicalised and must remain under the canonical root, so a symlink
-//!   inside the tree that points at `/etc/passwd` or `~/.ssh` is refused
-//!   rather than followed out of the tree. (Symlinks that resolve *inside* the
-//!   root are still served.)
+//!   canonicalised and must remain under the canonical root (symlinks that
+//!   resolve *inside* the root are still served).
 //! - **`..` traversal is rejected** — belt-and-suspenders alongside the same
-//!   check tower-http ServeDir already performs.
+//!   check ServeDir already performs.
 //!
 //! # Static-origin flags (`--spa` / `--cors` / `--token`)
 //!
 //! [`router_with`] takes a [`crate::model::StaticFlags`] value (persisted on
-//! the registry entry, so the detached worker re-applies what the operator
-//! asked for):
+//! the registry entry, so the detached worker re-applies it):
 //!
 //! - **`--spa`** — the [`spa_fallback`] middleware rewrites a 404 to the root
 //!   `index.html` (client-side router deep links). It sits OUTSIDE `confine`
 //!   (a missing path is itself confined to a 404, so a fallback inside the
-//!   guard could never see one) and re-checks the path itself before
-//!   rewriting: only a genuinely non-existent, dot-free path becomes the app
-//!   shell. Dotfiles/`..` keep their 404, symlink escapes keep their 404, an
-//!   existing-but-refused path keeps its 404, and a root without an
-//!   `index.html` keeps the honest 404 instead of erroring.
+//!   guard could never see one) and re-checks the path itself: only a
+//!   genuinely non-existent, dot-free path becomes the app shell — refusal
+//!   404s keep their meaning, and a root without an `index.html` keeps the
+//!   honest 404.
 //! - **`--cors`** — permissive CORS headers (`Access-Control-Allow-Origin: *`,
 //!   methods GET/HEAD/OPTIONS, wildcard request headers) stamped on every
-//!   response via `SetResponseHeaderLayer`, errors included. Preflight OPTIONS
-//!   is deliberately NOT answered with a success status. The trade-off, stated
-//!   exactly: only a CORS-simple request skips the preflight — a GET/HEAD whose
-//!   headers are all CORS-safelisted — while a GET/HEAD carrying a
-//!   non-safelisted header (e.g. `Authorization`) DOES preflight, and since
-//!   this origin 405s every OPTIONS like any non-GET/HEAD, the browser never
-//!   fires that authenticated request. So with `--token` (below), cross-origin
-//!   Bearer auth can never work; the unanswered preflight is preferred to
-//!   faking an allowance.
-//! - **`--token`** — the [`require_token`] guard answers 401 for EVERY request
-//!   (GET/HEAD included — unlike the drop bucket's mutation-only gate, the
-//!   static origin's whole value is its content, so there is no safe
-//!   unauthenticated subset) unless `Authorization: Bearer <secret>` or
-//!   `?token=<secret>` matches, compared in constant time. It layers OUTSIDE
-//!   `confine` so a 404-scanner learns nothing about the tree (not even which
-//!   paths 404) without the token; `WWW-Authenticate: Bearer` advertises the
-//!   scheme. The Bearer header is the safer transport (query strings leak into
-//!   shell history and client logs), and because the query value is
-//!   percent-decoded, a secret containing `%` or `+` authenticates via the
-//!   header in exactly its written form — prefer the header for such secrets.
+//!   response, errors included. Preflight OPTIONS is deliberately NOT
+//!   answered with a success status: only a CORS-simple request skips the
+//!   preflight, while a GET/HEAD carrying a non-safelisted header (e.g.
+//!   `Authorization`) DOES preflight — and this origin 405s every OPTIONS,
+//!   so the browser never fires that request. With `--token`, cross-origin
+//!   Bearer auth therefore can never work; the unanswered preflight is
+//!   preferred to faking an allowance.
+//! - **`--token`** — the [`require_token`] guard answers 401 for EVERY
+//!   request (GET/HEAD included — the static origin's whole value is its
+//!   content, so there is no safe unauthenticated subset) unless
+//!   `Authorization: Bearer <secret>` or `?token=<secret>` matches, compared
+//!   in constant time. It layers OUTSIDE `confine` so a 404-scanner learns
+//!   nothing about the tree without the token. The Bearer header is the
+//!   safer transport (query strings leak into shell history and client
+//!   logs); the query value is percent-decoded, so a secret containing `%`
+//!   or `+` authenticates via the header in exactly its written form.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -90,57 +81,42 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REQUEST_BODY: usize = 1024;
 
 /// Build an axum [`Router`] that serves `dir` at `/` with HTTP tracing and the
-/// given static-origin flags (`--spa`/`--cors`/`--token`) applied.
+/// given static-origin flags applied. The directory contents map directly
+/// onto the root path; the root is canonicalised so the confinement guard has
+/// a stable base.
 ///
-/// The directory contents are mapped directly onto the root path, so a
-/// request to `/foo.html` resolves to `dir/foo.html`. The root is canonicalised
-/// (symlinks resolved) so the confinement guard has a stable base to confine
-/// against.
-///
-/// Layers are applied innermost-first, so the LAST `.layer()` is the
-/// outermost: TimeoutLayer wraps everything (bounding slow clients and the
-/// graceful-drain), RequestBodyLimitLayer caps the body before ServeDir runs,
-/// SetResponseHeaderLayer stamps `nosniff` on every response, the optional
-/// CORS stamping sits above the token guard so even a 401 carries the CORS
-/// headers, the optional [`require_token`] guard runs next (outside
-/// confinement — see the module docs for why), TraceLayer observes the
-/// response, the optional [`spa_fallback`] rewrite sits outside `confine`,
-/// the [`confine`] guard runs next, and the [`serve_or_list`] listing
-/// middleware is the innermost layer — it sits just in front of the
-/// `ServeDir` fallback and either answers a directory with a listing or hands
-/// the request over untouched.
+/// Layers are applied innermost-first (the LAST `.layer()` is the outermost):
+/// serve_or_list in front of the ServeDir fallback, then confine, then the
+/// optional spa_fallback (outside confine — it must see missing-path 404s),
+/// TraceLayer, the optional [`require_token`] guard (outside confinement, so
+/// a 404-scanner cannot probe the tree), the optional CORS stamping (above
+/// the token guard so even a 401 carries the headers), nosniff, the body
+/// limit, and TimeoutLayer bounding slow clients and the graceful drain.
 pub fn router_with(dir: PathBuf, flags: crate::model::StaticFlags) -> Router {
-    // Canonicalise the root so (a) symlinked roots resolve to their real target
-    // and (b) the confinement guard compares against a stable, absolute base.
     let root = std::fs::canonicalize(&dir).unwrap_or(dir);
     let crate::model::StaticFlags { spa, cors, token } = flags;
-    // axum 0.8 removed `nest_service("/")` ("nesting at the root is no longer
-    // supported"). Serving the directory as the fallback service covers every
-    // path: `index.html` at `/`, the matching file beneath it elsewhere, and a
-    // 404 for anything missing. The serve_or_list middleware layered in front
-    // of it additionally renders a directory listing for a directory that has
-    // no `index.html` (see [`serve_or_list`]).
+    // axum 0.8 removed `nest_service("/")`; the directory as the fallback
+    // service covers every path (index.html at `/`, files beneath it, 404 for
+    // the rest), with serve_or_list rendering listings for index-less
+    // directories.
     let mut router = Router::new()
         .fallback_service(ServeDir::new(root.clone()))
         .layer(from_fn_with_state(root.clone(), serve_or_list))
         .layer(from_fn_with_state(root.clone(), confine));
-    // SPA sits OUTSIDE confine: confine itself 404s non-existent paths (its
-    // canonicalize fails on them), so a fallback layered inside the guard
-    // would never observe the deep-link 404s it exists to rewrite. The
-    // fallback re-checks the path itself before rewriting (see spa_fallback).
+    // SPA sits OUTSIDE confine: confine 404s non-existent paths itself (its
+    // canonicalize fails on them), so a fallback inside the guard would never
+    // observe the deep-link 404s it exists to rewrite.
     if spa {
         router = router.layer(from_fn_with_state(root.clone(), spa_fallback));
     }
     router = router.layer(TraceLayer::new_for_http());
-    // The token guard sits beside — and outside — the confinement middleware:
-    // auth before confinement means an unauthenticated 404-scanner cannot use
-    // the 404/200 distinction to probe which paths exist.
+    // Auth before confinement: an unauthenticated 404-scanner cannot use the
+    // 404/200 distinction to probe which paths exist.
     if let Some(expected) = token {
         router = router.layer(from_fn_with_state(expected, require_token));
     }
-    // CORS stamping is layered ABOVE the token guard (later layer = outer) so
-    // every response of the origin — 200s, 404s, and 401s alike — carries the
-    // headers, keeping the origin's cross-origin story uniform.
+    // Layered ABOVE the token guard so every response — 200s, 404s, 401s
+    // alike — carries the headers.
     if cors {
         router = router
             .layer(SetResponseHeaderLayer::overriding(
@@ -171,30 +147,23 @@ pub fn router_with(dir: PathBuf, flags: crate::model::StaticFlags) -> Router {
 }
 
 /// Listing middleware, layered between the [`confine`] guard and the
-/// `ServeDir` fallback: serve the request through `ServeDir` as usual, except
-/// when the request resolves to a directory that has no `index.html` — in
-/// that case answer with an HTML listing of the directory instead of letting
-/// ServeDir 404.
-///
-/// The listing honours the same confinement rules as file serving: the request
-/// has already passed the [`confine`] guard by the time it reaches us, and the
-/// listing itself hides entries the guard would refuse to serve — dotfiles,
-/// symlinks that escape the root, and broken symlinks. The filesystem reads
-/// for the listing happen in `spawn_blocking`, consistent with the guard's
-/// realpath/stat calls.
+/// `ServeDir` fallback: when the request resolves to a directory with no
+/// `index.html`, answer with an HTML listing instead of letting ServeDir 404.
+/// The listing hides entries the guard would refuse to serve (dotfiles,
+/// escaping/broken symlinks), and its filesystem reads run in
+/// `spawn_blocking`.
 async fn serve_or_list(State(root): State<PathBuf>, request: Request, next: Next) -> Response {
-    // Listings apply to GET/HEAD only; anything else defers to ServeDir,
-    // which answers non-GET/HEAD uniformly with 405, so a directory listing
-    // behaves exactly like a file would under the same method.
+    // GET/HEAD only: anything else defers to ServeDir's uniform 405, so a
+    // listing behaves like a file under the same method.
     let method = request.method();
     if method != Method::GET && method != Method::HEAD {
         return next.run(request).await;
     }
     let is_head = method == Method::HEAD;
     let raw = request.uri().path();
-    // Percent-decode and rebuild the candidate path through the guard's
-    // shared [`candidate_path`] helper (and, ultimately, ServeDir's rules) so
-    // the listing decision is made on the same path everyone else resolves.
+    // Decode and rebuild the candidate through the guard's shared
+    // [`candidate_path`] helper so the listing decision is made on the same
+    // path everyone else resolves.
     let decoded = match percent_decode(raw.as_bytes()).decode_utf8() {
         Ok(s) => s,
         // Undecodable paths are refused by `confine` first; if one reaches us
@@ -208,9 +177,8 @@ async fn serve_or_list(State(root): State<PathBuf>, request: Request, next: Next
         .unwrap_or(None);
     match listing {
         Some(html) => {
-            // A HEAD mirrors the GET representation's headers — including a
-            // truthful Content-Length — but carries no body, like ServeDir's
-            // HEAD answers on files.
+            // A HEAD mirrors the GET representation's headers (truthful
+            // Content-Length) but carries no body, like ServeDir's.
             let len = html.len();
             let mut response = Html(html).into_response();
             if is_head {
@@ -222,18 +190,17 @@ async fn serve_or_list(State(root): State<PathBuf>, request: Request, next: Next
                 response
             }
         }
-        // Not a listable directory (a file, a directory with an index.html, or
-        // a missing path): defer to ServeDir's semantics — redirects, ranges,
-        // ETag, index.html serving, and the final 404.
+        // Not a listable directory (a file, a directory with an index.html,
+        // or a missing path): defer to ServeDir's semantics.
         None => next.run(request).await,
     }
 }
 
 /// Blocking half of [`serve_or_list`]: if `candidate` is a directory under
-/// `root` with no `index.html`, return a rendered HTML listing of it;
-/// otherwise return `None` so the request falls through to `ServeDir`.
-/// Runs inside `spawn_blocking`; every syscall the listing needs (realpath,
-/// stat, read_dir) happens here, off the async worker threads.
+/// `root` with no `index.html`, return a rendered HTML listing of it; else
+/// `None` so the request falls through to `ServeDir`. Runs inside
+/// `spawn_blocking` — every syscall (realpath, stat, read_dir) happens off
+/// the async worker threads.
 fn render_listing(candidate: &Path, root: &Path) -> Option<String> {
     // Canonicalize fails on missing paths — those belong to ServeDir's 404.
     let resolved = std::fs::canonicalize(candidate).ok()?;
@@ -247,20 +214,18 @@ fn render_listing(candidate: &Path, root: &Path) -> Option<String> {
 
     let mut entries: Vec<(String, bool)> = Vec::new(); // (name, is_dir)
     for entry in std::fs::read_dir(&resolved).ok()?.flatten() {
-        // Non-UTF-8 filenames render lossily (U+FFFD) and their hrefs will
-        // 404 on fetch; tolerated in a dev-facing listing rather than
-        // threading raw OsStr bytes through the HTML layer.
+        // Non-UTF-8 filenames render lossily and their hrefs 404 on fetch;
+        // tolerated in a dev-facing listing.
         let name = entry.file_name().to_string_lossy().into_owned();
-        // Hide dotfiles: confine refuses to serve them, so listing them would
-        // only advertise links that 404 (and leak names such as `.env`).
+        // Hide dotfiles: confine refuses to serve them, so listing them
+        // would only advertise 404 links (and leak names such as `.env`).
         if name.starts_with('.') {
             continue;
         }
-        // Resolve each entry through symlinks (and junctions) once. A target
-        // outside the root is hidden — the guard would 404 the link anyway —
-        // and so is an unresolvable one (a broken symlink is a dead link).
-        // The resolution also gives the entry's real kind: a symlink to a
-        // directory inside the tree is listed as a directory, not a file.
+        // Resolve through symlinks once: a target outside the root is hidden
+        // (the guard 404s it anyway), so is an unresolvable one (a dead
+        // link); the resolution also gives the entry's real kind (a symlink
+        // to an inner directory is listed as a directory).
         let target = match std::fs::canonicalize(entry.path()) {
             Ok(target) if target.starts_with(root) => target,
             _ => continue,
@@ -270,21 +235,16 @@ fn render_listing(candidate: &Path, root: &Path) -> Option<String> {
     // Directories first, each group alphabetical.
     entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
-    // The title interpolates a filesystem-derived path into markup, so it is
-    // escaped exactly like the entry labels — a directory named `x<h1 …`
-    // must not inject. The literal `Index of ` prefix carries no markup and
-    // is prepended after escaping.
+    // The title is filesystem-derived, so it is escaped exactly like the
+    // entry labels (the `Index of ` prefix carries no markup).
     let title = escape_html(&format!("Index of {}", decoded_title(candidate, root)));
-    // Entry hrefs are rooted at `/` rather than `./`-relative so they resolve
-    // identically whether the listing was reached as `/dir/` or `/dir` (for
-    // files ServeDir answers the latter with a trailing-slash redirect; for
-    // listings both forms are rendered directly).
+    // Hrefs are `/`-rooted rather than `./`-relative so they resolve the
+    // same whether the listing was reached as `/dir/` or `/dir`.
     let base = href_base(candidate, root);
     let mut body = String::from("<ul>\n");
     if candidate != root {
-        // Absolute parent href: a relative `../` resolves against the
-        // listing's URL, which misses a level when the listing was reached
-        // without its trailing slash (/a/b -> / instead of /a/).
+        // Absolute parent href: a relative `../` misses a level when the
+        // listing was reached without its trailing slash (/a/b -> /).
         let parent = href_base(candidate.parent().unwrap_or(root), root);
         body.push_str(&format!("<li><a href=\"{parent}\">../</a></li>\n"));
     }
@@ -302,18 +262,13 @@ fn render_listing(candidate: &Path, root: &Path) -> Option<String> {
 }
 
 /// The shared HTML page scaffold behind the ft-owned origins' generated views
-/// (the static directory listing here, and the hook inspector in
-/// [`crate::hook_server`]). One wrapper so every generated page keeps the
-/// exact same styling — the body/max-width/h1/li rules are the visual
-/// contract shared by all of them.
+/// (the static directory listing, the hook inspector). One wrapper so every
+/// generated page keeps the same styling.
 ///
-/// `escaped_title` (rendered into both `<title>` and `<h1>`) and
-/// `escaped_body` (everything between the `<hr>` and `</body>`) must already
-/// be HTML-escaped by the caller: the scaffold interpolates them raw, so the
-/// escaping responsibility stays with the code that derives text from
-/// filesystem or request data (that is also why this takes pre-escaped input
-/// rather than escaping internally — a double-escape bug is visible, while a
-/// missed escape would be an injection).
+/// `escaped_title` and `escaped_body` must already be HTML-escaped by the
+/// caller: the scaffold interpolates them raw, so the escaping responsibility
+/// stays with the code deriving text from filesystem/request data — a
+/// double-escape bug is visible, a missed escape would be an injection.
 pub(crate) fn html_page(escaped_title: &str, escaped_body: &str) -> String {
     format!(
         "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n\
@@ -326,26 +281,23 @@ pub(crate) fn html_page(escaped_title: &str, escaped_body: &str) -> String {
 }
 
 /// Title text for the listing, before HTML escaping: the request path, or `/`
-/// for the root. `candidate` is always `root` plus pushed segments, so the
-/// strip cannot actually fail — the `unwrap_or` only keeps the function total
-/// without panicking.
+/// for the root.
 fn decoded_title(candidate: &Path, root: &Path) -> String {
     let rel = candidate.strip_prefix(root).unwrap_or(Path::new(""));
     if rel.as_os_str().is_empty() {
         return "/".to_string();
     }
     let title = format!("/{}", rel.to_string_lossy());
-    // Windows separates path components with `\`; the title must show the
-    // `/` the hrefs use. On Unix a `\` is an ordinary filename character and
-    // must be left alone.
+    // Windows separates components with `\`; the title must show the `/` the
+    // hrefs use (on Unix a `\` is an ordinary filename character).
     #[cfg(windows)]
     let title = title.replace('\\', "/");
     title
 }
 
 /// Prefix for the listing's entry hrefs: the requested directory as an
-/// absolute path with every segment percent-encoded and a trailing `/`
-/// (just `/` for the root listing).
+/// absolute, percent-encoded path with a trailing `/` (just `/` for the
+/// root).
 fn href_base(candidate: &Path, root: &Path) -> String {
     let mut base = String::from("/");
     if let Ok(rel) = candidate.strip_prefix(root) {
@@ -357,11 +309,9 @@ fn href_base(candidate: &Path, root: &Path) -> String {
     base
 }
 
-/// Percent-encode a name for use in an href: keep the unreserved set plus the
-/// `/` separator, encode everything else (spaces, `?`, `#`, `%`, `&`, `<`,
-/// `:`, `[`, non-ASCII, ...). Shared with [`crate::drop_server`], whose
-/// listing renders upload names into the same page scaffold with the same
-/// encoding rules.
+/// Percent-encode a name for use in an href: keep the unreserved set plus
+/// `/`, encode everything else. Shared with [`crate::drop_server`], whose
+/// listing renders upload names into the same scaffold.
 pub(crate) fn encode_href(name: &str) -> String {
     const FRAGMENT: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
         .add(b' ')
@@ -388,11 +338,9 @@ pub(crate) fn encode_href(name: &str) -> String {
     percent_encoding::utf8_percent_encode(name, FRAGMENT).to_string()
 }
 
-/// Minimal HTML text escaping for names inside the listing markup. Shared
-/// with [`crate::hook_server`], whose inspector renders request-derived text
-/// (paths, header names/values, bodies) into the same page scaffold — any
-/// text that came from outside must pass through here before it touches
-/// markup.
+/// Minimal HTML text escaping for markup. Shared with
+/// [`crate::hook_server`], whose inspector renders request-derived text —
+/// any text from outside must pass through here before touching markup.
 pub(crate) fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -408,12 +356,11 @@ pub(crate) fn escape_html(s: &str) -> String {
     out
 }
 
-/// True when any percent-decoded path segment begins with `.`: dotfiles and
-/// dot-directories (`.env`, `.git`, `.ssh`, …), self (`.`), and parent
-/// (`..`). ServeDir already blocks `..` traversal; the guard blocks every
-/// dot segment EARLIER, for defense in depth, and adds the dotfile default
-/// that ServeDir does not provide. Shared by [`confine`] and the SPA
-/// fallback so the refusal policy cannot drift between them.
+/// True when any percent-decoded path segment begins with `.`: dotfiles,
+/// dot-directories, self (`.`), and parent (`..`). ServeDir already blocks
+/// `..`; the guard blocks every dot segment EARLIER (defense in depth) and
+/// adds the dotfile default ServeDir lacks. Shared by [`confine`] and the
+/// SPA fallback so the refusal policy cannot drift.
 fn has_dot_segment(decoded: &str) -> bool {
     decoded
         .trim_start_matches('/')
@@ -422,11 +369,10 @@ fn has_dot_segment(decoded: &str) -> bool {
 }
 
 /// Rebuild the request's target under `root` exactly the way ServeDir
-/// resolves it: percent-decode, drop the leading `/`, split on `/`, and
-/// push every non-empty segment as a path component. One shared builder
-/// guarantees the three decision points — [`confine`], [`serve_or_list`],
-/// and [`spa_fallback`] — decide on literally the same candidate rather
-/// than three re-implementations kept in sync by comment.
+/// resolves it (percent-decode, drop the leading `/`, split on `/`, push
+/// every non-empty segment). One shared builder guarantees [`confine`],
+/// [`serve_or_list`], and [`spa_fallback`] decide on literally the same
+/// candidate.
 fn candidate_path(root: &Path, decoded: &str) -> PathBuf {
     let mut candidate = root.to_owned();
     for seg in decoded.trim_start_matches('/').split('/') {
@@ -438,52 +384,36 @@ fn candidate_path(root: &Path, decoded: &str) -> PathBuf {
 }
 
 /// Confinement guard: deny dotfiles, reject `..` traversal, and refuse any
-/// path whose canonicalised target escapes the served root (symlink escape).
+/// path whose canonicalised target escapes the served root (symlink escape —
+/// `canonicalize` follows symlinks to the real target, so an escaping link no
+/// longer `starts_with(root)`; missing paths also fail canonicalize and 404,
+/// as ServeDir would).
 ///
-/// Shared verbatim with [`crate::drop_server`] (visibility only, zero
-/// behaviour change — see the shared-helper rule in the module docs): the
-/// drop bucket's GET side must behave exactly like the static server's, so it
-/// layers this same middleware in front of the same `ServeDir` semantics.
+/// Shared verbatim with [`crate::drop_server`]: the drop bucket's GET side
+/// must behave exactly like the static server's.
 ///
-/// We reconstruct the candidate path the same way `ServeDir` does (percent-
-/// decode, drop leading `/`, split on `/`, skip empty segments) and then
-/// canonicalise it. `canonicalize` follows symlinks all the way to the real
-/// target, so a symlink pointing outside the root resolves to a path that no
-/// longer `starts_with(root)` and is refused with 404. Non-existent paths also
-/// fail canonicalize and fall to 404 (ServeDir would 404 them too).
+/// All filesystem syscalls run inside [`tokio::task::spawn_blocking`]:
+/// `confine` is on the hot path proxied from the public internet, and
+/// blocking realpath/stat calls on the runtime thread are the documented
+/// std::fs-in-async anti-pattern.
 ///
-/// All filesystem syscalls (`canonicalize`, `exists`, `is_dir`) are run inside
-/// [`tokio::task::spawn_blocking`]: `confine` is on the hot path proxied from
-/// the public internet, and those are blocking realpath/stat calls that would
-/// otherwise stall the tokio worker thread (the documented std::fs-in-async
-/// anti-pattern), serialising request handling and making a slow/NFS-backed
-/// served tree worse.
-///
-/// Note: there is a TOCTOU window between this canonicalise and ServeDir's own
-/// open. Closing it fully requires replacing ServeDir with a hand-written
-/// handler; for a dev tunneling tool the guard defeats the realistic threat
-/// (symlinks already present in the served tree) and keeps ServeDir's HTTP
-/// semantics (ranges, ETag, index.html).
+/// Note: a TOCTOU window remains between this canonicalise and ServeDir's own
+/// open; closing it fully would mean replacing ServeDir. For a dev tunneling
+/// tool the guard defeats the realistic threat (symlinks already present in
+/// the tree) and keeps ServeDir's HTTP semantics (ranges, ETag, index.html).
 pub(crate) async fn confine(State(root): State<PathBuf>, request: Request, next: Next) -> Response {
     let raw = request.uri().path();
     let decoded = match percent_decode(raw.as_bytes()).decode_utf8() {
         Ok(s) => s,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
-    // Any segment starting with '.' is refused: dotfiles/dot-dirs (.env,
-    // .git, .ssh, ...), self ('.'), and parent ('..'). ServeDir already
-    // blocks '..' traversal; we block it earlier here for defense in depth
-    // and add the dotfile default that ServeDir does not provide.
     if has_dot_segment(&decoded) {
         return StatusCode::NOT_FOUND.into_response();
     }
     let candidate = candidate_path(&root, &decoded);
-    // Symlink confinement: resolve the candidate for real and require it to
-    // stay beneath the canonical root. Escaping symlinks resolve outside `root`
-    // and are refused; missing paths fail canonicalize and 404. Run all of the
-    // blocking fs work (candidate canonicalize, is_dir, and the index.html
-    // confinement check) in one spawn_blocking so no realpath/stat touches the
-    // runtime worker thread.
+    // One spawn_blocking for all the fs work (candidate canonicalize, is_dir,
+    // and the index.html confinement check) — no realpath/stat touches the
+    // runtime thread.
     let confined = tokio::task::spawn_blocking(move || confine_blocking(&candidate, &root))
         .await
         .unwrap_or(false);
@@ -494,10 +424,9 @@ pub(crate) async fn confine(State(root): State<PathBuf>, request: Request, next:
 }
 
 /// Blocking half of [`confine`]: resolves `candidate`, requires it to stay
-/// under `root`, and — when it is a directory — confines the `index.html`
-/// ServeDir resolves on its own. Returns `true` if the request is safe to
-/// forward to ServeDir, `false` to 404. Designed to run inside
-/// `spawn_blocking`; performs the realpath/stat syscalls the guard needs.
+/// under `root`, and — when it is a directory — also confines the
+/// `index.html` ServeDir resolves on its own (that index may itself be an
+/// escaping symlink). `true` = safe to forward, `false` = 404.
 fn confine_blocking(candidate: &Path, root: &Path) -> bool {
     let resolved = match std::fs::canonicalize(candidate) {
         Ok(r) => r,
@@ -506,19 +435,16 @@ fn confine_blocking(candidate: &Path, root: &Path) -> bool {
     if !resolved.starts_with(root) {
         return false;
     }
-    // ServeDir serves `<dir>/index.html` for directory requests (its directory-
-    // index feature), and that index.html may itself be a symlink escaping the
-    // root — a vector confine must close, not just the directory itself. So when
-    // the candidate is a directory, also confine its index.html.
+    // ServeDir serves `<dir>/index.html` for directory requests; that index
+    // may itself be a symlink escaping the root — confine it too.
     if resolved.is_dir() && escapes_root(&resolved.join("index.html"), root) {
         return false;
     }
     true
 }
 
-/// True if `path` exists and canonicalises to a target outside `root`. Used to
-/// confine the directory-index file (`index.html`) that ServeDir resolves on
-/// its own, in addition to the request path itself.
+/// True if `path` exists and canonicalises to a target outside `root` —
+/// confines the directory-index file in addition to the request path.
 fn escapes_root(path: &Path, root: &Path) -> bool {
     if !path.exists() {
         return false;
@@ -534,22 +460,15 @@ fn escapes_root(path: &Path, root: &Path) -> bool {
 /// dot-free path to the root `index.html`, so client-side router deep links
 /// (`/settings/profile`) get the app shell instead of a 404.
 ///
-/// Deliberately layered OUTSIDE [`confine`] (which is what makes it able to
-/// see missing-path 404s at all — confine 404s those itself), and therefore
-/// re-checking the path itself before rewriting, so the guard's refusals keep
-/// their meaning:
-///
-/// - any `.`-prefixed segment (dotfiles, `.git/...`, `.`, `..`) keeps its 404;
-///   the app shell must never become a dotfile-detection oracle either;
-/// - a path that canonicalises to SOMETHING (existing inside the root, or a
-///   symlink escaping it — both are cases confine/ServeDir answered
-///   deliberately) keeps its 404: only "nothing exists there" is rewritten;
-/// - a root without an `index.html` keeps the honest 404 (never a 500).
-///
-/// The rewrite is GET/HEAD-only (the shell is a representation, like the
-/// listing); HEAD mirrors the GET headers with an empty body, matching the
-/// listing's HEAD discipline. All filesystem syscalls run in one
-/// `spawn_blocking`, per the guard's blocking-I/O discipline.
+/// Layered OUTSIDE [`confine`] (which 404s missing paths itself — a fallback
+/// inside the guard could never see them) and therefore re-checking the path
+/// so the guard's refusals keep their meaning: dot segments keep their 404
+/// (never a dotfile-detection oracle), a path that canonicalises to SOMETHING
+/// keeps its 404 (only "nothing exists there" is rewritten — an escaping
+/// symlink must not be laundered into a 200), and a root without an
+/// `index.html` keeps the honest 404 (never a 500). GET/HEAD-only; HEAD
+/// mirrors the GET headers with an empty body. Fs syscalls run in one
+/// `spawn_blocking`.
 async fn spa_fallback(State(root): State<PathBuf>, request: Request, next: Next) -> Response {
     let method = request.method().clone();
     let raw = request.uri().path().to_owned();
@@ -566,17 +485,16 @@ async fn spa_fallback(State(root): State<PathBuf>, request: Request, next: Next)
         // Undecodable paths were refused by confine; never rewrite them.
         Err(_) => return response,
     };
-    // Same rule, same place in the pipeline as the guard: a dot segment is
-    // a refusal, and a refusal must not turn into the app shell.
+    // Same rule as the guard: a dot segment is a refusal, and a refusal must
+    // not turn into the app shell.
     if has_dot_segment(&decoded) {
         return response;
     }
     let candidate = candidate_path(&root, &decoded);
     let shell = tokio::task::spawn_blocking(move || {
-        // The path resolves to something (inside or outside the root): its 404
-        // was a deliberate confinement/ServeDir answer, not a miss to paper
-        // over — most importantly an escaping symlink must never be laundered
-        // into a 200 by the fallback.
+        // The path resolves to something (inside or outside the root): its
+        // 404 was a deliberate confinement/ServeDir answer, not a miss to
+        // paper over.
         if std::fs::canonicalize(&candidate).is_ok() {
             return None;
         }
@@ -608,13 +526,12 @@ async fn spa_fallback(State(root): State<PathBuf>, request: Request, next: Next)
 }
 
 /// Token guard (`--token`): answer 401 for EVERY request that does not carry
-/// the configured secret — via `Authorization: Bearer <secret>` or
-/// `?token=<secret>`, compared in constant time — before the request reaches
-/// confinement, the listing, or ServeDir. Gating all methods (unlike the drop
-/// bucket's mutation-only gate) is deliberate: the static origin's entire
-/// value is its content, so reads are exactly what needs protecting, and
-/// gating before confinement means a 404-scanner without the token cannot use
-/// the 404/200 distinction to learn which paths exist.
+/// the configured secret — `Authorization: Bearer <secret>` or
+/// `?token=<secret>`, constant-time compared — before the request reaches
+/// confinement, the listing, or ServeDir. All methods (unlike the drop
+/// bucket's mutation-only gate) because the static origin's whole value is
+/// its content; before confinement so a 404-scanner cannot use the 404/200
+/// distinction to learn which paths exist.
 async fn require_token(State(expected): State<String>, request: Request, next: Next) -> Response {
     let header_token = request
         .headers()
@@ -637,10 +554,9 @@ async fn require_token(State(expected): State<String>, request: Request, next: N
     next.run(request).await
 }
 
-/// Extract the first value of `key` from a raw query string, percent-decoded.
-/// Byte-for-byte twin of the private `drop_server::query_param` (same `+`
-/// policy: a literal plus means a plus, the form-encoding convention is not
-/// applied) — the two must stay in sync if either changes.
+/// Extract the first value of `key` from a raw query string, percent-decoded
+/// (a literal `+` stays a plus — no form-encoding convention). Byte-in-sync
+/// twin of `drop_server::query_param`; keep the two in sync.
 fn query_param(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
@@ -654,15 +570,13 @@ fn query_param(query: &str, key: &str) -> Option<String> {
     })
 }
 
-/// Constant-time token comparison for the operator-chosen static secret: the
-/// decision folds XOR over every byte AND the length difference into one
-/// accumulator, so it never early-returns on the first mismatching byte — or
-/// on a length mismatch (the drop bucket's `tokens_match` folds the length the
-/// same way now that its token may be an arbitrary operator `--token` too;
-/// keep the two twins in sync). The total work still scales with the longer
-/// input, so a length *class* is inferable from timing, as with any looped
-/// compare. An empty configured token matches nothing (the CLI refuses one,
-/// and an empty secret must never open the origin).
+/// Constant-time token comparison: XOR-folds every byte AND the length
+/// difference into one accumulator, so there is no early return on a
+/// mismatching byte or a length mismatch. Work still scales with the longer
+/// input, so a length *class* leaks, as with any looped compare. An empty
+/// configured token matches nothing (an empty secret must never open the
+/// origin). Byte-in-sync twin of `drop_server::tokens_match`; keep the two
+/// in sync.
 fn tokens_match(provided: &str, expected: &str) -> bool {
     if expected.is_empty() {
         return false;
@@ -677,37 +591,32 @@ fn tokens_match(provided: &str, expected: &str) -> bool {
     diff == 0
 }
 
-/// Bind `router` to `127.0.0.1:port` and serve until interrupted by Ctrl-C.
-///
-/// Binding is restricted to the loopback interface on purpose: only the
-/// local cloudflared tunnel process should be able to reach this server.
-/// Shutdown is graceful: on Ctrl-C, axum stops accepting and drains in-flight
-/// requests before returning.
+/// Bind `router` to `127.0.0.1:port` and serve until Ctrl-C; shutdown is
+/// graceful (drain in-flight requests). Loopback-only on purpose: only the
+/// local cloudflared process should reach this server.
 pub async fn serve(router: Router, port: u16) -> crate::error::Result<()> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
         .with_context(|| format!("failed to bind 127.0.0.1:{port}"))?;
     serve_on(router, listener, async {
-        // A Ctrl-C here is observed by the caller's own ctrl_c() await; this
-        // future only drives axum's graceful shutdown and never aborts in-flight
-        // requests on its own.
+        // A Ctrl-C here is also observed by the caller's own ctrl_c() await;
+        // this future only drives axum's graceful shutdown.
         let _ = tokio::signal::ctrl_c().await;
     })
     .await
 }
 
-/// Serve on an already-bound listener. Lets the caller bind (and fail fast on a
-/// port conflict) before committing to spawning the tunnel. When the `shutdown`
-/// future completes, axum stops accepting new connections and drains the
-/// in-flight ones before returning — requests are never dropped mid-flight.
+/// Serve on an already-bound listener (the caller binds and fails fast on a
+/// port conflict before spawning the tunnel). On shutdown, axum stops
+/// accepting and drains in-flight requests — none are dropped mid-flight.
 pub async fn serve_on(
     router: Router,
     listener: tokio::net::TcpListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> crate::error::Result<()> {
-    // Enforce the "loopback-only" invariant on the type, not just by
-    // convention: a future caller passing a 0.0.0.0 listener would otherwise
-    // publish the served tree directly, bypassing the cloudflared-only surface.
+    // Enforce loopback-only on the type, not by convention: a 0.0.0.0 listener
+    // would publish the served tree directly, bypassing the tunnel-only
+    // surface.
     let addr = listener
         .local_addr()
         .context("reading the bound listener address")?;
@@ -891,10 +800,8 @@ mod http_confinement_tests {
         );
     }
 
-    /// Windows: a directory junction (a reparse point) pointing outside the
-    /// served root must be confined just like a Unix symlink. `std::fs::canonicalize`
-    /// resolves junctions, so `confine`'s canonicalize-then-`starts_with` rejects
-    /// the escape. (Runs only on the Windows CI matrix, where `mklink /J` exists.)
+    /// Windows: a directory junction pointing outside the served root is
+    /// confined like a Unix symlink (canonicalize resolves junctions).
     #[cfg(windows)]
     #[tokio::test]
     async fn junction_escape_outside_root_is_blocked() {
@@ -1207,10 +1114,8 @@ mod listing_tests {
         std::fs::create_dir_all(dir.path().join("a").join("b")).expect("mkdir");
         std::fs::write(dir.path().join("a").join("b").join("f.txt"), "f").expect("write");
 
-        // The regression case first: the listing reached WITHOUT its trailing
-        // slash. A relative ../ would resolve against `/a/b` and land on `/`;
-        // the absolute href must name the immediate parent `/a/` in both
-        // forms.
+        // The regression case: WITHOUT the trailing slash, a relative ../
+        // would land on `/`; the absolute href must name `/a/` in both forms.
         for uri in ["/a/b", "/a/b/"] {
             let resp = plain_router(dir.path().to_path_buf())
                 .oneshot(req("GET", uri))
@@ -1308,10 +1213,8 @@ mod listing_tests {
         assert!(html.contains("href=\"/alias/inner.txt\""), "{html}");
     }
 
-    /// Windows counterpart of the symlink test above: a junction to a
-    /// directory inside the root resolves through canonicalize and must be
-    /// listed as a directory too. (Runs only on the Windows CI matrix, where
-    /// `mklink /J` exists.)
+    /// Windows counterpart: a junction to an inner directory is listed as a
+    /// directory too.
     #[cfg(windows)]
     #[tokio::test]
     async fn junction_to_an_inner_directory_is_listed_as_a_directory() {
@@ -1436,9 +1339,8 @@ mod origin_flags_tests {
 
     #[tokio::test]
     async fn spa_serves_the_shell_for_a_deep_link_and_keeps_real_files() {
-        // The SPA contract: a path matching no file falls back to the root
-        // index.html, while paths matching real files (and the root itself)
-        // are served untouched.
+        // The SPA contract: unmatched paths fall back to the root index.html;
+        // real files are served untouched.
         let dir = spa_dir();
         let app = flagged_router(dir.path(), true, false, None);
 
@@ -1474,9 +1376,8 @@ mod origin_flags_tests {
 
     #[tokio::test]
     async fn spa_without_a_root_index_keeps_the_404() {
-        // A root with no index.html must keep the honest 404 for missing
-        // paths — never a 500 for the unreadable fallback target, and never a
-        // rewrite to a file that does not exist.
+        // No index.html: the honest 404 — never a 500, never a rewrite to a
+        // non-existent file.
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("real.txt"), "x").expect("write");
         let resp = flagged_router(dir.path(), true, false, None)
@@ -1488,11 +1389,9 @@ mod origin_flags_tests {
 
     #[tokio::test]
     async fn spa_keeps_dotfiles_traversal_and_the_listing() {
-        // The rewrite must not break the security or listing disciplines:
-        // dotfiles stay 404 (and never become the shell, which would leak a
-        // dotfile oracle the other way), `..` traversal stays 404, and a
-        // directory without an index.html still renders the generated listing
-        // instead of being swallowed by the fallback.
+        // The rewrite must not break the disciplines: dotfiles and `..` stay
+        // 404 (never the shell), and index-less directories still render the
+        // listing instead of being swallowed by the fallback.
         let dir = spa_dir();
         std::fs::write(dir.path().join(".env"), "SECRET=1").expect("plant dotfile");
         let app = flagged_router(dir.path(), true, false, None);
@@ -1532,10 +1431,8 @@ mod origin_flags_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn spa_never_launders_an_escaping_symlink_into_the_shell() {
-        // The adversarial case for the "canonicalize succeeded → keep the
-        // 404" rule: a symlink escaping the root is confined to a 404, and the
-        // SPA fallback must not turn that refusal into a 200 shell (which
-        // would make the tunnel answer poisoned routes with app content).
+        // The adversarial case for "canonicalize succeeded → keep the 404":
+        // the fallback must not turn a confinement refusal into a 200 shell.
         use std::os::unix::fs::symlink;
         let dir = spa_dir();
         let outside = tempfile::tempdir().expect("outside");
@@ -1591,11 +1488,9 @@ mod origin_flags_tests {
 
     #[tokio::test]
     async fn cors_stamps_error_responses_and_preflights_stay_unanswered() {
-        // The documented preflight choice: OPTIONS reaches ServeDir's uniform
-        // 405 (the origin is GET/HEAD-only, both CORS-simple), and the stamped
-        // headers ride even that 405 — and on 404s — so the origin's
-        // cross-origin story is uniform rather than faking an allowance with a
-        // fake-2xx preflight.
+        // The documented choice: OPTIONS reaches ServeDir's uniform 405, and
+        // the headers ride even that 405 and 404s — a uniform cross-origin
+        // story rather than a fake-2xx preflight.
         let dir = spa_dir();
         let app = flagged_router(dir.path(), false, true, None);
 
@@ -1688,11 +1583,9 @@ mod origin_flags_tests {
 
     #[tokio::test]
     async fn token_gates_before_confinement_so_the_tree_cannot_be_probed() {
-        // The layering reason the guard sits OUTSIDE confine: without a valid
-        // token even a dotfile path reads 401 (indistinguishable from any
-        // other path — no 404-scanning oracle), while WITH a valid token the
-        // confinement refusals keep their exact meaning (dotfile → 404, not
-        // the shell), and --spa deep links still work for the bearer.
+        // Without a token even a dotfile path reads 401 (no 404-scanning
+        // oracle); with one, confinement refusals keep their meaning and
+        // --spa deep links still work for the bearer.
         let dir = spa_dir();
         std::fs::write(dir.path().join(".env"), "SECRET=1").expect("plant dotfile");
         let app = flagged_router(dir.path(), true, false, Some("sekrit"));
@@ -1744,9 +1637,8 @@ mod origin_flags_tests {
 
     #[test]
     fn tokens_match_is_exact_and_constant_time_shaped() {
-        // The compare must never early-return on a mismatching byte or on a
-        // length difference (the accumulator folds both), an empty configured
-        // token matches nothing, and only the exact secret passes.
+        // No early return on a mismatching byte or length difference (the
+        // accumulator folds both); an empty configured token matches nothing.
         let m = |p: &str, e: &str| super::tokens_match(p, e);
         assert!(m("sekrit", "sekrit"));
         assert!(!m("sekriT", "sekrit"), "one differing byte is enough");
