@@ -31,13 +31,11 @@ use crate::cli::{Cli, Command};
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // The detached worker installs its own file-based tracing subscriber (so
-    // its logs land in worker.log — plus server.log for static services; a
-    // proxy worker creates no server.log). Every OTHER invocation — the
-    // foreground start flow, ls, kill, open, … — used to emit tracing events
-    // into the void. Give them a default stderr subscriber (RUST_LOG-tuned) so
-    // diagnostics there are no longer silently dropped. `try_init` is a no-op
-    // if something already installed a subscriber.
+    // The detached worker installs its own file-based subscriber (worker.log,
+    // plus server.log for static services). Every OTHER invocation gets a
+    // default stderr subscriber (RUST_LOG-tuned, default `warn`) so its
+    // diagnostics are not silently dropped; `try_init` is a no-op if one is
+    // already installed.
     if !matches!(cli.command, Some(Command::RunWorker { .. })) {
         let filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
