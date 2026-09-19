@@ -27,13 +27,15 @@
 //! The store keeps only the NEWEST `keep` requests (default
 //! [`DEFAULT_KEEP`], overridable per service via `ft hook --keep <n>`), and
 //! each recorded body is capped at [`MAX_REQUEST_BODY`] bytes. The store
-//! therefore cannot grow without bound: at most `keep` records of at most
-//! ~`MAX_REQUEST_BODY` + per-record overhead each (200 × 64 KiB ≈ 12.5 MiB by
-//! default; the CLI accepts up to 1000, ≈ 64 MiB worst case). The bound is
-//! enforced on RELOAD too: [`HookLog::load`] reads at most
-//! `keep × (MAX_REQUEST_BODY + per-record overhead)` bytes, so even a file
-//! tampered past what this server can write (a log redirected over the
-//! store) is treated as corruption rather than slurped into memory.
+//! therefore cannot grow without bound: at most `keep` records, each at
+//! most ~480 KiB of SERIALIZED JSON — the 64 KiB body can expand to 6x its
+//! byte count (serde_json escapes control bytes as `\u00XX`, and a binary
+//! body of NULs is the honest worst case) plus a fixed per-record head
+//! allowance (200 × 480 KiB ≈ 94 MiB by default; the CLI accepts up to
+//! 1000, ≈ 469 MiB worst case). The bound is enforced on RELOAD too:
+//! [`HookLog::load`] reads at most that many bytes, so even a file tampered
+//! past what this server can write (a log redirected over the store) is
+//! treated as corruption rather than slurped into memory.
 //!
 //! # What is deliberately NOT recorded
 //!
@@ -83,7 +85,8 @@ const MAX_REQUEST_BODY: usize = 64 * 1024;
 
 /// Default retention: how many recorded requests a hook store keeps
 /// (newest-first). Documented bound so the disk cannot fill: 200 records ×
-/// ≤64 KiB bodies ≈ 12.5 MiB per service, worst case. `ft hook --keep <n>`
+/// ≤480 KiB serialized each (a 64 KiB control-byte body expands ~6x in
+/// JSON) ≈ 94 MiB per service, worst case. `ft hook --keep <n>`
 /// overrides it (1..=1000). u16 because that is what the worker argv carries;
 /// convert with `usize::from` at the storage boundary.
 pub(crate) const DEFAULT_KEEP: u16 = 200;
@@ -201,19 +204,35 @@ pub struct HookLog {
     requests: Vec<RecordedRequest>,
 }
 
-/// Per-record allowance for everything except the capped body: the request
-/// line (path, query), the allowlisted headers, method/timestamp/flags, and
-/// the JSON syntax around them. Generous by design — a legitimate record
-/// uses a fraction of it — so only a store this server could not have
-/// written can ever cross the total bound below.
+/// Worst-case JSON expansion serde_json applies to a single recorded body
+/// byte: control bytes 0x00-0x1F serialize as the 6-byte `\u00XX` escape
+/// (the five short-escaped controls — `\b` `\f` `\n` `\r` `\t` — and the
+/// `"`/`\` pairs expand only 1→2, so 6 is the strict ceiling). A body of
+/// NULs is fully legitimate on this origin (NUL is valid UTF-8, so a
+/// binary webhook payload decodes losslessly to NUL characters), so the
+/// read bound MUST budget the expansion: an escape-unaware bound
+/// misclassifies such a store as oversized on reload and wipes it —
+/// remotely triggerable record loss on the deliberately token-less origin.
+const JSON_ESCAPE_FACTOR: usize = 6;
+
+/// Per-record allowance for everything except the body: the request line
+/// (path, query), the allowlisted headers, method/timestamp/flags, and the
+/// JSON syntax around them — as SERIALIZED bytes. Request targets and
+/// header values cannot carry raw control bytes (hyper rejects them; they
+/// arrive percent-encoded or are refused outright), so the worst-case
+/// expansion of this material is the 2x quote/backslash pair and 96 KiB
+/// serialized covers any head this server would record many times over.
 const STORE_RECORD_OVERHEAD: usize = 96 * 1024;
 
-/// Upper bound on a store this server could have written: `keep` records of
-/// at most [`MAX_REQUEST_BODY`] body bytes plus the per-record allowance
-/// above. Saturating in both steps so an absurd `keep` cannot overflow; u64
-/// so [`read_store_blob`]'s `File::take` can use it directly.
+/// Upper bound on a store this server could have written: `keep` records
+/// of at most [`MAX_REQUEST_BODY`] body bytes — each expanding to at most
+/// [`JSON_ESCAPE_FACTOR`] serialized bytes in JSON — plus the per-record
+/// head allowance above. Saturating in both steps so an absurd `keep`
+/// cannot overflow; u64 so [`read_store_blob`]'s `File::take` can use it
+/// directly.
 fn store_read_bound(keep: usize) -> u64 {
-    (keep as u64).saturating_mul(MAX_REQUEST_BODY as u64 + STORE_RECORD_OVERHEAD as u64)
+    let per_record = (MAX_REQUEST_BODY * JSON_ESCAPE_FACTOR + STORE_RECORD_OVERHEAD) as u64;
+    (keep as u64).saturating_mul(per_record)
 }
 
 /// Read the persisted store with the hard size bound above, mirroring
@@ -257,10 +276,12 @@ impl HookLog {
         let bound = store_read_bound(keep);
         let mut requests = match read_store_blob(&path, keep) {
             // Oversized = not a store this server wrote (every record it
-            // writes is body-capped, so `keep` legit records can never reach
-            // the bound): route it through the SAME corrupt-store recovery as
-            // a parse failure, NOT the read-error arm below, which exists to
-            // protect a store that may be intact behind an I/O error.
+            // writes is body-capped, and the bound budgets serde_json's
+            // worst-case control-byte escaping — see [`store_read_bound`] —
+            // so `keep` legit records can never reach it): route it through
+            // the SAME corrupt-store recovery as a parse failure, NOT the
+            // read-error arm below, which exists to protect a store that
+            // may be intact behind an I/O error.
             Ok(bytes) if bytes.len() as u64 > bound => {
                 tracing::warn!(
                     path = %path.display(),
@@ -749,20 +770,24 @@ mod tests {
 
     #[test]
     fn load_treats_an_oversized_store_as_corruption() {
-        // A store larger than keep x (body cap + per-record allowance) is
-        // not one this server wrote (every record it persists is capped), so
-        // it takes the corrupt-store recovery — warn and start empty — and
-        // the LOAD reads only bound+1 bytes of it, never slurping the whole
-        // file (the registry's stray-huge-file scenario: a log redirected
-        // over the store path). It must not take the read-error arm either,
-        // which exists to protect a store that may be intact behind an I/O
-        // error — this one provably is not intact.
+        // A store larger than keep x (escape-expanded body cap + per-record
+        // head allowance) is not one this server wrote (every record it
+        // persists is body-capped, and the bound already budgets the 6x
+        // control-byte escaping), so it takes the corrupt-store recovery —
+        // warn and start empty — and the LOAD reads only bound+1 bytes of
+        // it, never slurping the whole file (the registry's stray-huge-file
+        // scenario: a log redirected over the store path). It must not take
+        // the read-error arm either, which exists to protect a store that
+        // may be intact behind an I/O error — this one provably is not
+        // intact.
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("requests.json");
-        // Valid JSON the OLD unbounded code loaded: one record whose body
-        // alone exceeds the body cap. With keep = 1 the bound is one record
-        // of cap + overhead, so this file crosses it.
-        let fat_body = "x".repeat(MAX_REQUEST_BODY + STORE_RECORD_OVERHEAD);
+        // Valid JSON the OLD unbounded code loaded: one record whose
+        // serialized size alone exceeds the full escape-aware per-record
+        // bound (plain 'x's do not escape, so the byte count is honest).
+        // With keep = 1 the bound is exactly one record of 6x cap +
+        // overhead, so this file crosses it.
+        let fat_body = "x".repeat(MAX_REQUEST_BODY * JSON_ESCAPE_FACTOR + STORE_RECORD_OVERHEAD);
         let json = format!(
             "[{{\"seq\":1,\"received_at\":\"2024-01-01T00:00:00Z\",\"method\":\"POST\",\
              \"path\":\"/x\",\"query\":null,\"headers\":[],\"body\":\"{fat_body}\",\
@@ -775,6 +800,45 @@ mod tests {
         std::fs::write(&path, json).expect("seed oversized store");
         let log = HookLog::load(path, 1).expect("an oversized store still loads (as empty)");
         assert_eq!(log.len(), 0, "oversized store must load as empty");
+    }
+
+    #[test]
+    fn a_control_byte_body_at_the_cap_survives_reload() {
+        // Regression for the escape-unaware bound (judge-found): a body of
+        // NULs at the exact cap is fully legitimate — NUL is valid UTF-8,
+        // so capture decodes it losslessly — but serde_json serializes each
+        // NUL as the 6-byte \u0000 escape, so the persisted store is ~6x
+        // the capped body size. It EXCEEDS the naive byte-count bound (cap
+        // + overhead) the old store_read_bound used — which made load()
+        // classify this legitimate store as oversized and wipe it via the
+        // corrupt-store recovery, remotely triggerable on the token-less
+        // hook origin — and sits well INSIDE the escape-aware bound. The
+        // reload must keep the record intact.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("requests.json");
+        {
+            let mut log = HookLog::load(path.clone(), 1).expect("load");
+            let head = parts("POST", "/nul", &[]);
+            let body = vec![0u8; MAX_REQUEST_BODY];
+            log.record(RecordedRequest::capture(1, &head, &body))
+                .expect("record");
+        }
+        // The fixture really is the adversarial case: past the naive
+        // per-record byte count, within the escape-aware one.
+        let persisted_len = std::fs::metadata(&path).expect("store exists").len();
+        assert!(
+            persisted_len > (MAX_REQUEST_BODY + STORE_RECORD_OVERHEAD) as u64,
+            "the fixture must exceed the naive bound the old load() killed it by"
+        );
+        assert!(
+            persisted_len <= store_read_bound(1),
+            "the fixture must sit inside the escape-aware bound"
+        );
+        let reloaded = HookLog::load(path, 1).expect("reload");
+        let snap = reloaded.snapshot();
+        assert_eq!(snap.len(), 1, "a legitimate store must survive reload");
+        assert_eq!(snap[0].body.len(), MAX_REQUEST_BODY);
+        assert!(snap[0].body.bytes().all(|b| b == 0), "NULs round-trip");
     }
 
     #[test]
