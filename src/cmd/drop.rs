@@ -180,67 +180,18 @@ async fn run_background(
 
     state.ensure()?;
 
-    // --- Reserve name + id + entry atomically -----------------------------
-    // Same contract as START/PROXY/RUN/HOOK's reservation, including the M1
-    // protection that comes free: `worker_pid: 0` + a fresh `created_at` puts
-    // the entry inside `model::START_GRACE`, so a concurrent `ft kill` /
-    // `ft prune` refuses to reap it during the reserve→spawn→record window
-    // below (do NOT add any pid-0 staleness handling of our own —
-    // `Service::start_in_progress` owns it). Every exit of ours resolves the
-    // window quickly: token/spawn failure, worker death, and the URL timeout
-    // below all remove the entry by id, which bypasses the grace guard.
-    let (id, name) = Registry::update(&state, |reg| -> Result<(u64, String)> {
-        // One bucket, one owner (checked INSIDE the flock, atomically with
-        // the reserve — see [`find_drop_dir_conflict`]).
-        if let Some(other) = find_drop_dir_conflict(reg, &dir) {
-            bail!(
-                "directory {} is already the upload target of drop service \
-                 '{other}' — one bucket, one owner (a second drop origin on \
-                 the same directory would race its writes and stack its \
-                 total-cap allowance)",
-                dir.display()
-            );
-        }
-        let name = match &name {
-            Some(n) => {
-                name::validate_name(n)?;
-                ensure!(!reg.name_exists(n), "a service named '{n}' already exists");
-                n.clone()
-            }
-            // Default matches the foreground drop flow (`drop-{port}` in
-            // [`run_foreground`]) so both modes of `ft drop` produce the same
-            // name for the same port, mirroring the hook-{port} convention.
-            None => name::unique_name(reg, &format!("drop-{port}")),
-        };
-        let service_dir = state.ensure_service_dir(&name)?;
-        let id = reg.allocate_id();
-        reg.services.push(Service {
-            id,
-            name: name.clone(),
-            kind: ServiceKind::Drop,
-            // The upload TARGET — a real directory, carried like Static's
-            // served dir (the worker re-resolves and re-checks it).
-            dir: Some(dir.clone()),
-            port,
-            local_url: format!("http://127.0.0.1:{port}"),
-            public_url: None,
-            worker_pid: 0,
-            tunnel_pid: None,
-            command_pid: None, // Run-only field; a drop spawns no command
-            static_flags: Default::default(),
-            created_at: crate::model::now_utc(),
-            state_dir: service_dir,
-            foreground: false,
-        });
-        Ok((id, name))
-    })??;
+    // Reserve name + id + entry atomically. `worker_pid: 0` + a fresh
+    // `created_at` put the entry inside `model::START_GRACE`, so a concurrent
+    // `ft kill`/`ft prune` refuses to reap it during the reserve→spawn→record
+    // window below (do NOT add pid-0 staleness handling of our own —
+    // `Service::start_in_progress` owns it).
+    let (id, name, service_dir) = reserve_entry(&state, &dir, port, name, 0, false)?;
 
     // --- Token file -------------------------------------------------------
     // Written BEFORE the worker is spawned (it reads the token at startup and
     // fail-fasts without it) and after the reserve, so the file's lifetime is
     // bounded by the entry's. A failure here removes the entry: half a start
     // (entry without token) would fail the worker seconds later anyway.
-    let service_dir = state.ensure_service_dir(&name)?;
     if let Err(e) = drop_server::store_token(&service_dir, &token) {
         let _ = Registry::update(&state, |reg| {
             reg.remove(id);
@@ -316,7 +267,7 @@ async fn run_background(
                 // cloudflared (fail-fast on either error), so a published URL
                 // already implies an origin.
                 output::print_started(&svc);
-                output::print_drop_token(&token, &svc.public_url.clone().unwrap_or_default());
+                output::print_drop_token(&token, svc.public_url.as_deref().unwrap_or(""));
                 return Ok(());
             }
             Some(Some(svc)) if !proc::pid_alive(svc.worker_pid) => {
@@ -350,6 +301,62 @@ async fn run_background(
     }
     let reason = last_reason(&state, &name);
     bail!("timed out waiting for the tunnel URL{reason}")
+}
+
+/// Reserve the drop entry inside the `Registry::update` flock (shared by both
+/// start flows): refuse a second drop service on the same bucket (see
+/// [`find_drop_dir_conflict`]), resolve the name, push the entry. Returns
+/// (id, name, service_dir).
+fn reserve_entry(
+    state: &StateDir,
+    dir: &Path,
+    port: u16,
+    name: Option<String>,
+    worker_pid: u32,
+    foreground: bool,
+) -> Result<(u64, String, PathBuf)> {
+    Registry::update(state, |reg| -> Result<(u64, String, PathBuf)> {
+        if let Some(other) = find_drop_dir_conflict(reg, dir) {
+            bail!(
+                "directory {} is already the upload target of drop service \
+                 '{other}' — one bucket, one owner (a second drop origin on \
+                 the same directory would race its writes and stack its \
+                 total-cap allowance)",
+                dir.display()
+            );
+        }
+        let name = match &name {
+            Some(n) => {
+                name::validate_name(n)?;
+                ensure!(!reg.name_exists(n), "a service named '{n}' already exists");
+                n.clone()
+            }
+            // drop-{port} in BOTH flows (mirroring the hook-{port}
+            // convention), so both modes of `ft drop` produce the same name.
+            None => name::unique_name(reg, &format!("drop-{port}")),
+        };
+        let service_dir = state.ensure_service_dir(&name)?;
+        let id = reg.allocate_id();
+        reg.services.push(Service {
+            id,
+            name: name.clone(),
+            kind: ServiceKind::Drop,
+            // The upload TARGET — carried like Static's served dir (the
+            // worker re-resolves and re-checks it).
+            dir: Some(dir.to_path_buf()),
+            port,
+            local_url: format!("http://127.0.0.1:{port}"),
+            public_url: None,
+            worker_pid,
+            tunnel_pid: None,
+            command_pid: None, // Run-only field; a drop spawns no command
+            static_flags: Default::default(),
+            created_at: crate::model::now_utc(),
+            state_dir: service_dir.clone(),
+            foreground,
+        });
+        Ok((id, name, service_dir))
+    })?
 }
 
 /// Tear the just-started service down and fail: shared by the poll loop's
@@ -497,54 +504,11 @@ async fn run_foreground(
 
     cloudflared::ensure_installed()?;
 
-    // --- Reserve a registry entry (cross-platform) -------------------------
-    // Mirrors `run_background`'s reservation, but marks this as a FOREGROUND
-    // service whose worker_pid is THIS process. That makes `ft ls/detail/
-    // logs/open` see the foreground tunnel on every platform — notably
-    // Windows, where foreground is the only practical mode.
-    let (id, name) = Registry::update(&state, |reg| -> Result<(u64, String)> {
-        // One bucket, one owner (checked INSIDE the flock, atomically with
-        // the reserve — see [`find_drop_dir_conflict`]).
-        if let Some(other) = find_drop_dir_conflict(reg, &dir) {
-            bail!(
-                "directory {} is already the upload target of drop service \
-                 '{other}' — one bucket, one owner (a second drop origin on \
-                 the same directory would race its writes and stack its \
-                 total-cap allowance)",
-                dir.display()
-            );
-        }
-        let name = match &name {
-            Some(n) => {
-                name::validate_name(n)?;
-                ensure!(!reg.name_exists(n), "a service named '{n}' already exists");
-                n.clone()
-            }
-            // Default matches the background drop flow (`drop-{port}` in
-            // [`run_background`]) so both modes of `ft drop` produce the same
-            // name for the same port.
-            None => name::unique_name(reg, &format!("drop-{port}")),
-        };
-        let service_dir = state.ensure_service_dir(&name)?;
-        let id = reg.allocate_id();
-        reg.services.push(Service {
-            id,
-            name: name.clone(),
-            kind: ServiceKind::Drop,
-            dir: Some(dir.clone()),
-            port,
-            local_url: format!("http://127.0.0.1:{port}"),
-            public_url: None,
-            worker_pid: std::process::id(),
-            tunnel_pid: None,
-            command_pid: None,
-            static_flags: Default::default(),
-            created_at: crate::model::now_utc(),
-            state_dir: service_dir,
-            foreground: true,
-        });
-        Ok((id, name))
-    })??;
+    // Reserve a FOREGROUND entry whose worker_pid is THIS process, so `ft
+    // ls/detail/logs/open` see the tunnel on every platform (notably Windows,
+    // where foreground is the only practical mode).
+    let (id, name, service_dir) =
+        reserve_entry(&state, &dir, port, name, std::process::id(), true)?;
 
     // From here, every exit path must release the reserved entry (see
     // [`EntryGuard`]).
@@ -555,7 +519,6 @@ async fn run_foreground(
 
     // The token file before the origin starts: `ft detail` shows it, and the
     // in-process origin below is built from the same value.
-    let service_dir = state.ensure_service_dir(&name)?;
     drop_server::store_token(&service_dir, &token)
         .with_context(|| format!("storing the drop token in {}", service_dir.display()))?;
 

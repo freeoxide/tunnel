@@ -144,7 +144,7 @@ const MAX_NAME_BYTES: usize = 255 - TEMP_NAME_OVERHEAD;
 /// Name of the file (inside the service's private state dir) holding the
 /// drop origin's access token — the same value printed once at start and
 /// shown by `ft detail`. 0600 via [`crate::fsutil`], like the logs.
-pub(crate) const TOKEN_FILENAME: &str = "drop-token";
+const TOKEN_FILENAME: &str = "drop-token";
 
 /// Hard bound on a token-file read: minted tokens are 65 bytes; anything this
 /// large is not a token (see [`read_token`]).
@@ -285,7 +285,7 @@ pub(crate) fn read_token(dir: &Path) -> std::io::Result<Option<String>> {
 /// Validate an upload name. Returns the unchanged name on success — the
 /// policy is REJECT, never mangle (see the module docs) — or the rule the
 /// name broke, for the 400 body.
-pub(crate) fn sanitize_filename(raw: &str) -> Result<String, String> {
+fn sanitize_filename(raw: &str) -> Result<String, String> {
     if raw.is_empty() {
         return Err("the name is empty".to_string());
     }
@@ -491,12 +491,17 @@ async fn require_token(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::to_owned);
-    let query_token = request.uri().query().and_then(|q| query_param(q, "token"));
-    let ok = header_token
-        .or(query_token)
-        .is_some_and(|t| tokens_match(&t, &store.token));
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let ok = match header_token {
+        Some(t) => tokens_match(t, &store.token),
+        // Only the query arm needs an allocation (percent-decoding); the
+        // Bearer value is compared straight from the header buffer.
+        None => request
+            .uri()
+            .query()
+            .and_then(|q| query_param(q, "token"))
+            .is_some_and(|t| tokens_match(&t, &store.token)),
+    };
     if !ok {
         return (
             StatusCode::UNAUTHORIZED,
