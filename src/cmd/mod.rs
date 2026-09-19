@@ -20,10 +20,18 @@ pub mod sanitize;
 pub mod start;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Result;
 
 use crate::cli::{Cli, Command};
+
+/// Poll cadence while a parent waits for a worker to publish the public URL.
+/// Shared by the START/PROXY/RUN/HOOK background flows.
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Upper bound on how long a parent waits for the tunnel URL. Dev servers
+/// can be slow to boot, so this is generous (30 s).
+pub(crate) const POLL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Dispatch the parsed CLI to the matching command.
 ///
