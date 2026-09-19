@@ -359,14 +359,22 @@ pub async fn run(
     // reads — so a run service's origin output stays visible without a fourth
     // log file. Nothing is extracted from these lines: tunnel URLs come only
     // from cloudflared's streams.
-    let command_log_writer = if kind == ServiceKind::Run {
-        Some(Arc::new(Mutex::new(
-            crate::fsutil::open_private_append_async(&worker_log)
-                .await
-                .with_context(|| format!("opening worker log {}", worker_log.display()))?,
-        )))
-    } else {
-        None
+    let command_log_writer = match kind {
+        ServiceKind::Run => match crate::fsutil::open_private_append_async(&worker_log).await {
+            Ok(f) => Some(Arc::new(Mutex::new(f))),
+            Err(e) => {
+                // Dying worker mustn't leave a permanent stale entry; nothing
+                // is spawned yet (the sink opens BEFORE the command child on
+                // purpose), so teardown is just the server slot + the entry.
+                stop_server(kind, shutdown_tx, &mut server_handle).await;
+                let _ = Registry::update(&state, |reg| {
+                    reg.remove(id);
+                });
+                return Err(e)
+                    .with_context(|| format!("opening worker log {}", worker_log.display()));
+            }
+        },
+        _ => None,
     };
 
     // Run only: spawn the operator's command as THIS worker's child. It is
