@@ -44,7 +44,7 @@ use super::{POLL_INTERVAL, POLL_TIMEOUT};
 use crate::cloudflared;
 use crate::cmd::start::{
     EntryGuard, SERVER_SHUTDOWN_TIMEOUT, drain_and_announce, fail_start, fail_timeout,
-    is_sensitive_dir, remove_reservation, resolve_dir,
+    is_sensitive_dir, remove_reservation, resolve_dir, teardown,
 };
 use crate::drop_server::{self, DropStore};
 use crate::error::Result;
@@ -199,7 +199,16 @@ async fn run_background(
         // re-read and our entry is gone (vanished).
         let snapshot: Option<Option<Service>> = if new_mtime != last_mtime {
             last_mtime = new_mtime;
-            Some(Registry::load(&state)?.find(&id.to_string()).cloned())
+            match Registry::load(&state) {
+                Ok(reg) => Some(reg.find(&id.to_string()).cloned()),
+                Err(e) => {
+                    // Registry unreadable mid-poll: tear the live worker down
+                    // (start::teardown's shutdown-then-remove-by-id) first —
+                    // bailing bare would orphan it — then surface the cause.
+                    teardown(&state, id, worker_pid, "registry read error").await;
+                    return Err(e).context("re-reading the registry during the drop start poll");
+                }
+            }
         } else {
             // Registry unchanged: probe the worker directly to preserve
             // fail-fast (it may have died silently between rewrites).
