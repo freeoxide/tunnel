@@ -1,6 +1,7 @@
 //! The `logs` command: print the tail of a service's log files.
 
-use std::path::PathBuf;
+use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -12,7 +13,10 @@ use crate::state::StateDir;
 /// Number of trailing lines to show per log file by default.
 const TAIL_LINES: usize = 40;
 /// Poll interval when following log output.
-const FOLLOW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+const FOLLOW_INTERVAL: Duration = Duration::from_millis(500);
+/// Maximum number of bytes read from a log into memory at once; only the
+/// trailing window is held when computing a tail or draining appends.
+const READ_CAP: u64 = 65_536;
 
 /// Resolve `target` and print the tail of its logs.
 ///
@@ -41,16 +45,12 @@ pub async fn run(target: String, follow: bool) -> Result<()> {
     Ok(())
 }
 
-/// Maximum number of bytes read from a log into memory at once. Logs can grow
-/// large, so only the trailing window is held when computing the tail.
-const READ_CAP: u64 = 65_536;
-
 /// Print a header and the last ~`TAIL_LINES` lines of `path`.
 ///
 /// For large files, only the trailing `READ_CAP` bytes are read so memory stays
 /// bounded (a partial first line may be dropped). Friendly error if the file
 /// cannot be opened.
-async fn print_tail(path: &PathBuf, label: &str) -> Result<()> {
+async fn print_tail(path: &Path, label: &str) -> Result<()> {
     println!("--- {label} ---");
 
     let mut file = match tokio::fs::File::open(path).await {
@@ -62,8 +62,8 @@ async fn print_tail(path: &PathBuf, label: &str) -> Result<()> {
         Err(e) => bail!("opening log {}: {}", path.display(), e),
     };
 
-    // If the file is larger than the cap, seek to the last `READ_CAP` bytes
-    // before reading so we never hold the whole thing in memory.
+    // Seek to the last READ_CAP bytes of a large file so the whole thing is
+    // never held in memory.
     if let Ok(meta) = file.metadata().await
         && meta.len() > READ_CAP
     {
@@ -77,7 +77,7 @@ async fn print_tail(path: &PathBuf, label: &str) -> Result<()> {
         .context("reading log file")?;
 
     let text = String::from_utf8_lossy(&buf);
-    let tail: Vec<&str> = text.lines().rev().take(TAIL_LINES).collect::<Vec<_>>();
+    let tail: Vec<&str> = text.lines().rev().take(TAIL_LINES).collect();
     for line in tail.into_iter().rev() {
         println!("{line}");
     }
@@ -88,11 +88,11 @@ async fn print_tail(path: &PathBuf, label: &str) -> Result<()> {
 ///
 /// Each file is opened once and seeked to EOF; subsequent polls read from that
 /// offset to the current end, so only newly appended content is printed. A read
-/// error logs a warning and continues so a transient failure does not abort the
-/// follow.
-async fn follow_logs(tunnel_path: &PathBuf, worker_path: &PathBuf) -> Result<()> {
-    // A log may not exist yet (e.g. a service that is still starting). Tolerate
-    // that by opening each file best-effort and skipping any that are absent.
+/// error silently ends that file's follow so a transient failure does not
+/// abort the whole thing.
+async fn follow_logs(tunnel_path: &Path, worker_path: &Path) -> Result<()> {
+    // A log may not exist yet (e.g. a service that is still starting): open
+    // each best-effort and skip any that are absent.
     let mut tunnel = open_at_end(tunnel_path).await?;
     let mut worker = open_at_end(worker_path).await?;
     // Per-file leftover buffers carried across reads so a line or multi-byte
@@ -117,11 +117,10 @@ async fn follow_logs(tunnel_path: &PathBuf, worker_path: &PathBuf) -> Result<()>
     Ok(())
 }
 
-/// Open `path` and seek to its end, ready for incremental reads.
-///
-/// Returns `None` when the file does not exist yet (so a starting service does
-/// not crash `--follow`); any other I/O error is surfaced via `bail!`.
-async fn open_at_end(path: &PathBuf) -> Result<Option<tokio::fs::File>> {
+/// Open `path` and seek to its end, ready for incremental reads. `None` when
+/// the file does not exist yet (so a starting service does not crash
+/// `--follow`); any other I/O error is surfaced via `bail!`.
+async fn open_at_end(path: &Path) -> Result<Option<tokio::fs::File>> {
     let mut file = match tokio::fs::File::open(path).await {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -135,20 +134,17 @@ async fn open_at_end(path: &PathBuf) -> Result<Option<tokio::fs::File>> {
 ///
 /// Reads at most `READ_CAP` bytes per poll so a runaway writer cannot exhaust
 /// memory between polls; any backlog is picked up on subsequent iterations.
-///
-/// Trailing bytes after the last newline are carried into `leftover` and
-/// prepended to the next read, so a multi-byte UTF-8 code point or a logical
-/// line that straddles a read boundary is never split (the prior version
-/// replaced an incomplete trailing sequence with U+FFFD and printed half-lines).
+/// Trailing bytes after the last newline are carried in `leftover` so a
+/// multi-byte UTF-8 code point or a logical line is never split across reads.
 async fn drain_appended(file: &mut tokio::fs::File, leftover: &mut Vec<u8>) {
     let mut buf = vec![0u8; READ_CAP as usize];
     loop {
-        // Read into the back of whatever partial bytes we carried over, so the
-        // carried prefix is contiguous with the newly-read bytes.
+        // Read into the back of whatever partial bytes we carried over, then
+        // append them in place so the carried prefix stays contiguous.
         let read_start = leftover.len();
         if read_start >= buf.len() {
-            // Pathological: a single line longer than READ_CAP with no newline.
-            // Flush it as-is rather than growing unbounded, then start fresh.
+            // Pathological: a single line longer than READ_CAP with no
+            // newline. Flush it as-is rather than growing unbounded.
             flush_text(leftover);
             leftover.clear();
             continue;
@@ -158,28 +154,15 @@ async fn drain_appended(file: &mut tokio::fs::File, leftover: &mut Vec<u8>) {
             Ok(n) => n,
             Err(_) => return,
         };
-        // Combine carried bytes + fresh bytes.
-        let chunk_end = read_start + n;
-        let combined: Vec<u8> = leftover
-            .iter()
-            .copied()
-            .chain(buf[read_start..chunk_end].iter().copied())
-            .collect();
+        leftover.extend_from_slice(&buf[read_start..read_start + n]);
 
-        // Print every whole line in the combined buffer; carry whatever comes
-        // after the last newline into the next iteration. If there is no newline
-        // at all, carry the whole thing (a partial line still being written).
-        match combined.iter().rposition(|&b| b == b'\n') {
-            Some(last_nl) => {
-                let (complete, rest) = combined.split_at(last_nl + 1);
-                flush_text(complete);
-                leftover.clear();
-                leftover.extend_from_slice(rest);
-            }
-            None => {
-                leftover.clear();
-                leftover.extend_from_slice(&combined);
-            }
+        // Print every whole line; carry whatever follows the last newline
+        // into the next iteration. No newline at all: a partial line still
+        // being written, keep carrying it.
+        if let Some(last_nl) = leftover.iter().rposition(|&b| b == b'\n') {
+            let rest = leftover.split_off(last_nl + 1);
+            flush_text(leftover);
+            *leftover = rest;
         }
 
         if n < buf.len() - read_start {
@@ -192,10 +175,9 @@ async fn drain_appended(file: &mut tokio::fs::File, leftover: &mut Vec<u8>) {
 
 /// Decode `bytes` as UTF-8 (lossily) and print each line.
 ///
-/// Lines are split on `\n`; a trailing `\r` (CRLF) is trimmed per line. Because
 /// `bytes` always ends at a `\n` boundary (the caller carries partial tails),
-/// no multi-byte sequence is split across calls, so `from_utf8_lossy` cannot
-/// corrupt a trailing code point here.
+/// so no multi-byte sequence is split across calls and `from_utf8_lossy`
+/// cannot corrupt a trailing code point here.
 fn flush_text(bytes: &[u8]) {
     if bytes.is_empty() {
         return;
