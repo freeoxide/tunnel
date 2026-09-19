@@ -28,22 +28,31 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Map every char outside `[A-Za-z0-9_-]` to `-` (separators, dots, and
+/// non-ASCII all become dashes), preserving everything else verbatim —
+/// INCLUDING leading/trailing dashes. Whether those are trimmed is the
+/// caller's policy: [`generate_name`] trims for display names, while the
+/// state-dir path segment builder deliberately does not, because trimming
+/// made distinct valid names collide (e.g. `"a"` and `"-a"` both collapsed
+/// to `"a"`).
+pub(crate) fn dash_sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
 /// Derive a default name from a directory's basename, sanitizing characters.
 pub fn generate_name(dir: &Path) -> String {
     let base = dir
         .file_name()
         .and_then(|n| n.to_str())
-        .map(|s| {
-            s.chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                        c
-                    } else {
-                        '-'
-                    }
-                })
-                .collect::<String>()
-        })
+        .map(dash_sanitize)
         .unwrap_or_default();
     let trimmed = base.trim_matches('-');
     if trimmed.is_empty() {

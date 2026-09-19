@@ -16,7 +16,6 @@ pub struct StateDir {
     root: PathBuf,
 }
 
-#[allow(dead_code)] // public surface of the state API; callers may use any of these
 impl StateDir {
     /// Locate the state directory for Freeoxide Tunnel.
     pub fn new() -> Result<Self> {
@@ -27,6 +26,7 @@ impl StateDir {
     /// Construct a `StateDir` rooted directly at `root` (deriving registry/lock/
     /// services paths from it). Used by tests to point at a temp directory
     /// without mutating `XDG_STATE_HOME` (an `unsafe` operation in edition 2024).
+    #[cfg(test)]
     pub(crate) fn new_at(root: PathBuf) -> Self {
         Self { root }
     }
@@ -119,30 +119,23 @@ fn state_base() -> Result<PathBuf> {
     Ok(home.join(".local").join("state"))
 }
 
-/// Reduce a name to a single safe path segment: any char outside
-/// `[A-Za-z0-9_-]` becomes `-` (so `.`, `/`, and other separators are all
-/// neutralized to dashes and can never form a self/parent-dir segment).
-/// Trailing/leading dashes are intentionally NOT trimmed — trimming made
-/// distinct valid names collide (e.g. `"a"` and `"-a"` both collapsed to `"a"`).
-/// A result that is empty, `.`, `..`, or consists only of dashes carries no
-/// usable identity, so it falls back to `"service"`. This keeps traversal
-/// neutralized while preserving name distinctness.
+/// Reduce a name to a single safe path segment via [`dash_sanitize`]: any
+/// char outside `[A-Za-z0-9_-]` becomes `-`, so `.`, `/`, and other
+/// separators are all neutralized to dashes and can never form a self or
+/// parent-dir segment (`.` and `..` map to `-`/`--`, which the all-dashes
+/// fallback below rejects). Trailing/leading dashes are intentionally NOT
+/// trimmed — trimming made distinct valid names collide (e.g. `"a"` and
+/// `"-a"` both collapsed to `"a"`). A result that is empty or consists only
+/// of dashes carries no usable identity, so it falls back to `"service"`.
+/// This keeps traversal neutralized while preserving name distinctness.
 fn safe_component(name: &str) -> String {
-    let s: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    match s.as_str() {
-        // Empty, a self/parent marker, or all-dashes (no identity) -> fallback.
-        "" | "." | ".." => "service".to_string(),
-        _ if s.chars().all(|c| c == '-') => "service".to_string(),
-        _ => s,
+    let s = crate::name::dash_sanitize(name);
+    // All-dashes (which also covers the empty string — `all` is vacuously
+    // true there) means no usable identity -> fallback.
+    if s.chars().all(|c| c == '-') {
+        "service".to_string()
+    } else {
+        s
     }
 }
 

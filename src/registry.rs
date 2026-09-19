@@ -25,6 +25,30 @@ use std::io::Write;
 /// on close-on-drop instead.
 struct RegistryLock(#[allow(dead_code)] std::fs::File);
 
+/// Hard upper bound on a persisted registry blob we are willing to read.
+///
+/// The registry is a small operator-owned JSON document (a few hundred bytes
+/// per service), so anything past this bound is corruption — e.g. a log file
+/// accidentally redirected over `registry.json` — not state. Bounding the
+/// READ (not just failing the parse afterwards) is the point: without it, a
+/// multi-gigabyte stray file would be slurped whole into memory before the
+/// parser ever rejects it.
+const MAX_REGISTRY_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read a persisted registry blob with the hard size bound above: at most
+/// `MAX_REGISTRY_BYTES + 1` bytes are ever read (the +1 lets callers tell
+/// "at the bound" from "past it" by length alone). Returns `None` when the
+/// file is missing or unreadable, mirroring plain `std::fs::read(path).ok()`.
+fn read_registry_blob(path: &std::path::Path) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_REGISTRY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    Some(bytes)
+}
+
 fn acquire_lock(state: &StateDir) -> Result<RegistryLock> {
     let path = state.lock_path();
     let mut opts = OpenOptions::new();
@@ -84,10 +108,20 @@ impl Registry {
         // in `acquire_lock`, not here — `load` is also called by unlocked
         // read-only commands, which must not race a concurrent writer's temp.
 
-        if let Some(bytes) = std::fs::read(&path).ok()
+        if let Some(bytes) = read_registry_blob(&path)
             && !bytes.iter().all(u8::is_ascii_whitespace)
         {
-            let parsed = Registry::parse(&bytes);
+            // Oversized = corruption (see MAX_REGISTRY_BYTES): route it through
+            // the same recovery as a parse failure — backup, else a loud error —
+            // rather than the missing-file path, so a stray huge file over the
+            // registry can never yield a silent fresh default over real state.
+            let parsed = if bytes.len() > MAX_REGISTRY_BYTES as usize {
+                Err(anyhow::anyhow!(
+                    "blob is larger than the {MAX_REGISTRY_BYTES}-byte safety bound"
+                ))
+            } else {
+                Registry::parse(&bytes)
+            };
             // Whether or not it parsed, the live file exists and is readable:
             // best-effort re-seal it to 0600 so a registry created by an older
             // build (pre-0600) or hand-edited under a loose umask (0644) is
@@ -118,8 +152,8 @@ impl Registry {
     /// missing or corrupt. Returns `None` if there is no usable backup.
     fn load_backup(state: &StateDir) -> Option<Registry> {
         let bak = state.registry_path().with_extension("json.bak");
-        let bytes = std::fs::read(&bak).ok()?;
-        if bytes.iter().all(u8::is_ascii_whitespace) {
+        let bytes = read_registry_blob(&bak)?;
+        if bytes.len() > MAX_REGISTRY_BYTES as usize || bytes.iter().all(u8::is_ascii_whitespace) {
             return None;
         }
         let parsed = Registry::parse(&bytes).ok()?;
@@ -160,7 +194,8 @@ impl Registry {
         // promote it to `.bak` if it parses+validates: if a previous save or a
         // hand-edit left semantically broken content on disk, keep the existing
         // good backup instead of overwriting it with garbage.
-        if let Ok(prev) = std::fs::read(&path)
+        if let Some(prev) = read_registry_blob(&path)
+            && prev.len() <= MAX_REGISTRY_BYTES as usize
             && !prev.iter().all(u8::is_ascii_whitespace)
             && Registry::parse(&prev).is_ok()
         {
@@ -746,6 +781,28 @@ mod tests {
         assert!(
             res.is_err(),
             "both-corrupt must error, not silently default"
+        );
+    }
+
+    #[test]
+    fn load_treats_oversized_registry_as_corruption() {
+        // A stray huge file over registry.json (e.g. a log redirected onto it)
+        // is corruption: load must route it through the corrupt-live-file
+        // recovery — loud error here, backup fallback if one exists — never
+        // slurp it whole, never silently serve a fresh default over real state.
+        use crate::state::StateDir;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::new_at(tmp.path().join("ft-state"));
+        state.ensure().expect("ensure");
+        std::fs::write(
+            state.registry_path(),
+            vec![b'x'; super::MAX_REGISTRY_BYTES as usize + 1],
+        )
+        .expect("oversized live");
+        let res = Registry::load(&state);
+        assert!(
+            res.is_err(),
+            "oversized live file with no backup must error, not default"
         );
     }
 }
