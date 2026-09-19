@@ -13,9 +13,10 @@
 //!   `?token=`) BEFORE the body is read, else 401; the compare is
 //!   constant-time ([`tokens_match`]).
 //! - Caps: per-upload `--max-size` (the limit layer 413s a declared oversize;
-//!   the handler's bounded read 413s a chunked one) and a fixed 1 GiB total
-//!   ([`MAX_TOTAL_STORE`], 507) counted from a startup walk — manual
-//!   deletions need a restart to be credited.
+//!   the handler's bounded read 413s a chunked one), a fixed 1 GiB total
+//!   ([`MAX_TOTAL_STORE`], 507), and a fixed file count ([`MAX_FILE_COUNT`],
+//!   409) — all counted from a startup walk; manual deletions need a restart
+//!   to be credited.
 //! - Names are REJECTED, never mangled ([`sanitize_filename`], a 400 naming
 //!   the rule); a collision with an existing name is a 409.
 //! - Reads go through [`crate::static_server::confine`] verbatim in front of
@@ -61,6 +62,10 @@ pub(crate) const DEFAULT_MAX_SIZE: u64 = 64 * 1024 * 1024;
 /// "strict caps" promise keeps exactly one knob, so the worst-case disk
 /// footprint is a documented constant.
 pub(crate) const MAX_TOTAL_STORE: u64 = 1024 * 1024 * 1024;
+
+/// Fixed cap on stored FILE count under the byte cap: 0-byte uploads never
+/// fill the byte cap, and the public `GET /` listing is O(entries).
+pub(crate) const MAX_FILE_COUNT: u64 = 10_000;
 
 /// Bytes the temp-name scheme (`.{name}.part-<tag8>`) adds around the name
 /// (see [`DropStore::temp_path`]).
@@ -231,9 +236,18 @@ fn sanitize_filename(raw: &str) -> Result<String, String> {
     Ok(raw.to_string())
 }
 
+/// Running usage under `root`, guarded by the same lock that serializes
+/// uploads (so both caps' check-then-write is atomic). Starts from a startup
+/// walk and only grows.
+#[derive(Default)]
+struct Usage {
+    bytes: u64,
+    files: u64,
+}
+
 /// Shared drop state: canonical upload root, token, per-upload cap, and the
-/// running stored-bytes total (guarded by the same lock that serializes
-/// uploads, so the cap's check-then-write is atomic).
+/// running usage (guarded by the same lock that serializes uploads, so the
+/// caps' check-then-write is atomic).
 pub(crate) struct DropStore {
     /// Canonicalised upload target — the confinement base and the only
     /// directory uploads ever write into.
@@ -243,20 +257,45 @@ pub(crate) struct DropStore {
     max_upload: usize,
     /// Total stored-bytes cap (`MAX_TOTAL_STORE` in production).
     total_cap: u64,
-    /// Bytes currently counted under `root`; upload-serialized. Starts from a
+    /// Stored-file count cap (`MAX_FILE_COUNT` in production).
+    file_cap: u64,
+    /// Usage currently counted under `root`; upload-serialized. Starts from a
     /// startup walk (see [`DropStore::open`]) and only grows.
-    used: Mutex<u64>,
+    used: Mutex<Usage>,
 }
 
 impl DropStore {
     /// Open (not create) `root` as an upload bucket: canonicalise it (the
     /// confinement base must be the REAL path), then measure existing content
-    /// so it counts against the total cap from the first upload.
+    /// so it counts against the caps from the first upload.
     pub(crate) fn open(
         root: &Path,
         token: String,
         max_upload: u64,
         total_cap: u64,
+    ) -> std::io::Result<Arc<Self>> {
+        Self::open_all(root, token, max_upload, total_cap, MAX_FILE_COUNT)
+    }
+
+    /// [`DropStore::open`] with an explicit file-count cap, so the count-cap
+    /// refusal is testable without ten thousand uploads.
+    #[cfg(test)]
+    fn open_with_file_cap(
+        root: &Path,
+        token: String,
+        max_upload: u64,
+        total_cap: u64,
+        file_cap: u64,
+    ) -> std::io::Result<Arc<Self>> {
+        Self::open_all(root, token, max_upload, total_cap, file_cap)
+    }
+
+    fn open_all(
+        root: &Path,
+        token: String,
+        max_upload: u64,
+        total_cap: u64,
+        file_cap: u64,
     ) -> std::io::Result<Arc<Self>> {
         let root = std::fs::canonicalize(root)?;
         let used = measure_dir(&root);
@@ -266,6 +305,7 @@ impl DropStore {
             token,
             max_upload,
             total_cap,
+            file_cap,
             used: Mutex::new(used),
         }))
     }
@@ -297,11 +337,11 @@ fn token_tag(token: &str) -> &str {
     &token[..end]
 }
 
-/// Sum the byte size of every regular file under `root`, best-effort.
-/// Symlinks are skipped (`file_type()` does not follow them): no cycles, and
-/// their targets consume no disk here.
-fn measure_dir(root: &Path) -> u64 {
-    let mut total = 0u64;
+/// Sum the byte size of, and count, every regular file under `root`,
+/// best-effort. Symlinks are skipped (`file_type()` does not follow them): no
+/// cycles, and their targets consume no disk here.
+fn measure_dir(root: &Path) -> Usage {
+    let mut used = Usage::default();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -316,17 +356,20 @@ fn measure_dir(root: &Path) -> u64 {
             if ft.is_dir() {
                 stack.push(path);
             } else if ft.is_file() {
-                total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                used.bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                used.files += 1;
             }
         }
     }
-    total
+    used
 }
 
 /// Failure modes of a store write, mapped to responses by the caller.
 enum StoreError {
     /// Past the total cap → 507.
     Full,
+    /// Past the file-count cap → 409.
+    FullCount,
     /// A directory entry with this name already exists → 409.
     Exists,
     /// Disk I/O failed → 500.
@@ -507,6 +550,11 @@ async fn upload(store: Arc<DropStore>, request: Request) -> Response {
             "the drop bucket is full (total-store cap reached); nothing was stored\n",
         )
             .into_response(),
+        Ok(Err(StoreError::FullCount)) => (
+            StatusCode::CONFLICT,
+            "the drop bucket is full (file-count cap reached); nothing was stored\n",
+        )
+            .into_response(),
         Ok(Err(StoreError::Exists)) => (
             StatusCode::CONFLICT,
             "a file with that name already exists; uploads never overwrite\n",
@@ -540,8 +588,11 @@ fn store_write(store: &DropStore, name: &str, bytes: &[u8]) -> Result<(), StoreE
         .used
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if *used + bytes.len() as u64 > store.total_cap {
+    if used.bytes + bytes.len() as u64 > store.total_cap {
         return Err(StoreError::Full);
+    }
+    if used.files >= store.file_cap {
+        return Err(StoreError::FullCount);
     }
     let tmp = store.temp_path(name);
     // Unlink any stale temp BEFORE the truncate-open: a crash between the
@@ -581,13 +632,15 @@ fn store_write(store: &DropStore, name: &str, bytes: &[u8]) -> Result<(), StoreE
     }
     match std::fs::remove_file(&tmp) {
         Ok(()) => {
-            *used += bytes.len() as u64;
+            used.bytes += bytes.len() as u64;
+            used.files += 1;
             Ok(())
         }
         // The upload IS stored; count it, log the stray temp (dot-prefixed,
         // invisible, over-counted at the next startup walk — conservative).
         Err(e) => {
-            *used += bytes.len() as u64;
+            used.bytes += bytes.len() as u64;
+            used.files += 1;
             tracing::warn!(%e, tmp = %tmp.display(), "stored the upload but could not remove the temp file");
             Ok(())
         }
@@ -1432,6 +1485,41 @@ mod tests {
         assert!(
             !store.root.join("over.bin").exists() && !store.temp_path("over.bin").exists(),
             "a 507 must leave no file and no temp"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_count_cap_returns_a_precise_409_and_stores_nothing() {
+        // The count cap bounds the O(entries) listing under the byte cap
+        // (0-byte uploads never fill the byte cap): a 409 with its own body,
+        // distinct from the name-collision 409, and nothing stored past it.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("pre1"), b"a").expect("seed 1");
+        std::fs::write(tmp.path().join("pre2"), b"b").expect("seed 2");
+        let store = DropStore::open_with_file_cap(
+            tmp.path(),
+            "tok-abc123".to_string(),
+            1024,
+            MAX_TOTAL_STORE,
+            2,
+        )
+        .expect("open store");
+        // The startup walk counted the two pre-existing files: the FIRST
+        // upload is already past the cap (manual deletions, like the byte
+        // cap's, need a restart to be credited).
+        let resp = router(store.clone())
+            .oneshot(req("POST", "/next.txt?token=tok-abc123", &[], b"x"))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = String::from_utf8(body_of(resp).await).expect("utf-8 body");
+        assert!(
+            body.contains("file-count") && !body.contains("already exists"),
+            "the 409 must name the count rule, not a collision: {body}"
+        );
+        assert!(
+            !store.root.join("next.txt").exists() && !store.temp_path("next.txt").exists(),
+            "a refused upload must leave no file and no temp"
         );
     }
 
