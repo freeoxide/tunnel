@@ -2138,6 +2138,50 @@ fn token_flags_read_the_ft_token_env() {
 }
 
 #[test]
+fn printing_commands_piped_to_head_exit_quietly() {
+    // Regression: Rust ignores SIGPIPE, so `ft logs <svc> | head` panicked
+    // with "failed printing to stdout: Broken pipe" (exit 101). Printing
+    // commands restore the default disposition, so the kernel kills the
+    // process silently once the pipe closes.
+    let dir = TempDir::new().unwrap();
+    seed_registry(
+        dir.path(),
+        &registry_json(4000000, false, Some("https://x.trycloudflare.com")),
+    );
+    // Both logs larger than the 64 KiB pipe buffer: writes are guaranteed to
+    // continue past `head -1` exiting, so the broken pipe is actually hit.
+    let svc = dir.path().join("freeoxide/tunnel/services/seed-svc");
+    fs::create_dir_all(&svc).unwrap();
+    let fat_line = format!("{}\n", "x".repeat(2048));
+    for log in ["tunnel.log", "worker.log"] {
+        let mut body = String::new();
+        while body.len() < 96 * 1024 {
+            body.push_str(&fat_line);
+        }
+        fs::write(svc.join(log), body).unwrap();
+    }
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg("\"$1\" logs seed-svc | head -1")
+        .arg("ft")
+        .arg(ft_bin())
+        .env("XDG_STATE_HOME", dir.path())
+        .env("RUST_LOG", "")
+        .output()
+        .expect("spawning the piped ft command");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("Broken pipe"),
+        "a printing command piped to head must not panic, stderr: {stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("--- tunnel ---"),
+        "head should have received the first line, stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
 fn proxy_takes_no_static_origin_flags() {
     // NEVER-ON-PROXY (hard exclusion, binary level): the static-origin flags
     // exist only on the implicit START, so `ft proxy` with any of them is a

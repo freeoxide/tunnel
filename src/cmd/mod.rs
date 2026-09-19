@@ -38,6 +38,24 @@ pub(crate) const POLL_TIMEOUT: Duration = Duration::from_secs(30);
 /// A `Some(command)` is matched to its handler; `None` falls through to the
 /// implicit START command with the positional directory (defaulting to `.`).
 pub async fn run(cli: Cli) -> Result<()> {
+    // Short-lived printing commands only. Serving paths (the implicit START,
+    // proxy/run/hook/drop, run-worker) must NEVER do this: a SigDfl server
+    // dies on the first client disconnect.
+    if matches!(
+        cli.command,
+        Some(
+            Command::Ls
+                | Command::Detail { .. }
+                | Command::Doctor
+                | Command::Kill { .. }
+                | Command::Logs { .. }
+                | Command::Open { .. }
+                | Command::Prune
+                | Command::Sanitize
+        )
+    ) {
+        crate::output::reset_sigpipe();
+    }
     match cli.command {
         Some(Command::Ls) => list::run().await,
         Some(Command::Detail { target }) => detail::run(target).await,

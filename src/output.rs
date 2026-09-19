@@ -11,6 +11,19 @@ use crate::model::{Service, ServiceKind};
 use chrono::{Datelike, Timelike};
 use comfy_table::{Cell, ContentArrangement, Table};
 
+/// Restore the default SIGPIPE disposition so a short-lived printing command
+/// piped to a consumer (`ft ls | head`) dies quietly on the broken pipe
+/// instead of panicking. NEVER call on a serving path (start/run/hook/drop/
+/// proxy, the worker): a SigDfl server dies on the first client disconnect.
+pub fn reset_sigpipe() {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{SigHandler, Signal, signal};
+        // Once, before any threads/tasks exist: no signal-safety concerns.
+        let _ = unsafe { signal(Signal::SIGPIPE, SigHandler::SigDfl) };
+    }
+}
+
 /// Format a timestamp as `YYYY-MM-DD HH:MM` (no seconds, no timezone suffix).
 fn fmt_started(service: &Service) -> String {
     let t = service.created_at;
