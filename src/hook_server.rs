@@ -463,9 +463,25 @@ async fn record(State(log): State<Arc<Mutex<HookLog>>>, request: Request) -> Res
     }
 }
 
+/// Take a point-in-time snapshot off the async worker thread. The record
+/// path holds this lock across persist's serialize + tmp write + rename
+/// (inside its own `spawn_blocking`), so an async-side `lock()` here could
+/// park a tokio worker for that entire window — the std::sync-in-async
+/// anti-pattern the record path already avoids; the inspect views must not
+/// reintroduce it. The closure only clones a Vec (infallible), so the
+/// JoinHandle error arm is structurally unreachable and degrades to an
+/// empty view rather than a 500, mirroring the static server's graceful
+/// `unwrap_or` handling of its blocking tasks.
+async fn snapshot_offline(log: &Arc<Mutex<HookLog>>) -> Vec<RecordedRequest> {
+    let log = Arc::clone(log);
+    tokio::task::spawn_blocking(move || lock(&log).snapshot())
+        .await
+        .unwrap_or_default()
+}
+
 /// `GET /__inspect` — the HTML inspection view, newest-first.
 async fn inspect_html(State(log): State<Arc<Mutex<HookLog>>>) -> Html<String> {
-    let requests = lock(&log).snapshot();
+    let requests = snapshot_offline(&log).await;
     Html(render_inspection(&requests))
 }
 
@@ -515,7 +531,7 @@ fn render_inspection(requests: &[RecordedRequest]) -> String {
 
 /// `GET /__inspect.json` — the records as a newest-first JSON array.
 async fn inspect_json(State(log): State<Arc<Mutex<HookLog>>>) -> Json<Vec<RecordedRequest>> {
-    Json(lock(&log).snapshot())
+    Json(snapshot_offline(&log).await)
 }
 
 #[cfg(test)]
