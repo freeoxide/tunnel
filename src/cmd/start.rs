@@ -148,7 +148,6 @@ pub(crate) fn is_sensitive_dir(dir: &Path) -> bool {
     home_overlapped || state_overlapped
 }
 
-/// Resolve a directory to an absolute, existing, readable path.
 pub(crate) fn resolve_dir(dir: &Path) -> Result<PathBuf> {
     let abs = std::path::absolute(dir)
         .with_context(|| format!("resolving directory {}", dir.display()))?;
@@ -170,8 +169,6 @@ fn is_readable(dir: &Path) -> bool {
     std::fs::read_dir(dir).is_ok()
 }
 
-/// Background flow: reserve the entry, spawn the detached worker, poll for
-/// the URL (failing fast if the worker dies first).
 async fn run_background(
     dir: &Path,
     name: Option<String>,

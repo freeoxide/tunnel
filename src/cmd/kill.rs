@@ -218,8 +218,8 @@ mod tests {
 
     #[test]
     fn recorded_entry_is_removed_immediately() {
-        // The pid already landed, so the M1 window is over — no grace applies
-        // and kill proceeds regardless of the entry's age.
+        // The pid already landed, so no start grace applies — kill proceeds
+        // regardless of the entry's age.
         let mut reg = reg_with(svc(false)); // worker_pid = 12345, created now
         assert!(matches!(
             plan_kill(&mut reg, "x"),
