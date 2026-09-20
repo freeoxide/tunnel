@@ -187,8 +187,6 @@ pub(crate) fn html_page(escaped_title: &str, escaped_body: &str) -> String {
     )
 }
 
-/// Title text for the listing, before HTML escaping: the request path, or `/`
-/// for the root.
 fn decoded_title(candidate: &Path, root: &Path) -> String {
     let rel = candidate.strip_prefix(root).unwrap_or(Path::new(""));
     if rel.as_os_str().is_empty() {
@@ -201,8 +199,6 @@ fn decoded_title(candidate: &Path, root: &Path) -> String {
     title
 }
 
-/// Entry-href prefix: the directory as an absolute percent-encoded path with
-/// a trailing `/`.
 fn href_base(candidate: &Path, root: &Path) -> String {
     let mut base = String::from("/");
     if let Ok(rel) = candidate.strip_prefix(root) {
@@ -456,8 +452,6 @@ fn tokens_match(provided: &str, expected: &str) -> bool {
     diff == 0
 }
 
-/// Bind `127.0.0.1:port` and serve until Ctrl-C (graceful drain);
-/// loopback-only — only the local cloudflared process should reach it.
 pub async fn serve(router: Router, port: u16) -> crate::error::Result<()> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
