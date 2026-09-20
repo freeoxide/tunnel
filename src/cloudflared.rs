@@ -86,9 +86,8 @@ pub fn is_tunnel_url(url: &str) -> bool {
 ///
 /// The child's `stdout` and `stderr` are piped; the caller is responsible
 /// for reading them line by line, applying [`extract_url`], and teeing the
-/// output to `tunnel.log`. `tunnel_log` is accepted for API symmetry but is
-/// not opened here so this function stays focused on spawning.
-pub fn spawn(port: u16, _tunnel_log: PathBuf) -> Result<Child> {
+/// output to `tunnel.log`.
+pub fn spawn(port: u16) -> Result<Child> {
     let cloudflared = ensure_installed()?;
 
     let mut cmd = Command::new(cloudflared);
@@ -102,33 +101,20 @@ pub fn spawn(port: u16, _tunnel_log: PathBuf) -> Result<Child> {
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::piped());
 
-    // cloudflared deliberately inherits the spawner's process group: in the
-    // worker flow it joins the worker's group so `kill(-worker_pid)` reaches it
-    // directly (even if the worker has already died and can no longer relay a
-    // signal), and in the foreground flow a terminal Ctrl+C reaches it along
-    // with `ft`. We do NOT `setsid()` here — that would orphan it on kill.
+    // cloudflared deliberately inherits the spawner's process group: the
+    // worker's group kill reaches it directly (even if the worker already died
+    // and cannot relay a signal), and a terminal Ctrl+C reaches it in the
+    // foreground flow. NO setsid() here — that would orphan it on kill.
 
-    // Best-effort: on Linux, ask the kernel to SIGKILL cloudflared if its
-    // parent (the worker) dies — even via SIGKILL or OOM — so we never leave
-    // an orphaned tunnel behind when the worker is killed abnormally while
-    // cloudflared is idle.
-    //
-    // There is an inherent fork→prctl window: if the worker is SIGKILL'd in
-    // that window the child has not installed PDEATHSIG yet, gets reparented to
-    // init (pid 1), and the signal would never fire. Close that race by
-    // re-checking getppid() after prctl and refusing to exec if we already lost
-    // the parent — spawn() then surfaces a normal error instead of an orphan.
+    // On Linux, PDEATHSIG asks the kernel to SIGKILL cloudflared if the worker
+    // dies — even via SIGKILL/OOM — so no orphaned tunnel remains. The hook
+    // (shared with the command-child spawn) re-checks getppid() after prctl to
+    // close the fork→prctl reparenting window, and surfaces a failed prctl
+    // instead of exec'ing without the death signal. See
+    // [`crate::proc::parent_death_signal`].
     #[cfg(target_os = "linux")]
     unsafe {
-        cmd.pre_exec(|| {
-            let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong);
-            if libc::getppid() == 1 {
-                return Err(std::io::Error::other(
-                    "parent died before prctl(PR_SET_PDEATHSIG); refusing to exec",
-                ));
-            }
-            Ok(())
-        });
+        cmd.pre_exec(crate::proc::parent_death_signal);
     }
 
     let child = cmd
@@ -137,18 +123,11 @@ pub fn spawn(port: u16, _tunnel_log: PathBuf) -> Result<Child> {
     Ok(child)
 }
 
-/// Shut down a `cloudflared` child this process owns, then reap it to avoid a
-/// transient zombie.
-///
-/// Shared by the detached worker ([`crate::worker`]) and the foreground flow
-/// ([`crate::cmd::start`]), which previously duplicated this sequence. On Unix
-/// we send a graceful SIGTERM (by pid, so it reaches the child even if the
-/// owned handle is not the kill vector on this platform) and escalate to
-/// SIGKILL after [`SHUTDOWN_GRACE`]; on Windows there is no signal/group
-/// teardown, so the owned tokio child is force-killed directly (the worker's
-/// Job Object would also reap it on the worker's own exit). Callers use this
-/// only on paths where cloudflared may still be alive — after `child.wait()`
-/// has already reaped it, there is nothing to do.
+/// Shut down a `cloudflared` child this process owns, then reap it (shared by
+/// the detached worker and the foreground flow). Unix: SIGTERM by pid, then
+/// SIGKILL after [`SHUTDOWN_GRACE`]. Windows: no signal/group teardown — the
+/// owned child is force-killed (the worker's Job Object reaps it on the
+/// worker's exit). No-op after `child.wait()` has already reaped it.
 pub async fn shutdown(tunnel_pid: Option<u32>, child: &mut Child) {
     #[cfg(unix)]
     {
@@ -171,8 +150,7 @@ pub async fn shutdown(tunnel_pid: Option<u32>, child: &mut Child) {
     }
     #[cfg(not(unix))]
     {
-        // No graceful signal path on Windows; force-kill the owned child. The
-        // pid is irrelevant here because the owned handle is the kill vector.
+        // No signal path on Windows; the owned handle is the kill vector.
         let _ = tunnel_pid;
         let _ = child.start_kill();
     }
@@ -225,9 +203,7 @@ mod tests {
 
     #[test]
     fn picks_trycloudflare_among_two_urls() {
-        // The first https:// is the tunnel URL; a later non-tunnel URL is
-        // present but never examined. extract_url scans left-to-right and
-        // returns as soon as it finds the trycloudflare host.
+        // Scans left-to-right, returns the first trycloudflare host.
         let line = "your tunnel: https://my-tunnel.trycloudflare.com  docs: https://developers.cloudflare.com/";
         assert_eq!(
             extract_url(line),
@@ -237,8 +213,7 @@ mod tests {
 
     #[test]
     fn skips_non_tunnel_url_before_tunnel_url() {
-        // A non-tunnel https:// precedes the trycloudflare URL on the same
-        // line. extract_url must skip it and return the later tunnel URL.
+        // A non-tunnel https:// before the tunnel URL is skipped.
         let line = "docs: https://developers.cloudflare.com/  tunnel: https://real-tunnel.trycloudflare.com";
         assert_eq!(
             extract_url(line),
@@ -248,9 +223,7 @@ mod tests {
 
     #[test]
     fn keeps_path_and_query_in_returned_url() {
-        // The host is what confine/is_tunnel_url validate, but extract_url must
-        // return the full URL (path + query intact), not a trimmed host-only
-        // value, since `ft open` hands it verbatim to the browser.
+        // `ft open` hands the URL verbatim to the browser: path + query stay.
         let line = "your tunnel: https://x.trycloudflare.com/foo?bar=1";
         assert_eq!(
             extract_url(line),
@@ -260,9 +233,7 @@ mod tests {
 
     #[test]
     fn uppercase_https_is_rejected() {
-        // Documents the case-sensitivity of the `https://` scan: cloudflared
-        // always emits lowercase, so an uppercase `HTTPS://` is deliberately
-        // not recognized (avoids accidentally matching prose like "HTTPS://").
+        // cloudflared always emits lowercase; prose must not match.
         assert_eq!(extract_url("HTTPS://x.trycloudflare.com"), None);
     }
 
@@ -274,9 +245,7 @@ mod tests {
 
     #[test]
     fn picks_tunnel_when_non_tunnel_url_comes_after() {
-        // Complements `picks_trycloudflare_among_two_urls` (tunnel first) by
-        // exercising the same scan with the non-tunnel URL *after* the tunnel
-        // URL — the loop must not get distracted by the trailing candidate.
+        // The trailing non-tunnel candidate must not distract the scan.
         let line = "tunnel: https://real-tunnel.trycloudflare.com  docs: https://developers.cloudflare.com/";
         assert_eq!(
             extract_url(line),

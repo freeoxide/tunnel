@@ -30,3 +30,6 @@ target
 
 # ZCode workflow orchestration state (session scratch, never committed)
 .z-workflow/
+
+# ZCode proflow orchestration state (session scratch, never committed)
+/.z-proflow/

@@ -14,16 +14,33 @@ use fs2::FileExt;
 use std::fs::OpenOptions;
 use std::io::Write;
 
-/// An advisory lock on the registry, released on drop.
-///
-/// `fs2` grants a cross-platform exclusive lock — `flock(LOCK_EX)` on Unix and
-/// `LockFileEx` on Windows — bound to this file handle. Both OSes release the
-/// lock automatically when the handle is closed, so dropping this guard (which
-/// drops and closes the file) frees it without an explicit unlock call. Calling
-/// `fs2::FileExt::unlock` directly trips a `clippy::incompatible_msrv` false
-/// positive that misattributes the trait method to the std library, so we rely
-/// on close-on-drop instead.
+/// An advisory lock on the registry, released on drop. `fs2` grants a
+/// cross-platform exclusive lock (flock/LOCK_EX, LockFileEx) bound to this
+/// file handle; both OSes release it when the handle closes, so drop frees it
+/// without an explicit unlock (calling `fs2::FileExt::unlock` trips a
+/// `clippy::incompatible_msrv` false positive).
 struct RegistryLock(#[allow(dead_code)] std::fs::File);
+
+/// Hard upper bound on a persisted registry blob we are willing to read: the
+/// registry is a small operator-owned JSON document, so anything past this
+/// bound is corruption (e.g. a log redirected over `registry.json`), and
+/// bounding the READ itself stops a multi-GB stray file being slurped whole
+/// before the parser rejects it.
+const MAX_REGISTRY_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read a persisted registry blob with the hard size bound above: at most
+/// `MAX_REGISTRY_BYTES + 1` bytes are ever read (the +1 lets callers tell
+/// "at the bound" from "past it" by length alone). Returns `None` when the
+/// file is missing or unreadable, mirroring plain `std::fs::read(path).ok()`.
+fn read_registry_blob(path: &std::path::Path) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_REGISTRY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    Some(bytes)
+}
 
 fn acquire_lock(state: &StateDir) -> Result<RegistryLock> {
     let path = state.lock_path();
@@ -73,25 +90,31 @@ fn seal_private_file(path: &std::path::Path) {
 impl Registry {
     /// Load the registry, returning an empty one if it does not yet exist.
     ///
-    /// Cleans up any `registry.json.tmp` left by a crash between the temp write
-    /// and the rename, validates the parsed content (healing `next_id` and
-    /// rejecting clearly-broken entries), and falls back to `registry.json.bak`
-    /// if the live file is missing or unparseable — so a botched commit can no
-    /// longer brick the whole CLI.
+    /// Cleans up any orphan `registry.json.tmp` (under the lock, in
+    /// `acquire_lock`), validates the parsed content, and falls back to
+    /// `registry.json.bak` if the live file is missing or unparseable — so a
+    /// botched commit cannot brick the whole CLI.
     pub fn load(state: &StateDir) -> Result<Registry> {
         let path = state.registry_path();
-        // NOTE: orphan `registry.json.tmp` cleanup is performed under the lock
-        // in `acquire_lock`, not here — `load` is also called by unlocked
-        // read-only commands, which must not race a concurrent writer's temp.
+        // NOTE: orphan-tmp cleanup lives in `acquire_lock`, not here — `load`
+        // is also called by unlocked read-only commands, which must not race a
+        // concurrent writer's temp.
 
-        if let Some(bytes) = std::fs::read(&path).ok()
+        if let Some(bytes) = read_registry_blob(&path)
             && !bytes.iter().all(u8::is_ascii_whitespace)
         {
-            let parsed = Registry::parse(&bytes);
-            // Whether or not it parsed, the live file exists and is readable:
-            // best-effort re-seal it to 0600 so a registry created by an older
-            // build (pre-0600) or hand-edited under a loose umask (0644) is
-            // healed on read, mirroring the directory re-seal in StateDir::ensure.
+            // Oversized = corruption: route it through the same recovery as a
+            // parse failure (backup, else a loud error), never the missing-file
+            // path — a stray huge file must not yield a silent fresh default.
+            let parsed = if bytes.len() > MAX_REGISTRY_BYTES as usize {
+                Err(anyhow::anyhow!(
+                    "blob is larger than the {MAX_REGISTRY_BYTES}-byte safety bound"
+                ))
+            } else {
+                Registry::parse(&bytes)
+            };
+            // Best-effort re-seal to 0600: heal a pre-0600 build's or a loose
+            // umask's registry on read (mirrors StateDir::ensure's dir re-seal).
             seal_private_file(&path);
             return match parsed {
                 Ok(reg) => Ok(reg),
@@ -118,8 +141,8 @@ impl Registry {
     /// missing or corrupt. Returns `None` if there is no usable backup.
     fn load_backup(state: &StateDir) -> Option<Registry> {
         let bak = state.registry_path().with_extension("json.bak");
-        let bytes = std::fs::read(&bak).ok()?;
-        if bytes.iter().all(u8::is_ascii_whitespace) {
+        let bytes = read_registry_blob(&bak)?;
+        if bytes.len() > MAX_REGISTRY_BYTES as usize || bytes.iter().all(u8::is_ascii_whitespace) {
             return None;
         }
         let parsed = Registry::parse(&bytes).ok()?;
@@ -129,19 +152,15 @@ impl Registry {
         Some(parsed)
     }
 
-    /// Atomically and durably persist the registry:
-    ///
-    /// 1. write a mode-0600 temp file and `fsync` it;
-    /// 2. best-effort promote the *previous* registry to `registry.json.bak` —
-    ///    but only if the on-disk bytes still parse+validate, so the backup is a
-    ///    known-good recovery point rather than a byte copy of tampered content;
-    /// 3. atomically rename temp → `registry.json`;
-    /// 4. `fsync` the parent directory so the rename survives power loss.
+    /// Atomically and durably persist the registry: write a 0600 temp + fsync,
+    /// promote the previous blob to `.bak` (only if it parses+validates, so the
+    /// backup stays a known-good recovery point), rename temp → live, fsync the
+    /// parent dir.
     pub fn save(&self, state: &StateDir) -> Result<()> {
         let path = state.registry_path();
         let tmp = path.with_extension("json.tmp");
-        // Compact encoding: registry.json is operator-readable via `ft detail`/`ft ls`,
-        // not by eye, so the 2-3x size/encode overhead of pretty-print is waste.
+        // Compact encoding: registry.json is read via `ft detail`/`ft ls`, not
+        // by eye, so pretty-print's 2-3x overhead is waste.
         let data = serde_json::to_vec(self).context("encoding registry")?;
         {
             let mut opts = OpenOptions::new();
@@ -155,16 +174,25 @@ impl Registry {
             file.sync_all()
                 .with_context(|| format!("fsyncing registry temp file {}", tmp.display()))?;
         }
-        // Recovery snapshot of the previous registry (copy, not rename, so the
-        // live file stays in place right up to the atomic replace below). Only
-        // promote it to `.bak` if it parses+validates: if a previous save or a
-        // hand-edit left semantically broken content on disk, keep the existing
-        // good backup instead of overwriting it with garbage.
-        if let Ok(prev) = std::fs::read(&path)
+        // Copy (not rename) the previous blob to `.bak` only if it
+        // parses+validates, so tampered content never overwrites a good backup.
+        if let Some(prev) = read_registry_blob(&path)
+            && prev.len() <= MAX_REGISTRY_BYTES as usize
             && !prev.iter().all(u8::is_ascii_whitespace)
             && Registry::parse(&prev).is_ok()
         {
-            let _ = std::fs::write(path.with_extension("json.bak"), prev);
+            // Owner-only like every other registry write: the .bak can carry
+            // static_flags token secrets (defense-in-depth atop the 0700 root).
+            let mut opts = OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            fsutil::apply_private_mode(&mut opts);
+            // Best-effort, like the fs::write it replaces.
+            if let Ok(mut file) = opts.open(path.with_extension("json.bak")) {
+                let _ = file.write_all(&prev);
+            }
+            // mode(0o600) applies only at creation — re-seal a legacy .bak
+            // that a pre-fix build left at umask-default 0644.
+            seal_private_file(&path.with_extension("json.bak"));
         }
         std::fs::rename(&tmp, &path)
             .with_context(|| format!("committing registry {}", path.display()))?;
@@ -173,16 +201,11 @@ impl Registry {
         Ok(())
     }
 
-    /// Sanity-check a loaded registry, healing `next_id` so future allocations
-    /// stay monotonic. Rejects clearly-broken state (reserved id 0, duplicate
-    /// ids/names, empty names, reserved port 0) that would otherwise cause
-    /// confusing behavior downstream.
-    ///
-    /// Kind/dir consistency is enforced strictly: a `Static` service is
-    /// defined by the directory it serves, and a `Proxy` service by the
-    /// upstream port it fronts — a `dir` on a proxy entry (or its absence on
-    /// a static entry) means the file was hand-edited into a shape no code
-    /// path would ever produce, so reject rather than guess.
+    /// Sanity-check a loaded registry: heal `next_id` past the highest id, and
+    /// reject clearly-broken state (reserved id 0, duplicate ids/names, empty
+    /// names, reserved port 0). Kind/dir consistency is strict — a `dir` on a
+    /// proxy entry (or its absence on a static one) is a hand-edited shape no
+    /// code path produces, so reject rather than guess.
     pub fn validate(&mut self) -> Result<()> {
         let mut ids = std::collections::HashSet::new();
         let mut names = std::collections::HashSet::new();
@@ -199,9 +222,8 @@ impl Registry {
             if !names.insert(s.name.as_str()) {
                 anyhow::bail!("duplicate service name {:?}", s.name);
             }
-            // Applies to both kinds: a Static service binds this port with
-            // its own server, a Proxy service fronts the operator's server
-            // on it — either way 0 means the entry is unusable.
+            // 0 is unusable for both kinds: Static binds it, Proxy fronts the
+            // operator's server on it.
             if s.port == 0 {
                 anyhow::bail!("service {:?} has reserved port 0", s.name);
             }
@@ -337,19 +359,16 @@ mod tests {
 
     #[test]
     fn find_all_digit_target_matches_id_not_name() {
-        // An all-digit target must resolve as an ID, never as a same-named service.
+        // An all-digit target always resolves as an ID, never as a name.
         let mut reg = Registry::default();
         reg.services.push(dummy_service(1, "111"));
         reg.services.push(dummy_service(42, "real"));
-        // Target "1" parses as ID 1; it must not match the service *named* "111".
         let found = reg.find("1").expect("id 1 should resolve");
         assert_eq!(found.id, 1);
         assert_eq!(found.name, "111");
-        // Conversely, "42" is the ID of "real", not a name lookup.
         let found = reg.find("42").expect("id 42 should resolve");
         assert_eq!(found.id, 42);
         assert_eq!(found.name, "real");
-        // "111" parses as ID 111, which doesn't exist (it is NOT a name lookup).
         assert!(reg.find("111").is_none());
     }
 
@@ -468,9 +487,8 @@ mod tests {
 
     #[test]
     fn load_does_not_remove_orphan_tmp() {
-        // SR-2: an unlocked read (Registry::load) must NOT delete a writer's
-        // in-flight registry.json.tmp, or a concurrent reader could fail the
-        // writer's commit. Only acquire_lock (under the exclusive flock) cleans it.
+        // An unlocked read must not delete a writer's in-flight tmp; only
+        // acquire_lock (under the flock) cleans it.
         use crate::state::StateDir;
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::new_at(tmp.path().join("ft-state"));
@@ -544,8 +562,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_proxy_on_reserved_port() {
-        // port != 0 applies to both kinds: for a proxy, `port` IS the
-        // operator's upstream port, and 0 is just as unusable there.
+        // For a proxy, `port` IS the operator's upstream port; 0 is unusable.
         let mut s = dummy_proxy_service(1, "a");
         s.port = 0;
         let mut reg = Registry {
@@ -585,9 +602,7 @@ mod tests {
 
     #[test]
     fn parse_rejects_proxy_entry_with_dir() {
-        // Back-compat must not become a silent pass-through for nonsense:
-        // validate runs inside parse, so a tagged-proxy entry carrying a
-        // directory is rejected at load time, not mid-command later.
+        // validate runs inside parse, so nonsense is rejected at load time.
         let json = r#"{
                 "next_id": 2,
                 "services": [
@@ -610,7 +625,7 @@ mod tests {
         assert!(Registry::parse(json.as_bytes()).is_err());
     }
 
-    // --- TC-8: save→load data-integrity round-trip + corrupt recovery ---------
+    // --- save→load data-integrity round-trip + corrupt recovery --------------
 
     /// Build a fully-populated Service with every field set to a non-default
     /// value, so a round-trip can prove each one survives serde + the atomic
@@ -637,10 +652,8 @@ mod tests {
 
     #[test]
     fn save_load_preserves_all_fields() {
-        // Exercises every serialization-relevant field of Service/Registry
-        // through save()'s full path (temp fsync + .bak promotion + rename +
-        // parent-dir fsync). A field made non-serializable by a refactor, or a
-        // .bak copy that interfered with the commit, would fail here.
+        // Every serialization-relevant field through save()'s full path (temp
+        // fsync + .bak promotion + rename + parent-dir fsync).
         use crate::state::StateDir;
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::new_at(tmp.path().join("ft-state"));
@@ -698,17 +711,64 @@ mod tests {
     }
 
     #[test]
+    fn save_promotes_the_previous_blob_to_an_owner_only_bak() {
+        // Regression: the .bak used to be written with umask-default mode
+        // (typically 0644); it can carry static_flags token secrets.
+        #[cfg(unix)]
+        {
+            use crate::state::StateDir;
+            use std::os::unix::fs::PermissionsExt;
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = StateDir::new_at(tmp.path().join("ft-state"));
+            state.ensure().expect("ensure");
+
+            let first = Registry {
+                next_id: 43,
+                services: vec![fully_populated_service()],
+            };
+            first.save(&state).expect("first save");
+            let second = Registry {
+                next_id: 44,
+                services: Vec::new(),
+            };
+            second
+                .save(&state)
+                .expect("second save promotes the first blob");
+
+            let bak = state.registry_path().with_extension("json.bak");
+            let mode = std::fs::metadata(&bak)
+                .expect("a valid previous blob must have been promoted")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "the .bak must be owner-only");
+
+            // Legacy trees: a pre-existing 0644 .bak (the creation-time mode
+            // never applies to it) must be healed by the next promotion.
+            std::fs::set_permissions(&bak, std::fs::Permissions::from_mode(0o644))
+                .expect("widen the .bak to a legacy mode");
+            Registry::default()
+                .save(&state)
+                .expect("third save re-promotes the second blob");
+            let mode = std::fs::metadata(&bak)
+                .expect("the .bak must still exist")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "a legacy 0644 .bak must be re-sealed");
+        }
+    }
+
+    #[test]
     fn load_falls_back_to_backup_when_live_corrupt() {
-        // A corrupted (unparseable) live registry.json must fall back to a valid
-        // registry.json.bak — load() recovers rather than erroring the whole CLI.
+        // A corrupted live registry.json falls back to a valid .bak instead of
+        // erroring the whole CLI.
         use crate::state::StateDir;
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::new_at(tmp.path().join("ft-state"));
         state.ensure().expect("ensure");
 
-        // Seed a known-good registry, then snapshot it as the backup. next_id must
-        // be consistent with the service id (>= max+1) or validate() heals it on
-        // load, which would make this a test of healing, not of backup fallback.
+        // Seed a known-good registry, then snapshot it as the backup. next_id
+        // must be consistent with the service id, or validate() would heal it
+        // on load and this would test healing, not fallback.
         let good = Registry {
             next_id: 43,
             services: vec![fully_populated_service()],
@@ -727,9 +787,7 @@ mod tests {
 
     #[test]
     fn load_returns_err_when_both_live_and_backup_corrupt() {
-        // When neither the live file nor the backup parses, load() must surface
-        // an error (not panic, and not silently yield a fresh empty registry —
-        // the corruption is real and the operator should be told).
+        // Neither file parses: error, never a silent fresh default.
         use crate::state::StateDir;
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::new_at(tmp.path().join("ft-state"));
@@ -746,6 +804,27 @@ mod tests {
         assert!(
             res.is_err(),
             "both-corrupt must error, not silently default"
+        );
+    }
+
+    #[test]
+    fn load_treats_oversized_registry_as_corruption() {
+        // A stray huge file over registry.json is corruption: corrupt-file
+        // recovery (loud error here, backup fallback if one exists), never a
+        // silent fresh default over real state.
+        use crate::state::StateDir;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::new_at(tmp.path().join("ft-state"));
+        state.ensure().expect("ensure");
+        std::fs::write(
+            state.registry_path(),
+            vec![b'x'; super::MAX_REGISTRY_BYTES as usize + 1],
+        )
+        .expect("oversized live");
+        let res = Registry::load(&state);
+        assert!(
+            res.is_err(),
+            "oversized live file with no backup must error, not default"
         );
     }
 }

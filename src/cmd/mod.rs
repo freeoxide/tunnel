@@ -20,16 +20,45 @@ pub mod sanitize;
 pub mod start;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Result;
 
 use crate::cli::{Cli, Command};
+
+/// Poll cadence while a parent waits for a worker to publish the public URL.
+/// Shared by the START/PROXY/RUN/HOOK background flows.
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Upper bound on how long a parent waits for the tunnel URL. Dev servers
+/// can be slow to boot, so this is generous (30 s).
+pub(crate) const POLL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Origin-probe connect timeout, shared by doctor's blocking probe and run's
+/// async twin. A loopback connect resolves instantly; nothing is ever read.
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Dispatch the parsed CLI to the matching command.
 ///
 /// A `Some(command)` is matched to its handler; `None` falls through to the
 /// implicit START command with the positional directory (defaulting to `.`).
 pub async fn run(cli: Cli) -> Result<()> {
+    // Short-lived printing commands only. Serving paths (the implicit START,
+    // proxy/run/hook/drop, run-worker) must NEVER do this: a SigDfl server
+    // dies on the first client disconnect.
+    if matches!(
+        cli.command,
+        Some(
+            Command::Ls
+                | Command::Detail { .. }
+                | Command::Doctor
+                | Command::Kill { .. }
+                | Command::Logs { .. }
+                | Command::Open { .. }
+                | Command::Prune
+                | Command::Sanitize
+        )
+    ) {
+        crate::output::reset_sigpipe();
+    }
     match cli.command {
         Some(Command::Ls) => list::run().await,
         Some(Command::Detail { target }) => detail::run(target).await,

@@ -1,94 +1,36 @@
-//! Upload-receiver origin ("drop bucket") for `ft drop <dir>`.
+//! Upload-receiver origin ("drop bucket") for `ft drop <dir>`: a
+//! loopback-only origin behind cloudflared that stores uploads into a local
+//! directory and serves the stored files back.
 //!
-//! Serves an ft-owned HTTP origin on the loopback interface that accepts file
-//! uploads into a local directory and serves the stored files back. Like the
-//! static server and the hook origin, it is an ORIGIN — the public surface is
-//! still only cloudflared, and this server is bound to `127.0.0.1` behind it.
-//!
-//! # API surface
-//!
-//! - `POST /<name>` / `PUT /<name>` — store the request's RAW body as `<name>`.
-//! - `POST /?filename=<name>` — the same, with the name carried as a query
-//!   parameter (useful for clients that cannot put the name in the path). A
-//!   non-root path AND a `?filename=` together are a 400: one name, one place.
-//!   Query/path names are percent-decoded; a literal `+` in a query value
-//!   means a plus (the form-encoding space convention is not applied).
-//! - `GET`/`HEAD /<name>` — serve a stored file back. Reads are PUBLIC: the
-//!   token gates mutations only, matching the static origin's model (whatever
-//!   the operator drops into a published bucket is readable by anyone holding
-//!   the tunnel URL). `GET /` renders an HTML listing (same page scaffold as
-//!   the static listing) that documents the upload shape.
-//! - Any other method with a valid token falls through to ServeDir's 405 —
-//!   there is deliberately no delete/move API (a public tunnel endpoint that
-//!   destroys operator files would be the opposite of conservative).
-//!
-//! Multipart bodies are NOT parsed (no such dependency, per the area brief):
-//! a multipart request stores its raw capped bytes as the file, exactly the
-//! A3 hook precedent for opaque bodies. Send raw bodies (`curl
-//! --data-binary`/`-T`) instead.
-//!
-//! # Token auth (mutations only)
-//!
-//! Every non-GET/HEAD request MUST present the access token via
-//! `Authorization: Bearer <token>` or `?token=<token>`; anything else is
-//! answered 401 before the body is read. The comparison is constant-time
-//! (XOR fold — see [`tokens_match`]). When `ft drop` is started without
-//! `--token`, one is generated from the OS CSPRNG ([`generate_token`]),
-//! printed once at start, stored in the service's private state dir
-//! ([`store_token`]), and shown by `ft detail`.
-//!
-//! # Caps
-//!
-//! - Per-upload: [`DropStore::max_upload`] bytes (CLI `--max-size`, default
-//!   [`DEFAULT_MAX_SIZE`]). Enforced twice, per the hook's 413 convention:
-//!   declared Content-Length oversize is pre-rejected 413 by the
-//!   [`RequestBodyLimitLayer`] before the handler; a chunked over-cap body
-//!   surfaces as a read error in the handler, which answers 413 too.
-//! - Total store: [`MAX_TOTAL_STORE`] bytes of content under the target dir
-//!   (fixed, not configurable). An upload that would exceed it is answered
-//!   507 and nothing is written. The counter starts from a startup walk of
-//!   the directory and only grows afterwards — operator deletions by hand
-//!   take a restart to be credited, which is the conservative direction.
-//!
-//! # Filename policy (reject, never mangle)
-//!
-//! An upload name that violates any rule of [`sanitize_filename`] is rejected
-//! with 400 naming the rule — mangling (A3-recorded-body style tolerance)
-//! would silently write a file the uploader cannot find and cannot predict,
-//! so rejection is the honest contract. Rules: non-empty, no `/` or `\`, no
-//! leading `.` (no dotfiles, no `..`), no control characters, no trailing
-//! `.` or space, at most [`MAX_NAME_BYTES`] bytes, and no Windows device
-//! names (a name that would fail to store on a Windows host is refused on
-//! every host, so scripts stay portable). Existing files are never clobbered:
-//! a name collision is a 409.
-//!
-//! # Confinement and write discipline
-//!
-//! The read side reuses the static server's [`crate::static_server::confine`]
-//! guard verbatim (dotfiles denied, `..` rejected, symlink escape refused)
-//! in front of the same `ServeDir` service, so `ft drop`'s GET behaviour is
-//! exactly `ft <dir>`'s. The write side only ever creates REGULAR files with
-//! sanitized single-segment names under the canonical root: bytes land in a
-//! token-scoped dot-prefixed `.name.part-<token8>` temp file (invisible to
-//! both the upload API and the GET side, and unique per SERVICE so two
-//! origins on one directory can never share a temp) written with private
-//! permissions, then published with a collision-checked `hard_link` +
-//! unlink — a create that fails rather than overwrites when the name exists,
-//! cross-process, so the never-clobber guarantee survives even a hand-edited
-//! registry running two origins on one bucket. A pre-existing directory
-//! entry — including a symlink — makes the upload a 409, so an upload can
-//! never follow a link out of the bucket. Uploads are serialized behind the
-//! store's lock, which also makes the total-cap check-then-write atomic.
-//! (The CLI additionally REFUSES to start a second drop service on a
-//! directory that is already a drop target — see `cmd::drop`'s pre-flight —
-//! so the per-service 1 GiB cap is also a per-DIRECTORY guarantee for
-//! ft-managed services.) The hard-link publish requires hard-link support
-//! from the bucket's filesystem (every mainstream local choice has it;
-//! FAT/exFAT does not): a filesystem without it surfaces as a loud 500 at
-//! the first upload rather than a silent weakening of the no-clobber rule.
-//! Like the hook origin there is deliberately NO
-//! TraceLayer: drop workers get no `server.log` sink (request traces would be
-//! discarded), and the store's own files are the record of what arrived.
+//! - `POST`/`PUT /<name>` or `POST /?filename=<name>` — store the RAW body
+//!   (multipart is never parsed; it stores as opaque bytes, like the hook
+//!   origin). Names are percent-decoded; `+` is a literal plus. Giving the
+//!   name in both the path and `?filename=` is a 400.
+//! - `GET`/`HEAD /<name>` — serve a stored file; reads are PUBLIC (the token
+//!   gates mutations only, the static origin's model). `GET /` lists the
+//!   bucket. Other methods hit ServeDir's 405 — there is no delete/move API.
+//! - Non-GET/HEAD requests must present the token (`Authorization: Bearer` or
+//!   `?token=`) BEFORE the body is read, else 401; the compare is
+//!   constant-time ([`tokens_match`]).
+//! - Caps: per-upload `--max-size` (the limit layer 413s a declared oversize;
+//!   the handler's bounded read 413s a chunked one), a fixed 1 GiB total
+//!   ([`MAX_TOTAL_STORE`], 507), and a fixed file count ([`MAX_FILE_COUNT`],
+//!   409) — all counted from a startup walk; manual deletions need a restart
+//!   to be credited.
+//! - Names are REJECTED, never mangled ([`sanitize_filename`], a 400 naming
+//!   the rule); a collision with an existing name is a 409.
+//! - Reads go through [`crate::static_server::confine`] verbatim in front of
+//!   the same ServeDir, so GET behaves like `ft <dir>`. Writes only create
+//!   regular files: bytes land in a private, dot-prefixed, token-scoped temp
+//!   (`.name.part-<tag8>`, invisible to the API from both sides), published
+//!   with a collision-checked `hard_link` + unlink — a create that fails
+//!   rather than overwrites, cross-process. A pre-existing entry (even a
+//!   symlink) is a 409, so an upload never follows a link out of the bucket.
+//!   The store lock serializes uploads and makes the total-cap's
+//!   check-then-write atomic; `cmd::drop` additionally refuses two drop
+//!   services on one directory. Hard-link-less filesystems (FAT/exFAT)
+//!   surface as a loud 500, never a silent no-clobber weakening. No
+//!   TraceLayer: drop workers get no server.log sink.
 
 use std::fmt::Write as _;
 use std::io::Write;
@@ -109,48 +51,43 @@ use tower_http::timeout::TimeoutLayer;
 
 use crate::static_server::{confine, encode_href, escape_html, html_page};
 
-/// Hard upper bound on any single request. Generous on purpose — uploads are
-/// whole files, not webhook payloads — but still bounded so a stalled public
-/// client cannot pin a connection forever (the timeout bounds both the
-/// request and the worker's graceful drain).
+/// Hard upper bound on any single request: bounds stalled public clients and
+/// the worker's graceful drain alike.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Default per-upload cap (`--max-size` when omitted): large enough for
-/// realistic dev-artifact drops, small enough that one request cannot fill a
-/// disk. The CLI accepts up to [`MAX_TOTAL_STORE`].
+/// Default per-upload cap (`--max-size` when omitted).
 pub(crate) const DEFAULT_MAX_SIZE: u64 = 64 * 1024 * 1024;
 
-/// Fixed total cap on stored content under the bucket (per service). Fixed —
-/// not another flag — so the "strict caps" promise has exactly one knob and
-/// the worst-case disk footprint of any drop service is a documented constant.
+/// Fixed total cap on stored content under the bucket (per service): the
+/// "strict caps" promise keeps exactly one knob, so the worst-case disk
+/// footprint is a documented constant.
 pub(crate) const MAX_TOTAL_STORE: u64 = 1024 * 1024 * 1024;
 
-/// Extra bytes the publish path's temp-name scheme (`.{name}.part-<tag8>`)
-/// adds around the name: the leading dot, the `.part-` marker, and the ≤ 8
-/// byte token tag (see [`DropStore::temp_path`]).
+/// Fixed cap on stored FILE count under the byte cap: 0-byte uploads never
+/// fill the byte cap, and the public `GET /` listing is O(entries).
+pub(crate) const MAX_FILE_COUNT: u64 = 10_000;
+
+/// Bytes the temp-name scheme (`.{name}.part-<tag8>`) adds around the name
+/// (see [`DropStore::temp_path`]).
 const TEMP_NAME_OVERHEAD: usize = 1 + ".part-".len() + 8;
 
-/// Longest upload name accepted. This is a BUDGET, not the raw filesystem
-/// limit: the common NAME_MAX across the filesystems this tool targets is 255
-/// bytes, but a name is stored as the dot-prefixed temp file FIRST (see
-/// [`TEMP_NAME_OVERHEAD`]), so a name near 255 B would hit ENAMETOOLONG at the
-/// temp open inside `spawn_blocking` and surface as a generic 500 — even
-/// though the final name would have fit. Capping at 255 minus the exact temp
-/// overhead means every name that passes [`sanitize_filename`] stores cleanly
-/// on any of those filesystems (the publish path itself is never the thing
-/// that fails).
+/// Longest upload name accepted. A BUDGET, not NAME_MAX: names are stored as
+/// the longer dot-prefixed temp FIRST, so capping at 255 minus the exact temp
+/// overhead means every accepted name stores cleanly on 255-byte-NAME_MAX
+/// filesystems (the publish path itself never fails).
 const MAX_NAME_BYTES: usize = 255 - TEMP_NAME_OVERHEAD;
 
-/// Name of the file (inside the service's private state dir) holding the
-/// drop origin's access token — the same value printed once at start and
-/// shown by `ft detail`. 0600 via [`crate::fsutil`], like the logs.
-pub(crate) const TOKEN_FILENAME: &str = "drop-token";
+/// Name of the 0600 file (inside the service's state dir) holding the drop
+/// origin's access token, shown by `ft detail`.
+const TOKEN_FILENAME: &str = "drop-token";
 
-/// Generate a fresh access token from the OS CSPRNG: 32 random bytes rendered
-/// as 64 lowercase hex chars. There is deliberately NO weak fallback (time-
-/// or pid-mixed values): the token is the only thing standing between the
-/// public tunnel and arbitrary writes into the operator's directory, so if
-/// the OS entropy source is unavailable, starting the origin must fail.
+/// Hard bound on a token-file read: minted tokens are 65 bytes; anything this
+/// large is not a token (see [`read_token`]).
+const TOKEN_READ_BOUND: u64 = 4096;
+
+/// Mint an access token: 32 OS-CSPRNG bytes as 64 lowercase hex chars. No
+/// weak fallback — the token is the only guard between the public tunnel and
+/// arbitrary writes, so an unavailable entropy source must fail the start.
 pub(crate) fn generate_token() -> std::io::Result<String> {
     let mut bytes = [0u8; 32];
     fill_random(&mut bytes)?;
@@ -161,12 +98,8 @@ pub(crate) fn generate_token() -> std::io::Result<String> {
     Ok(token)
 }
 
-/// Fill `buf` from the operating system's cryptographic RNG.
-///
-/// - Unix: `/dev/urandom` (the OS CSPRNG on every platform this crate ships
-///   for, macOS included).
-/// - Windows: `BCryptGenRandom` with the system-preferred RNG — the same
-///   primitive std's own hashmap-seeding entropy uses.
+/// Fill `buf` from the OS CSPRNG: /dev/urandom on Unix,
+/// BCryptGenRandom (system-preferred RNG) on Windows.
 fn fill_random(buf: &mut [u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -175,16 +108,13 @@ fn fill_random(buf: &mut [u8]) -> std::io::Result<()> {
     }
     #[cfg(windows)]
     {
-        // The `Win32_Security_Cryptography` feature gate on windows-sys (see
-        // Cargo.toml) exposes these bindings; `BCRYPTGENRANDOM_FLAGS` is a
-        // plain `u32` type alias in windows-sys 0.59 (not a newtype), so the
-        // flag const below passes as a bare u32.
         use windows_sys::Win32::Security::Cryptography::{
             BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
         };
+        // BCRYPTGENRANDOM_FLAGS is a plain u32 alias in windows-sys 0.59;
+        // the algorithm handle is unused with the system-preferred flag.
         let status = unsafe {
             BCryptGenRandom(
-                // Algorithm handle unused with the system-preferred-RNG flag.
                 std::ptr::null_mut(),
                 buf.as_mut_ptr(),
                 buf.len() as u32,
@@ -209,17 +139,12 @@ fn fill_random(buf: &mut [u8]) -> std::io::Result<()> {
     }
 }
 
-/// Constant-time token comparison: the decision folds XOR over every byte AND
-/// the length difference into one accumulator, so it never early-returns on
-/// the first mismatching byte — or on a length mismatch. The drop token is not
-/// necessarily the fixed-length hex minted by [`generate_token`]: the operator
-/// may pass an arbitrary `--token`, whose length is worth not advertising (the
-/// static origin's `static_server::tokens_match` twin folds the same way —
-/// keep the two in sync). The total work still scales with the longer input,
-/// so a length *class* is inferable from timing, as with any looped compare.
-/// An empty expected token matches nothing: an empty secret must never open
-/// the bucket (the CLI refuses one; this is the server-side backstop for a
-/// hand-built store).
+/// Constant-time token comparison: folds XOR over every byte AND the length
+/// difference into one accumulator — no early return on a mismatch, length
+/// included (an operator `--token`'s length is worth not advertising; only a
+/// length CLASS leaks, as with any looped compare). Byte-in-sync twin of
+/// `static_server::tokens_match` — keep the two in sync. An empty expected
+/// token matches nothing: the server-side backstop for a hand-built store.
 fn tokens_match(provided: &str, expected: &str) -> bool {
     if expected.is_empty() {
         return false;
@@ -234,37 +159,52 @@ fn tokens_match(provided: &str, expected: &str) -> bool {
     diff == 0
 }
 
-/// Store `token` in `dir` (the service's state dir) with private permissions,
-/// returning the file path. This file — not the process environment — is the
-/// durable home of the token: the worker and the foreground flow read it back
-/// at startup, and `ft detail` reads it to show the operator what was minted.
+/// Store `token` in `dir` (the service's state dir) with private permissions:
+/// this file is the token's durable home — the worker reads it at startup and
+/// `ft detail` reads it to show what was minted. The trailing newline keeps
+/// `cat` output paste-safe; readers trim.
 pub(crate) fn store_token(dir: &Path, token: &str) -> std::io::Result<PathBuf> {
     let path = dir.join(TOKEN_FILENAME);
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     crate::fsutil::apply_private_mode(&mut opts);
     let mut file = opts.open(&path)?;
-    // The trailing newline makes `cat` output paste-safe; readers trim.
     file.write_all(token.as_bytes())?;
     file.write_all(b"\n")?;
     Ok(path)
 }
 
-/// Read the token back. `Ok(None)` = no token file (never started with one);
-/// `Err` = a real read error, which callers must not swallow as "no token"
-/// (the file may be intact behind a permissions problem).
+/// Read the token back, bounded at [`TOKEN_READ_BOUND`] so a stray huge file
+/// at the token path cannot be slurped into memory. `Ok(None)` = no token
+/// file; `Err` = a real read error (or an over-bound/undecodable file),
+/// which callers must not swallow as "no token".
 pub(crate) fn read_token(dir: &Path) -> std::io::Result<Option<String>> {
-    match std::fs::read_to_string(dir.join(TOKEN_FILENAME)) {
-        Ok(s) => Ok(Some(s.trim().to_string())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+    use std::io::Read as _;
+    let file = match std::fs::File::open(dir.join(TOKEN_FILENAME)) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut bytes = Vec::new();
+    file.take(TOKEN_READ_BOUND + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > TOKEN_READ_BOUND {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the drop token file is implausibly large",
+        ));
     }
+    let text = String::from_utf8(bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the drop token file is not valid UTF-8",
+        )
+    })?;
+    Ok(Some(text.trim().to_string()))
 }
 
 /// Validate an upload name. Returns the unchanged name on success — the
-/// policy is REJECT, never mangle (see the module docs) — or the rule the
-/// name broke, for the 400 body.
-pub(crate) fn sanitize_filename(raw: &str) -> Result<String, String> {
+/// policy is REJECT, never mangle — or the rule the name broke, for the 400.
+fn sanitize_filename(raw: &str) -> Result<String, String> {
     if raw.is_empty() {
         return Err("the name is empty".to_string());
     }
@@ -280,12 +220,16 @@ pub(crate) fn sanitize_filename(raw: &str) -> Result<String, String> {
     if raw.chars().any(char::is_control) {
         return Err("control characters are not allowed".to_string());
     }
+    // ':' is NTFS alternate-data-stream syntax and illegal in Windows
+    // filenames — refused under the same portability contract as the devices.
+    if raw.contains(':') {
+        return Err("colons are not allowed (Windows filenames cannot contain them)".to_string());
+    }
     if raw.ends_with('.') || raw.ends_with(' ') {
         return Err("trailing dots/spaces are not allowed (Windows strips them)".to_string());
     }
-    // Windows refuses to create files whose STEM is a device name, with or
-    // without an extension; refuse those everywhere so a bucket is portable
-    // across the platforms this tool ships for.
+    // Windows refuses files whose STEM is a device name, with or without an
+    // extension; refuse them everywhere so a bucket stays portable.
     let stem = raw.split('.').next().unwrap_or("").to_ascii_uppercase();
     const DEVICES: &[&str] = &[
         "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
@@ -297,34 +241,67 @@ pub(crate) fn sanitize_filename(raw: &str) -> Result<String, String> {
     Ok(raw.to_string())
 }
 
-/// The shared drop state: the canonical upload root, the access token, the
-/// per-upload cap, and the running total of stored bytes (guarded by the same
-/// lock that serializes uploads, so the cap's check-then-write is atomic).
+/// Running usage under `root`, guarded by the same lock that serializes
+/// uploads (so both caps' check-then-write is atomic). Starts from a startup
+/// walk and only grows.
+#[derive(Default)]
+struct Usage {
+    bytes: u64,
+    files: u64,
+}
+
+/// Shared drop state: canonical upload root, token, per-upload cap, and the
+/// running usage (guarded by the same lock that serializes uploads, so the
+/// caps' check-then-write is atomic).
 pub(crate) struct DropStore {
-    /// Canonicalised upload target — the base every GET is confined against
-    /// and the only directory uploads ever write into.
+    /// Canonicalised upload target — the confinement base and the only
+    /// directory uploads ever write into.
     root: PathBuf,
     token: String,
     /// Per-upload body cap (also the router's pre-handler limit-layer bound).
     max_upload: usize,
     /// Total stored-bytes cap (`MAX_TOTAL_STORE` in production).
     total_cap: u64,
-    /// Bytes currently counted under `root`; upload-serialized. Starts from a
+    /// Stored-file count cap (`MAX_FILE_COUNT` in production).
+    file_cap: u64,
+    /// Usage currently counted under `root`; upload-serialized. Starts from a
     /// startup walk (see [`DropStore::open`]) and only grows.
-    used: Mutex<u64>,
+    used: Mutex<Usage>,
 }
 
 impl DropStore {
     /// Open (not create) `root` as an upload bucket: canonicalise it (the
-    /// confinement base must be the REAL path, like the static server's
-    /// router), then measure the content already on disk so pre-existing
-    /// files count against the total cap from the first upload. Startup-path
-    /// sync I/O, like the hook store's load.
+    /// confinement base must be the REAL path), then measure existing content
+    /// so it counts against the caps from the first upload. Startup-path sync
+    /// I/O, like the hook store's load — must not migrate to a request path.
     pub(crate) fn open(
         root: &Path,
         token: String,
         max_upload: u64,
         total_cap: u64,
+    ) -> std::io::Result<Arc<Self>> {
+        Self::open_all(root, token, max_upload, total_cap, MAX_FILE_COUNT)
+    }
+
+    /// [`DropStore::open`] with an explicit file-count cap, so the count-cap
+    /// refusal is testable without ten thousand uploads.
+    #[cfg(test)]
+    fn open_with_file_cap(
+        root: &Path,
+        token: String,
+        max_upload: u64,
+        total_cap: u64,
+        file_cap: u64,
+    ) -> std::io::Result<Arc<Self>> {
+        Self::open_all(root, token, max_upload, total_cap, file_cap)
+    }
+
+    fn open_all(
+        root: &Path,
+        token: String,
+        max_upload: u64,
+        total_cap: u64,
+        file_cap: u64,
     ) -> std::io::Result<Arc<Self>> {
         let root = std::fs::canonicalize(root)?;
         let used = measure_dir(&root);
@@ -334,35 +311,26 @@ impl DropStore {
             token,
             max_upload,
             total_cap,
+            file_cap,
             used: Mutex::new(used),
         }))
     }
 
-    /// This service's temp-file path for `name`. The token-scoped suffix
-    /// keeps two drop services pointed at the SAME directory from ever
-    /// sharing a temp file (the CLI refuses that configuration — see
-    /// `cmd::drop`'s one-bucket-one-owner pre-flight — so this is defense in
-    /// depth for hand-edited registries): each service's `.part` files are
-    /// its own, so one service's write can never truncate another's
-    /// in-flight temp. Still dot-prefixed: `sanitize_filename` rejects
-    /// leading-dot uploads and `confine` denies dotfile GETs, so temps are
-    /// unreachable through the API from both sides.
+    /// This service's temp-file path for `name`. Token-scoped so two services
+    /// on one directory never share a temp (defense in depth beyond the CLI's
+    /// one-bucket-one-owner pre-flight); dot-prefixed so both API sides
+    /// (sanitize rejects leading-dot uploads, confine denies dotfile GETs)
+    /// keep it unreachable.
     fn temp_path(&self, name: &str) -> PathBuf {
-        // The token is ≥ 64 hex chars in production (generate_token); tests
-        // and operator `--token`s may be anything, hence the boundary-safe cut
-        // (see [`token_tag`]).
         let tag = token_tag(&self.token);
         self.root.join(format!(".{name}.part-{tag}"))
     }
 }
 
-/// First ≤ 8 bytes of `token`, cut at a char boundary. WHY not plain byte
-/// slicing (`&token[..token.len().min(8)]`): byte 8 can split a multibyte
-/// char of an operator-chosen `--token`, and slicing then panics — the panic
-/// lands inside `spawn_blocking`, turning EVERY upload into a 500. Walking
-/// back to the nearest boundary keeps the tag a valid, stable prefix (never
-/// longer than 8 bytes, so the [`TEMP_NAME_OVERHEAD`] budget holds); the
-/// scoping it provides stays prefix-based, exactly as before for ASCII tokens.
+/// First ≤ 8 bytes of `token`, cut at a char boundary: byte 8 can split a
+/// multibyte char of an operator `--token`, and plain slicing would panic
+/// inside spawn_blocking, 500-ing every upload. The cut never exceeds 8 bytes
+/// (the [`TEMP_NAME_OVERHEAD`] budget holds) and stays prefix-based.
 fn token_tag(token: &str) -> &str {
     let end = token.len().min(8);
     if token.is_char_boundary(end) {
@@ -375,12 +343,11 @@ fn token_tag(token: &str) -> &str {
     &token[..end]
 }
 
-/// Sum the byte size of every regular file under `root`, best-effort.
-/// Symlinks are skipped entirely (`file_type()` does not follow them, so a
-/// symlinked directory can neither inflate the count nor create a cycle) —
-/// their targets live outside this bucket and consume no new disk here.
-fn measure_dir(root: &Path) -> u64 {
-    let mut total = 0u64;
+/// Sum the byte size of, and count, every regular file under `root`,
+/// best-effort. Symlinks are skipped (`file_type()` does not follow them): no
+/// cycles, and their targets consume no disk here.
+fn measure_dir(root: &Path) -> Usage {
+    let mut used = Usage::default();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -395,32 +362,30 @@ fn measure_dir(root: &Path) -> u64 {
             if ft.is_dir() {
                 stack.push(path);
             } else if ft.is_file() {
-                total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                used.bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                used.files += 1;
             }
         }
     }
-    total
+    used
 }
 
 /// Failure modes of a store write, mapped to responses by the caller.
 enum StoreError {
-    /// The upload would push the bucket past the total cap → 507.
+    /// Past the total cap → 507.
     Full,
+    /// Past the file-count cap → 409.
+    FullCount,
     /// A directory entry with this name already exists → 409.
     Exists,
     /// Disk I/O failed → 500.
     Io(std::io::Error),
 }
 
-/// Build the drop origin's [`Router`] over an opened [`DropStore`].
-///
-/// Layering (outermost last, mirroring static/hook): the timeout bounds slow
-/// public clients and the drain, the body limit pre-rejects declared-oversize
-/// uploads with 413, `nosniff` is stamped on every response, the token guard
-/// 401s unauthenticated mutations before any handler, the upload middleware
-/// intercepts POST/PUT (and renders the `GET /` listing), and the static
-/// server's own `confine` guard sits just in front of `ServeDir` so the read
-/// side behaves byte-for-byte like `ft <dir>`.
+/// Build the drop origin's [`Router`] over an opened [`DropStore`]. Outermost
+/// last: timeout → body limit (pre-rejects declared-oversize 413) → nosniff →
+/// token guard (401s unauthenticated mutations) → upload middleware → the
+/// static server's `confine` guard in front of ServeDir.
 pub(crate) fn router(store: Arc<DropStore>) -> Router {
     Router::new()
         .fallback_service(ServeDir::new(store.root.clone()))
@@ -453,10 +418,17 @@ fn query_param(query: &str, key: &str) -> Option<String> {
     })
 }
 
-/// Token-check middleware: GET/HEAD pass (reads are public — the static
-/// origin's model); every other method must present the token via
-/// `Authorization: Bearer` or `?token=`, compared in constant time, BEFORE
-/// its body is read (an unauthenticated client pays no bytes into us).
+/// Extract the credentials after a case-insensitive `Bearer` scheme match
+/// (RFC 7235: auth schemes are case-insensitive; the credentials are not).
+/// Byte-in-sync twin of `static_server::bearer_token`; keep the two in sync.
+fn bearer_token(value: &str) -> Option<&str> {
+    let (scheme, credentials) = value.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then_some(credentials)
+}
+
+/// Token-check middleware: GET/HEAD pass (reads are public); every other
+/// method must present the token, constant-time compared, BEFORE its body is
+/// read (an unauthenticated client pays no bytes into us).
 async fn require_token(
     State(store): State<Arc<DropStore>>,
     request: Request,
@@ -470,12 +442,17 @@ async fn require_token(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::to_owned);
-    let query_token = request.uri().query().and_then(|q| query_param(q, "token"));
-    let ok = header_token
-        .or(query_token)
-        .is_some_and(|t| tokens_match(&t, &store.token));
+        .and_then(bearer_token);
+    let ok = match header_token {
+        Some(t) => tokens_match(t, &store.token),
+        // Only the query arm needs an allocation (percent-decoding); the
+        // Bearer value is compared straight from the header buffer.
+        None => request
+            .uri()
+            .query()
+            .and_then(|q| query_param(q, "token"))
+            .is_some_and(|t| tokens_match(&t, &store.token)),
+    };
     if !ok {
         return (
             StatusCode::UNAUTHORIZED,
@@ -487,10 +464,9 @@ async fn require_token(
     next.run(request).await
 }
 
-/// Upload/list middleware, between the token guard and `confine`/ServeDir:
-/// POST/PUT become uploads (and never reach ServeDir), `GET /`/`HEAD /`
-/// render the listing, and everything else falls through to the confined
-/// static-style file serving.
+/// Upload/list middleware: POST/PUT become uploads (never reaching ServeDir),
+/// `GET /`/`HEAD /` render the listing, everything else falls through to the
+/// confined static-style serving.
 async fn upload_or_list(
     State(store): State<Arc<DropStore>>,
     request: Request,
@@ -506,18 +482,16 @@ async fn upload_or_list(
     next.run(request).await
 }
 
-/// True for the bucket root paths the listing answers (`/`; HTTP paths are
-/// absolute, but stay tolerant of the empty form).
+/// True for the bucket root paths the listing answers (`/`; tolerant of the
+/// empty absolute-path form).
 fn is_root_path(path: &str) -> bool {
     path == "/" || path.is_empty()
 }
 
-/// Resolve an upload's filename from the request: the (single-segment,
-/// percent-decoded) path for `POST /<name>`, or `?filename=` on the root
-/// path. Both at once is a 400 — one name, one place. The `Err` carries a
-/// (status, body) pair rather than a full [`Response`]: the error type is
-/// constructed per refusal but the response only in the caller, keeping the
-/// `Result`'s footprint small.
+/// Resolve an upload's filename: the (single-segment, percent-decoded) path
+/// for `POST /<name>`, or `?filename=` on the root path; both at once is a
+/// 400. The `Err` is a (status, body) pair; the response is built in the
+/// caller.
 fn upload_name(request: &Request) -> Result<String, (StatusCode, String)> {
     let bad = |msg: &'static str| (StatusCode::BAD_REQUEST, format!("{msg}\n"));
     let path = request.uri().path();
@@ -541,8 +515,8 @@ fn upload_name(request: &Request) -> Result<String, (StatusCode, String)> {
 }
 
 /// Store an upload: resolve + sanitize the name, read the (capped) raw body,
-/// then write it under the store lock (cap check → temp file → rename →
-/// count). See the module docs for the write discipline.
+/// then write it under the store lock. See the module docs for the write
+/// discipline.
 async fn upload(store: Arc<DropStore>, request: Request) -> Response {
     let name = match upload_name(&request) {
         Ok(n) => n,
@@ -558,11 +532,8 @@ async fn upload(store: Arc<DropStore>, request: Request) -> Response {
                 .into_response();
         }
     };
-    // Second enforcement of the per-upload cap, after the limit layer: a
-    // declared Content-Length over the cap is pre-rejected 413 by the layer
-    // (this handler never runs), but a chunked body carries none — for those
-    // the read below is the enforcement, bounded at the cap (hook's 413
-    // convention).
+    // Second cap enforcement for chunked bodies (no Content-Length for the
+    // limit layer to pre-reject): the read itself is bounded at the cap.
     let bytes = match axum::body::to_bytes(request.into_body(), store.max_upload).await {
         Ok(b) => b,
         Err(e) => {
@@ -574,7 +545,7 @@ async fn upload(store: Arc<DropStore>, request: Request) -> Response {
                 .into_response();
         }
     };
-    // A filename clone rides into the blocking closure so the 201 body can
+    // The name rides a clone into the blocking closure so the 201 body can
     // name what was stored without a borrow across the spawn boundary.
     let stored_name = name.clone();
     let written = tokio::task::spawn_blocking(move || store_write(&store, &name, &bytes)).await;
@@ -583,6 +554,11 @@ async fn upload(store: Arc<DropStore>, request: Request) -> Response {
         Ok(Err(StoreError::Full)) => (
             StatusCode::INSUFFICIENT_STORAGE,
             "the drop bucket is full (total-store cap reached); nothing was stored\n",
+        )
+            .into_response(),
+        Ok(Err(StoreError::FullCount)) => (
+            StatusCode::CONFLICT,
+            "the drop bucket is full (file-count cap reached); nothing was stored\n",
         )
             .into_response(),
         Ok(Err(StoreError::Exists)) => (
@@ -610,31 +586,26 @@ async fn upload(store: Arc<DropStore>, request: Request) -> Response {
 }
 
 /// Blocking half of [`upload`]: under the upload lock, check the total cap,
-/// unlink any stale temp for the name (crash recovery — see the comment
-/// inline), write the token-scoped dot-prefixed temp file (private perms),
-/// publish it with a collision-checked hard-link + unlink, and only then
-/// grow the counter — so a failed write never charges bytes and a counted
-/// byte is always on disk. The lock makes the cap's check-then-write atomic
-/// and serializes uploads (a dev tool with a capped bucket; throughput is
-/// not the point).
+/// write the temp file (private perms), publish with a collision-checked
+/// hard-link + unlink, and only then grow the counter — a failed write never
+/// charges bytes; a counted byte is always on disk.
 fn store_write(store: &DropStore, name: &str, bytes: &[u8]) -> Result<(), StoreError> {
     let mut used = store
         .used
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if *used + bytes.len() as u64 > store.total_cap {
+    if used.bytes + bytes.len() as u64 > store.total_cap {
         return Err(StoreError::Full);
     }
+    if used.files >= store.file_cap {
+        return Err(StoreError::FullCount);
+    }
     let tmp = store.temp_path(name);
-    // Recover the publish invariant BEFORE the truncate-open: a crash between
-    // the hard_link below and its unlink (or the unlink-failure arm) leaves
-    // `tmp` hard-linked to the PUBLISHED file — truncate-opening that path
-    // as-is would write through the link, silently overwriting the stored
-    // file while the upload is answered 409. Unlinking first guarantees the
-    // open below creates a FRESH inode; a real unlink failure (not NotFound)
-    // fails the upload loudly instead of risking a write through the link.
-    // (Uploads are serialized by this store's lock, and temp paths are
-    // token-scoped per service, so this unlink cannot race a live writer.)
+    // Unlink any stale temp BEFORE the truncate-open: a crash between the
+    // hard_link below and its unlink leaves `tmp` hard-linked to the PUBLISHED
+    // file, and truncating through that link would silently overwrite it. This
+    // unlink cannot race a live writer (uploads serialize on this store's
+    // lock; temps are token-scoped); a real failure fails the upload loudly.
     if let Err(e) = std::fs::remove_file(&tmp)
         && e.kind() != std::io::ErrorKind::NotFound
     {
@@ -645,22 +616,20 @@ fn store_write(store: &DropStore, name: &str, bytes: &[u8]) -> Result<(), StoreE
         opts.write(true).create(true).truncate(true);
         crate::fsutil::apply_private_mode(&mut opts);
         let mut file = opts.open(&tmp)?;
-        file.write_all(bytes)
+        file.write_all(bytes)?;
+        // Durable bytes BEFORE the publish: a crash must never leave an
+        // announced file whose contents never reached disk.
+        file.sync_all()
     };
     if let Err(e) = write() {
         let _ = std::fs::remove_file(&tmp);
         return Err(StoreError::Io(e));
     }
-    // Publish WITHOUT clobbering, atomically, across processes: `hard_link`
-    // creates `target` only if it does not exist — POSIX link(2)/Windows
-    // CreateHardLinkW both fail with AlreadyExists otherwise — so the
-    // never-overwrite guarantee does not rest on a check-then-act race.
-    // Unlike round 1's `rename` (which silently overwrites on Unix), a file
-    // that appears in between — from another process pointed at this
-    // directory, however that happened — wins and this upload is a 409.
-    // This also covers pre-existing symlinks: the link lands on the NAME, a
-    // symlinked directory entry is "exists", and a symlink target is never
-    // followed or written through.
+    // Publish WITHOUT clobbering, atomically, across processes: link(2)/
+    // CreateHardLinkW create `target` only if absent, so the never-overwrite
+    // guarantee rests on no check-then-act race — and a pre-existing entry
+    // (including a symlink; the link lands on the NAME, the target is never
+    // followed) is a 409.
     let target = store.root.join(name);
     let linked = std::fs::hard_link(&tmp, &target);
     if let Err(e) = linked {
@@ -671,28 +640,35 @@ fn store_write(store: &DropStore, name: &str, bytes: &[u8]) -> Result<(), StoreE
             StoreError::Io(e)
         });
     }
-    match std::fs::remove_file(&tmp) {
+    let res = match std::fs::remove_file(&tmp) {
         Ok(()) => {
-            *used += bytes.len() as u64;
+            used.bytes += bytes.len() as u64;
+            used.files += 1;
             Ok(())
         }
-        // The upload IS stored (the link succeeded) — a temp-removal failure
-        // must not turn a stored file into a lied-about 500, so it counts and
-        // the stray temp is logged. It stays dot-prefixed (invisible to the
-        // API) and over-counts at the next startup walk: the conservative
-        // direction for the cap.
+        // The upload IS stored; count it, log the stray temp (dot-prefixed,
+        // invisible, over-counted at the next startup walk — conservative).
         Err(e) => {
-            *used += bytes.len() as u64;
+            used.bytes += bytes.len() as u64;
+            used.files += 1;
             tracing::warn!(%e, tmp = %tmp.display(), "stored the upload but could not remove the temp file");
             Ok(())
         }
+    };
+    // Best-effort durability of the publish's directory entry (Unix only),
+    // before the 201 announces the file.
+    #[cfg(unix)]
+    {
+        if let Ok(dir) = std::fs::File::open(&store.root) {
+            let _ = dir.sync_all();
+        }
     }
+    res
 }
 
-/// `GET /` (and HEAD): the HTML listing of the bucket, rendered through the
-/// shared page scaffold. The curl hint uses a `<token>` PLACEHOLDER on
-/// purpose — this page is public (reads are unauthenticated), so the real
-/// token must never be rendered into it.
+/// `GET /` (and HEAD): the HTML listing of the bucket via the shared page
+/// scaffold. The curl hint uses a `<token>` PLACEHOLDER on purpose — the page
+/// is public, so the real token must never be rendered into it.
 async fn listing(store: Arc<DropStore>, is_head: bool) -> Response {
     let rendered = tokio::task::spawn_blocking(move || render_listing(&store)).await;
     let html = match rendered {
@@ -706,8 +682,8 @@ async fn listing(store: Arc<DropStore>, is_head: bool) -> Response {
                 .into_response();
         }
     };
-    // A HEAD mirrors the GET representation's headers — including a truthful
-    // Content-Length — but carries no body, like the static listing's HEAD.
+    // HEAD mirrors the GET representation's headers — truthful
+    // Content-Length — but carries no body.
     let len = html.len();
     let mut response = Html(html).into_response();
     if is_head {
@@ -721,13 +697,13 @@ async fn listing(store: Arc<DropStore>, is_head: bool) -> Response {
 
 /// Blocking half of [`listing`]. Hides exactly what the GET side would refuse
 /// (dotfiles, escaping/broken symlinks) so the page never advertises a link
-/// that 404s — the same discipline as the static listing.
+/// that 404s.
 fn render_listing(store: &DropStore) -> String {
     let mut entries: Vec<(String, bool, u64)> = Vec::new(); // (name, is_dir, size)
     if let Ok(read) = std::fs::read_dir(&store.root) {
         for entry in read.flatten() {
-            // Non-UTF-8 names render lossily; their hrefs will not resolve,
-            // tolerated in a dev-facing listing (same trade as the static one).
+            // Non-UTF-8 names render lossily (their hrefs will not resolve) —
+            // tolerated in a dev-facing listing, same trade as the static one.
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.starts_with('.') {
                 continue;
@@ -777,9 +753,8 @@ fn render_listing(store: &DropStore) -> String {
 
 #[cfg(test)]
 mod tests {
-    //! Sanitization/token rules as pure units, then the full Router driven
-    //! with tower::oneshot (the established no-cloudflared HTTP-layer
-    //! pattern), including the adversarial cases the area brief calls for.
+    //! Pure rule units plus the full Router driven with tower::oneshot,
+    //! including the adversarial cases the area brief calls for.
 
     use super::*;
     use axum::body::Body;
@@ -818,8 +793,6 @@ mod tests {
 
     #[test]
     fn generate_token_is_hex_unique_and_64_chars() {
-        // The token is the credential: it must come out as 64 lowercase hex
-        // chars (32 CSPRNG bytes), and two mints must never agree.
         let a = generate_token().expect("generate");
         let b = generate_token().expect("generate");
         assert_eq!(a.len(), 64);
@@ -843,8 +816,7 @@ mod tests {
 
     #[test]
     fn sanitize_filename_rejects_traversal_and_separators() {
-        // The adversarial core: nothing that could escape the bucket root —
-        // parent references, raw or platform separators — may pass.
+        // Nothing that could escape the bucket root may pass.
         for bad in ["..", "../x", "a/..", "a/b", "a\\b", "/etc/passwd"] {
             assert!(sanitize_filename(bad).is_err(), "{bad} must be rejected");
         }
@@ -852,9 +824,8 @@ mod tests {
 
     #[test]
     fn sanitize_filename_rejects_dotfiles() {
-        // Dotfiles are denied on the GET side by confine; the write side must
-        // not be able to create them in the first place (also keeps the
-        // bucket's own `.name.part` temp namespace collision-free).
+        // confine denies dotfile GETs; the write side must not create them
+        // either (keeps the `.part` temp namespace collision-free too).
         for bad in [".env", ".", "..", "..hidden", ".part"] {
             assert!(sanitize_filename(bad).is_err(), "{bad} must be rejected");
         }
@@ -862,12 +833,22 @@ mod tests {
 
     #[test]
     fn sanitize_filename_rejects_windows_hostile_names() {
-        // Device names (case-insensitive, with or without extension) and
-        // trailing dot/space would fail to store on Windows; refusing them
-        // everywhere keeps the API portable.
+        // Device names and trailing dot/space fail to store on Windows;
+        // refusing them everywhere keeps the API portable.
         for bad in ["con", "NUL", "Com1.txt", "lpt9", "aux", "name.", "name "] {
             assert!(sanitize_filename(bad).is_err(), "{bad} must be rejected");
         }
+    }
+
+    #[test]
+    fn sanitize_filename_rejects_colons() {
+        // ':' is NTFS alternate-data-stream syntax and illegal in Windows
+        // filenames — same Windows-portability contract as the device names.
+        for bad in ["a:b", "2026-09-19T10:30:00.log", ":"] {
+            assert!(sanitize_filename(bad).is_err(), "{bad} must be rejected");
+        }
+        let err = sanitize_filename("a:b").expect_err("colons must be rejected");
+        assert!(err.contains("colons"), "the 400 must name the rule: {err}");
     }
 
     #[test]
@@ -886,21 +867,16 @@ mod tests {
 
     #[test]
     fn token_tag_cuts_at_char_boundaries_and_stays_within_eight_bytes() {
-        // R3-11: the old byte-slice `&token[..len.min(8)]` panicked on a
-        // multibyte operator --token (byte 8 splitting a char), and the panic
-        // surfaced as a 500 for every upload. The tag must stay a valid
-        // prefix of at most 8 bytes for ANY token, and unchanged for plain
-        // ASCII.
+        // Regression: byte-slicing `&token[..len.min(8)]` panicked on a
+        // multibyte operator --token (500 for every upload). The tag must be
+        // a valid prefix of at most 8 bytes for ANY token.
         assert_eq!(token_tag("tok-abc123"), "tok-abc1", "ASCII: first 8 bytes");
         assert_eq!(token_tag("ab"), "ab", "short tokens are used whole");
         assert_eq!(token_tag(""), "", "an empty token yields an empty tag");
         // 3-byte chars: byte 8 splits the third char, so the cut walks back
-        // to the boundary at 6 (two full chars, 6 bytes).
+        // to the boundary at 6; 4-byte chars: byte 8 lands between chars.
         assert_eq!(token_tag("日本語テスト"), "日本");
-        // 4-byte chars: byte 8 lands on a boundary (4 + 4), two full chars.
         assert_eq!(token_tag("😀😀😀"), "😀😀");
-        // Invariant over arbitrary shapes: a prefix cut on a boundary, never
-        // longer than 8 bytes.
         for token in ["aé🎉b", "🎉", "🎉🎉🎉🎉🎉", "日本", "x"] {
             let tag = token_tag(token);
             assert!(token.starts_with(tag), "prefix of {token:?}");
@@ -914,16 +890,13 @@ mod tests {
 
     #[test]
     fn temp_names_for_maximal_names_stay_within_name_max() {
-        // The MAX_NAME_BYTES budget's reason to exist: any name sanitize
-        // accepts must produce a temp file name (dot + name + ".part-" + an
-        // ≤ 8-byte tag) that fits the common 255-byte NAME_MAX — ASCII and
-        // multibyte alike — so the publish path itself never fails.
+        // Any accepted name's temp (dot + name + ".part-" + ≤ 8-byte tag)
+        // must fit the common 255-byte NAME_MAX, ASCII and multibyte alike.
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = DropStore::open(tmp.path(), "tok-abc123".to_string(), 1024, MAX_TOTAL_STORE)
             .expect("open store");
         let max_ascii = "a".repeat(MAX_NAME_BYTES);
-        // "é" is 2 bytes: exactly MAX_NAME_BYTES bytes, half the char count.
-        let max_multibyte = "é".repeat(MAX_NAME_BYTES / 2);
+        let max_multibyte = "é".repeat(MAX_NAME_BYTES / 2); // 2 bytes per char
         assert_eq!(max_multibyte.len(), MAX_NAME_BYTES, "byte budget met");
         for name in [max_ascii, max_multibyte] {
             assert!(
@@ -947,13 +920,8 @@ mod tests {
 
     #[test]
     fn tokens_match_is_exact_never_length_leaky_and_empty_matches_nothing() {
-        // Correctness first; the differing-only-in-last-byte case is the one
-        // a naive early-return comparison would get right too — pinning it
-        // documents that the XOR fold covers the WHOLE token either way. The
-        // length difference folds into the same accumulator (an operator's
-        // arbitrary --token must not leak its length by timing), and an empty
-        // token matches nothing — not even an empty expected one, because an
-        // empty secret must never open the bucket.
+        // The XOR fold covers the whole token and the length difference; an
+        // empty secret must never open the bucket (not even vs an empty one).
         assert!(tokens_match("aaaa", "aaaa"));
         assert!(!tokens_match("aaab", "aaaa"));
         assert!(!tokens_match("aaa", "aaaa"));
@@ -966,8 +934,8 @@ mod tests {
 
     #[test]
     fn token_file_round_trips_and_is_private() {
-        // The token's durable home must read back exactly (trimmed), and must
-        // be owner-only — it is the write credential for the bucket.
+        // The token's durable home reads back exactly (trimmed) and is
+        // owner-only — it is the write credential for the bucket.
         #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -992,6 +960,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn read_token_is_bounded_against_a_stray_huge_file() {
+        // A stray huge file at the token path is an Err, not a slurp — the
+        // same read-bound discipline as the registry/hook stores.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let huge = "x".repeat(TOKEN_READ_BOUND as usize + 1);
+        std::fs::write(tmp.path().join(TOKEN_FILENAME), &huge).expect("plant huge token");
+        assert!(
+            read_token(tmp.path()).is_err(),
+            "an over-bound token file must Err, not read"
+        );
+    }
+
     // --- the full Router, driven like the static/hook HTTP tests -------------
 
     #[tokio::test]
@@ -1009,14 +990,14 @@ mod tests {
             .expect("oneshot");
         assert_eq!(resp.status(), StatusCode::CREATED);
 
-        // GET needs no token (reads are public) and returns the exact bytes.
+        // GET needs no token (reads are public) and returns the exact bytes,
+        // as an owner-only regular file on disk.
         let resp = router(store.clone())
             .oneshot(req("GET", "/hello.txt", &[], b""))
             .await
             .expect("oneshot");
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_of(resp).await, b"hello world".to_vec());
-        // And the file is a regular file on disk with private permissions.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1026,6 +1007,41 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600, "stored uploads must be owner-only");
         }
+    }
+
+    #[tokio::test]
+    async fn bearer_scheme_matches_case_insensitively_per_rfc_7235() {
+        // RFC 7235: the auth SCHEME is case-insensitive — `bearer <token>`
+        // must authenticate a mutation (the credentials stay case-sensitive).
+        let (_tmp, store) = test_store(MAX_TOTAL_STORE);
+        let resp = router(store.clone())
+            .oneshot(req(
+                "POST",
+                "/lower.txt",
+                &[("authorization", "bearer tok-abc123")],
+                b"lo",
+            ))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(
+            std::fs::read(store.root.join("lower.txt")).expect("read back"),
+            b"lo".to_vec()
+        );
+        let resp = router(store.clone())
+            .oneshot(req(
+                "POST",
+                "/nope.txt",
+                &[("authorization", "BEARER TOK-ABC123")],
+                b"lo",
+            ))
+            .await
+            .expect("oneshot");
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "the credentials stay case-sensitive"
+        );
     }
 
     #[tokio::test]
@@ -1054,8 +1070,8 @@ mod tests {
 
     #[tokio::test]
     async fn mutating_without_token_is_401_but_get_stays_public() {
-        // The auth contract: every mutating method is refused before the body
-        // is read, while reads need no token (the static origin's model).
+        // Every mutating method is refused before the body is read; reads
+        // need no token (the static origin's model).
         let (_tmp, store) = test_store(MAX_TOTAL_STORE);
         let app = router(store.clone());
         for method in ["POST", "PUT", "DELETE", "PATCH"] {
@@ -1121,9 +1137,8 @@ mod tests {
 
     #[tokio::test]
     async fn non_upload_methods_with_token_fall_through_to_405() {
-        // GET-only store: there is deliberately no delete/move API. With a
-        // valid token, DELETE still reaches ServeDir's uniform 405 instead of
-        // destroying operator files.
+        // There is deliberately no delete/move API: with a valid token,
+        // DELETE still reaches ServeDir's uniform 405.
         let (_tmp, store) = test_store(MAX_TOTAL_STORE);
         let app = router(store.clone());
         app.oneshot(req("POST", "/f.txt?token=tok-abc123", &[], b"x"))
@@ -1139,9 +1154,8 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_chunked_body_is_413_and_stores_nothing() {
-        // The per-upload cap's in-handler enforcement (chunked bodies carry
-        // no Content-Length for the limit layer to pre-reject): 413, and the
-        // bucket gains nothing.
+        // The in-handler cap enforcement (chunked bodies carry no
+        // Content-Length for the limit layer to pre-reject): 413, nothing stored.
         let (_tmp, store) = test_store(MAX_TOTAL_STORE);
         let big = vec![b'z'; 1025]; // store cap is 1024 in test_store
         let resp = router(store.clone())
@@ -1160,15 +1174,12 @@ mod tests {
 
     #[tokio::test]
     async fn names_over_the_temp_budget_get_a_precise_400_and_at_the_budget_store() {
-        // R3-10: a name in the gap between the old 255-byte sanitize cap and
-        // what the publish path's temp name could hold passed sanitize and
-        // then died ENAMETOOLONG at the temp open inside spawn_blocking — a
-        // generic 500 with nothing stored. The budget cap rejects such names
-        // up front with a 400 naming the rule, while a name exactly AT the
-        // budget stores cleanly (the whole write path holds).
+        // Regression: a name between the raw 255-byte cap and what the temp
+        // name holds passed sanitize, then died ENAMETOOLONG at the temp open
+        // as a generic 500. The budget cap rejects it up front with a 400
+        // naming the rule; a name exactly AT the budget stores cleanly.
         let (_tmp, store) = test_store(MAX_TOTAL_STORE);
         let app = router(store.clone());
-        // 241 bytes: under the old 255-byte cap, over the 240-byte budget.
         let over = "a".repeat(MAX_NAME_BYTES + 1);
         let resp = app
             .clone()
@@ -1202,14 +1213,11 @@ mod tests {
 
     #[tokio::test]
     async fn stale_temp_linked_to_the_stored_file_cannot_corrupt_it() {
-        // Regression (judge fix round 3): a crash between the publish's
-        // hard_link and its unlink leaves the temp path hard-linked to the
-        // PUBLISHED file (two names, one inode). The next same-name upload
-        // must unlink that stale temp BEFORE its truncate-open — otherwise
-        // the open writes through the link, silently overwriting the stored
-        // file while the upload is answered 409. The forged link below is
-        // exactly that crash state; on the pre-fix code this test fails with
-        // the stored bytes replaced.
+        // Regression: a crash between the publish's hard_link and its unlink
+        // leaves the temp path hard-linked to the PUBLISHED file. The next
+        // same-name upload must unlink that stale temp BEFORE its
+        // truncate-open, or it writes through the link, silently overwriting
+        // the stored file while answering 409.
         let (_tmp, store) = test_store(MAX_TOTAL_STORE);
         let app = router(store.clone());
         app.clone()
@@ -1238,8 +1246,7 @@ mod tests {
             "the stale temp must be gone after the publish attempt"
         );
 
-        // The invariant stays recovered for the uploads that follow: a fresh
-        // name stores normally right after the recovery path ran.
+        // The invariant stays recovered for the uploads that follow.
         let resp = app
             .oneshot(req("POST", "/y.txt?token=tok-abc123", &[], b"next"))
             .await
@@ -1253,8 +1260,8 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_name_is_409_and_the_original_is_untouched() {
-        // Uploads never overwrite: the second upload of a name is a conflict,
-        // and the first file's bytes survive byte-for-byte.
+        // Uploads never overwrite: the second upload of a name conflicts, and
+        // the first file's bytes survive byte-for-byte.
         let (_tmp, store) = test_store(MAX_TOTAL_STORE);
         let app = router(store.clone());
         app.clone()
@@ -1276,13 +1283,12 @@ mod tests {
 
     #[tokio::test]
     async fn second_origin_on_the_same_dir_cannot_overwrite_the_first_ones_file() {
-        // The cross-process safety pin (judge fix round 2): two DropStores on
-        // the SAME directory — the shape a hand-edited registry could produce,
-        // and which the CLI's one-bucket-one-owner pre-flight refuses for
-        // ft-managed services — must still be safe at the write level. The
-        // publish is a collision-checked hard-link (not a rename, which
-        // silently overwrites on Unix), so the second origin's upload of an
-        // existing name is a 409 and the first origin's bytes survive.
+        // Cross-process safety pin: two DropStores on the SAME directory
+        // (the shape a hand-edited registry could produce; the CLI's pre-flight
+        // refuses it for ft-managed services) must still be safe at the write
+        // level — the collision-checked hard-link publish (not a rename,
+        // which silently overwrites on Unix) makes B's conflicting upload a
+        // 409 while A's bytes survive, and distinct names store from both.
         let tmp = tempfile::tempdir().expect("tempdir");
         let a = DropStore::open(tmp.path(), "token-aaaa".to_string(), 1024, MAX_TOTAL_STORE)
             .expect("open store a");
@@ -1324,10 +1330,9 @@ mod tests {
 
     #[test]
     fn temp_names_are_scoped_per_service_token() {
-        // The temp-file scheme: same bucket, different services (different
-        // tokens) never share a temp path — one service's write can never
-        // truncate another's in-flight temp. Same token, same path (a
-        // service truncates only its OWN stale temps).
+        // Same bucket, different tokens: never a shared temp path, so one
+        // service's write cannot truncate another's in-flight temp. Same
+        // token, same path (a service truncates only its OWN stale temps).
         let tmp = tempfile::tempdir().expect("tempdir");
         let a = DropStore::open(tmp.path(), "token-aaaa".to_string(), 1024, MAX_TOTAL_STORE)
             .expect("open a");
@@ -1349,18 +1354,13 @@ mod tests {
 
     #[tokio::test]
     async fn multibyte_operator_token_uploads_and_temp_names_stay_sane() {
-        // R3-11 end-to-end over the router: with the old byte-sliced temp
-        // tag, an operator --token whose 8th byte falls mid-char panicked in
-        // temp_path inside spawn_blocking — every upload answered 500. The
-        // boundary-safe tag lets the multibyte token authenticate AND store,
-        // and the temp path stays a valid, dot-prefixed component that
-        // publish consumes. The token rides ?token= percent-encoded ON
-        // PURPOSE: a Bearer header value cannot carry UTF-8
-        // (HeaderValue::to_str rejects it), so the query is the only wire
-        // shape a multibyte operator token can actually travel by — and its
-        // percent-decoded value is exactly what used to panic in temp_path.
-        // (The token's 8th byte sits inside 日 — the shape that used to
-        // panic.)
+        // Regression, end-to-end: with the old byte-sliced temp tag, an
+        // operator --token whose 8th byte falls mid-char panicked in
+        // temp_path — every upload answered 500. The token rides ?token=
+        // percent-encoded ON PURPOSE: a Bearer header value cannot carry
+        // UTF-8 (HeaderValue::to_str rejects it), so the query is the only
+        // wire shape a multibyte token can travel by — and its decoded value
+        // is exactly what used to panic.
         let tmp = tempfile::tempdir().expect("tempdir");
         let token = "鍵🔑日本語";
         let store = DropStore::open(tmp.path(), token.to_string(), 1024, MAX_TOTAL_STORE)
@@ -1383,8 +1383,8 @@ mod tests {
             std::fs::read(store.root.join("upload.bin")).expect("read back"),
             b"multibyte".to_vec()
         );
-        // The temp scheme stayed sane: a valid UTF-8, dot-prefixed component
-        // carrying the part marker, consumed by the publish.
+        // The temp scheme stayed sane: a dot-prefixed component carrying the
+        // part marker, consumed by the publish.
         let temp = store.temp_path("upload.bin");
         let file_name = temp
             .file_name()
@@ -1405,10 +1405,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn upload_onto_a_preexisting_symlink_is_refused_without_touching_the_target() {
-        // The adversarial write case: a symlink planted in the bucket pointing
-        // at a file OUTSIDE it must never be followed by an upload — the
-        // no-clobber check uses symlink_metadata (unfollowed), so the upload
-        // conflicts and the outside target keeps its bytes.
+        // A symlink planted in the bucket pointing outside must never be
+        // followed by an upload: the hard-link publish lands on the NAME and
+        // fails AlreadyExists, so the upload conflicts and the outside target
+        // keeps its bytes.
         use std::os::unix::fs::symlink;
         let (tmp, store) = test_store(MAX_TOTAL_STORE);
         let outside = tempfile::tempdir().expect("outside tempdir");
@@ -1432,10 +1432,9 @@ mod tests {
     async fn traversal_and_dotfile_names_are_rejected_with_400() {
         // Percent-decoded path names and ?filename= values go through the
         // same sanitizer: separators, parent refs, and dotfiles are 400s that
-        // write nothing. (Each request carries the valid token ON PURPOSE:
-        // auth runs before filename validation — an unauthenticated upload is
-        // a 401 without ever seeing a filename — so the token is what lets
-        // these adversarial names reach the sanitizer at all.)
+        // write nothing. (The valid token is ON PURPOSE: auth runs before
+        // filename validation, so the token is what lets these adversarial
+        // names reach the sanitizer at all.)
         let (_tmp, store) = test_store(MAX_TOTAL_STORE);
         let app = router(store.clone());
         let cases = [
@@ -1487,9 +1486,8 @@ mod tests {
 
     #[tokio::test]
     async fn total_cap_returns_507_and_counts_preexisting_files() {
-        // The total-store cap covers content ALREADY in the directory (the
-        // startup walk), not just bytes this process uploaded: a pre-existing
-        // file near the cap pushes the next upload to 507 with nothing written.
+        // The total cap covers content ALREADY in the directory (the startup
+        // walk), not just bytes this process uploaded.
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(tmp.path().join("pre-existing.bin"), vec![b'p'; 700]).expect("seed");
         let store =
@@ -1521,11 +1519,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_count_cap_returns_a_precise_409_and_stores_nothing() {
+        // The count cap bounds the O(entries) listing under the byte cap
+        // (0-byte uploads never fill the byte cap): a 409 with its own body,
+        // distinct from the name-collision 409, and nothing stored past it.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("pre1"), b"a").expect("seed 1");
+        std::fs::write(tmp.path().join("pre2"), b"b").expect("seed 2");
+        let store = DropStore::open_with_file_cap(
+            tmp.path(),
+            "tok-abc123".to_string(),
+            1024,
+            MAX_TOTAL_STORE,
+            2,
+        )
+        .expect("open store");
+        // The startup walk counted the two pre-existing files: the FIRST
+        // upload is already past the cap (manual deletions, like the byte
+        // cap's, need a restart to be credited).
+        let resp = router(store.clone())
+            .oneshot(req("POST", "/next.txt?token=tok-abc123", &[], b"x"))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = String::from_utf8(body_of(resp).await).expect("utf-8 body");
+        assert!(
+            body.contains("file-count") && !body.contains("already exists"),
+            "the 409 must name the count rule, not a collision: {body}"
+        );
+        assert!(
+            !store.root.join("next.txt").exists() && !store.temp_path("next.txt").exists(),
+            "a refused upload must leave no file and no temp"
+        );
+    }
+
+    #[tokio::test]
     async fn listing_renders_uploads_escapes_markup_and_hides_dotfiles() {
-        // The UI contract: uploads are listed (size shown), markup in names is
-        // escaped, the bucket's temp/dot files are hidden, and the curl hint
-        // uses a <token> PLACEHOLDER — the real token must never be rendered
-        // into a public page.
+        // Uploads listed with sizes, markup in names escaped, dotfiles
+        // hidden, and a `<token>` PLACEHOLDER only — the page is public, so
+        // the real token must never be rendered into it.
         let (tmp, store) = test_store(MAX_TOTAL_STORE);
         std::fs::write(tmp.path().join(".secret"), "x").expect("plant dotfile");
         let app = router(store.clone());
@@ -1598,10 +1630,8 @@ mod tests {
 
     #[tokio::test]
     async fn multipart_body_is_stored_as_opaque_capped_bytes() {
-        // No multipart parsing (no such dependency, per the area brief): a
-        // multipart POST with an explicit name stores its raw capped bytes —
-        // the A3 hook precedent — so the API contract is honest about what
-        // landed on disk.
+        // No multipart parsing (no such dependency): the raw capped bytes are
+        // stored, so the API contract is honest about what landed on disk.
         let (_tmp, store) = test_store(MAX_TOTAL_STORE);
         let body = b"--BOUNDARY\r\ncontent-disposition: form-data; name=\"f\"; filename=\"x.txt\"\r\n\r\nhi\r\n--BOUNDARY--\r\n";
         let resp = router(store.clone())
@@ -1636,8 +1666,7 @@ mod tests {
     #[tokio::test]
     async fn get_side_confinement_matches_the_static_server() {
         // The read side must behave exactly like `ft <dir>`: dotfiles denied,
-        // escaping symlinks refused, missing paths 404 — even though the
-        // bucket also accepts writes.
+        // escaping symlinks refused, missing paths 404.
         #[cfg(unix)]
         use std::os::unix::fs::symlink;
         let (tmp, store) = test_store(MAX_TOTAL_STORE);
@@ -1681,11 +1710,10 @@ mod tests {
 
     #[tokio::test]
     async fn origin_serves_over_a_real_socket_and_pre_rejects_declared_oversize() {
-        // A real-TCP smoke (oneshot bypasses the HTTP server): a genuine
-        // authenticated POST is stored and answered 201, and a body that
-        // DECLARES an over-cap Content-Length is pre-rejected 413 by the
-        // limit layer before the handler reads a byte — the path only a real
-        // request with a Content-Length header can reach.
+        // Real-TCP smoke (oneshot bypasses the HTTP server): an authenticated
+        // POST is answered 201, and a body that DECLARES an over-cap
+        // Content-Length is pre-rejected 413 by the limit layer before the
+        // handler reads a byte.
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (_tmp, store) = test_store(1 << 20);
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))

@@ -2,69 +2,46 @@
 //!
 //! The motivating failure mode is a `Proxy` service whose worker and tunnel
 //! are happily up while the upstream port it fronts has nothing listening
-//! anymore: `cloudflared` answers every request with a 502 and nothing in
-//! `ft ls` hints at it — the worker is alive and the URL is published, the
-//! tunnel is just fronting a dead origin. `ft doctor` surfaces exactly
-//! that, plus the other cheap sanity checks: `cloudflared` discoverable on
-//! `PATH`, every registered service's worker still alive, and every
-//! service's state directory present on disk.
+//! anymore: cloudflared answers every request with a 502 and nothing in
+//! `ft ls` hints at it. `ft doctor` surfaces exactly that, plus the other
+//! cheap sanity checks: `cloudflared` on PATH, every service's worker alive,
+//! and every service's state directory present.
 //!
-//! `Run` services add a second dimension the other kinds cannot have: the
-//! worker owns a child command (the operator's dev server), and when the
-//! worker dies without tearing it down — a SIGKILL or crash on the platforms
-//! whose safety nets (Linux `PR_SET_PDEATHSIG`, the Windows Job Object) miss,
-//! macOS has none — the tunnel is dead while the command lives on, holding
-//! its port. Doctor flags that orphan from the recorded `command_pid`:
-//! a plain existence probe (an operator command has no cmdline needle, so
-//! identity is best-effort) cross-checked against the run's own port, which
-//! a recycled pid almost never answers. Neither signal proves identity — a
-//! recycled pid can even coincide with an unrelated squatter holding the
-//! port — so the finding wording never attributes the listener (or the live
-//! process) to the recorded pid outright, and both branches share one
-//! verify-first hint ("check what pid N is and stop it if it is the
-//! command"). Doctor stays strictly diagnostic even here: `ft kill`'s
-//! group signal is identity-gated on the (dead) worker and will not reach
-//! the orphan, so the hint says to stop the pid by hand and lists `ft kill`
-//! for the registry cleanup it does perform.
+//! `Run` services add one more dimension: the worker owns a child command,
+//! and when the worker dies without tearing it down (SIGKILL/crash on macOS,
+//! whose safety nets PDEATHSIG/Job Object do not exist), the tunnel is dead
+//! while the command lives on, holding its port. Doctor flags that orphan
+//! from the recorded `command_pid` with a plain existence probe (an operator
+//! command has no cmdline needle, so identity is best-effort), cross-checked
+//! against the run's own port. Neither signal proves identity — a recycled
+//! pid can even coincide with an unrelated squatter holding the port — so the
+//! wording never attributes the listener or the live process to the recorded
+//! pid outright, and both branches share one verify-first hint. Doctor stays
+//! strictly diagnostic even here: `ft kill`'s group signal is identity-gated
+//! on the (dead) worker and cannot reach the orphan, so the hint says to stop
+//! the pid by hand.
 //!
-//! Doctor is strictly diagnostic. It never mutates the registry (it reads
-//! through `Registry::load`, the unlocked read-only path — no `ensure`, no
-//! `update`, so even a `ft doctor` on a machine with no state at all
-//! creates nothing), never signals or kills anything, and never spawns or
-//! installs anything: remediation is printed as a `hint:` line naming the
-//! command that would fix a finding (`ft kill <name>`, `ft sanitize`, …) and
-//! is never executed. Because findings are information rather than command
-//! failures, doctor exits 0 whenever it ran at all; only a genuinely broken
-//! environment (an unresolvable state dir) exits non-zero through the
-//! normal error flow.
+//! Doctor never mutates the registry (it reads through `Registry::load`, the
+//! unlocked read-only path — no `ensure`, no `update`, so even a machine with
+//! no state at all creates nothing), never signals or kills anything, and
+//! never spawns or installs anything: remediation is printed as a `hint:` line
+//! naming the fixing command and is never executed. Findings are information,
+//! not command failures — doctor exits 0 whenever it ran at all; only an
+//! unresolvable state dir exits non-zero.
 //!
-//! The origin probe (`origin_alive`) is shared at `pub(crate)` visibility
-//! with `cmd/sanitize.rs`, the cleanup counterpart: sanitize removes exactly
-//! the services doctor's dead-origin check flags, so the two probe the same
-//! port through the same helper rather than keeping a third copy. It still
-//! duplicates the tiny `upstream_alive` that stays private to `cmd/proxy.rs`
-//! (START's pre-flight) instead of widening that module's API — this repo
-//! deliberately duplicates such small helpers (see the "keep the two in
-//! sync" notes there). The dead-origin finding's wording mirrors the
-//! pre-flight's error message on purpose: both exist to explain that a
-//! tunnel fronting a dead port only ever serves 502s.
+//! The origin probe (`origin_alive`, `pub(crate)`) is shared with
+//! `cmd/sanitize.rs`, the cleanup counterpart, so the two probe the same port
+//! through the same helper; `cmd/proxy.rs`'s pre-flight uses it too. The
+//! dead-origin finding's wording mirrors that pre-flight's error on purpose.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
 
+use super::PROBE_TIMEOUT;
 use crate::error::Result;
 use crate::model::{Registry, Service, ServiceKind, ServiceStatus};
 use crate::output;
 use crate::proc;
 use crate::state::StateDir;
-
-/// How long the origin probe waits for the connect to resolve.
-///
-/// Same value and rationale as `cmd/proxy.rs`'s [`PROBE_TIMEOUT`] (kept in
-/// sync with it): a loopback connect is answered by the local kernel almost
-/// instantly, so this only bounds pathological stacks — nothing is ever read
-/// from the socket.
-const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Severity of one check's outcome.
 ///
@@ -126,28 +103,22 @@ pub struct Check {
 /// Entry point for the DOCTOR command.
 pub async fn run() -> Result<()> {
     // A broken state-dir resolution is the one environment failure doctor
-    // reports by failing itself (the normal Result → exit-1 flow); every
-    // per-check outcome below is informational by contrast.
+    // reports by failing itself; every per-check outcome is informational.
     let state = StateDir::new()?;
 
     let mut checks = vec![cloudflared_check()];
 
     // A missing registry file is the ordinary fresh-install state (load
     // falls back to an empty default → "no services yet", not a finding);
-    // an unloadable one IS the finding — corrupt with no usable backup —
-    // and per-service checks are skipped because there is nothing to walk.
+    // an unloadable one IS the finding, and per-service checks are skipped.
     match Registry::load(&state) {
         Ok(reg) => {
             for svc in &reg.services {
                 let status = svc.status();
-                // Probe the origin only when the worker is alive (Running,
-                // or Starting with a recorded pid): a dead worker already
-                // explains any dead port, and probing a Static service's
-                // port whose worker is gone would just duplicate the
-                // stale finding. (A stale RUN service's port IS probed —
-                // but by [`command_probe`], as the orphan cross-check,
-                // where the answer decides a finding of its own instead of
-                // duplicating the stale one.)
+                // Probe the origin only when the worker is alive: a dead
+                // worker already explains any dead port. (A stale RUN
+                // service's port IS probed — by [`command_probe`], where the
+                // answer decides the orphan finding.)
                 let worker_alive = match status {
                     ServiceStatus::Running => true,
                     ServiceStatus::Starting => svc.worker_pid != 0,
@@ -178,12 +149,10 @@ pub async fn run() -> Result<()> {
 ///
 /// Uses the raw `which::which` lookup rather than
 /// [`crate::cloudflared::ensure_installed`]: that helper bails with the full
-/// multi-line install message — right for a start command that cannot
-/// proceed, wrong for a single check line — while doctor wants the bare
-/// lookup result plus its own one-line hint. A missing `cloudflared` is only
-/// a warning (existing tunnels keep running; new starts are what break), and
-/// must never fail the command: CI machines without it still get their
-/// diagnosis.
+/// multi-line install message — right for a start command, wrong for a
+/// single check line. A missing `cloudflared` is only a warning (existing
+/// tunnels keep running) and must never fail the command: CI machines
+/// without it still get their diagnosis.
 fn cloudflared_check() -> Check {
     match which::which("cloudflared") {
         Ok(path) => Check {
@@ -208,13 +177,11 @@ fn cloudflared_check() -> Check {
 
 /// True when something accepts connections on `127.0.0.1:port`.
 ///
-/// `pub(crate)` so `cmd/sanitize.rs` reuses it for its origin double-probe
-/// (one shared copy rather than a third). Still duplicated from
-/// `cmd/proxy.rs`'s private `upstream_alive` (the pre-flight probe) per this
-/// repo's frozen-core split; keep the two in sync. Loopback-only by
-/// construction; a blocking `std::net` connect is fine here since doctor (and
-/// sanitize, which probes before taking the registry lock) run no other I/O
-/// concurrently.
+/// `pub(crate)`: shared with `cmd/sanitize.rs` (its origin double-probe) and
+/// `cmd/proxy.rs` (its pre-flight) so only one copy of the loopback probe
+/// exists. Loopback-only by construction; a blocking `std::net` connect is
+/// fine here since doctor (and sanitize, which probes before taking the
+/// registry lock) run no other I/O concurrently.
 pub(crate) fn origin_alive(port: u16) -> bool {
     let addr = SocketAddr::new(IpAddr::from(Ipv4Addr::LOCALHOST), port);
     std::net::TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok()
@@ -228,28 +195,24 @@ struct CommandProbe {
     /// The recorded pid, echoed back for the finding wording.
     pid: u32,
     /// Plain existence probe of `pid`. Deliberately NOT an identity check:
-    /// an operator command has no cmdline needle (unlike `run-worker` /
-    /// `cloudflared`), so a recycled pid reads alive — both stale branches'
-    /// hedged wording and the shared verify-first hint exist for that case.
+    /// an operator command has no cmdline needle, so a recycled pid reads
+    /// alive — the hedged wording and the shared verify-first hint exist for
+    /// that case.
     alive: bool,
     /// Whether the run's own port answers. Evidence for the orphan reading,
-    /// never proof of identity: a recycled pid almost never answers on the
-    /// run's port, but an unrelated squatter can hold any port, so the
-    /// wording still stops short of attributing the listener to `pid`.
-    /// Probed unconditionally (a refused loopback connect is answered
-    /// instantly), so the field's meaning never depends on `alive`.
+    /// never proof of identity (an unrelated squatter can hold any port).
+    /// Probed unconditionally, so the field's meaning never depends on
+    /// `alive`.
     port_alive: bool,
 }
 
 /// Probe a `Run` service's recorded command child, if it has one.
 ///
-/// Only a `Run` entry with a recorded `command_pid` (its worker writes it
-/// right after spawning) has a child to ask about — every other kind, and a
-/// run entry still inside its spawn window, probes nothing. A pid of 0 is
-/// refused like an unrecorded one: `kill(0)` would probe the CALLER's own
-/// process group and read as "alive" (the same hazard
-/// `shutdown_process_group` guards for its pgid), and a hand-edited entry
-/// must not conjure an orphan finding out of the doctor process itself.
+/// Only a `Run` entry with a recorded non-zero `command_pid` has a child to
+/// ask about. A pid of 0 is refused like an unrecorded one: `kill(0)` would
+/// probe the CALLER's own process group and read as "alive", and a
+/// hand-edited entry must not conjure an orphan finding out of the doctor
+/// process itself.
 fn command_probe(svc: &Service) -> Option<CommandProbe> {
     if svc.kind != ServiceKind::Run {
         return None;
@@ -262,17 +225,13 @@ fn command_probe(svc: &Service) -> Option<CommandProbe> {
     })
 }
 
-/// Build the checks for one service.
-///
-/// `status` is the service's (already computed) [`Service::status`] — passed
-/// in so `run` and the classification below branch on one and the same
-/// probe — and `origin` is the origin-probe result, `None` when the probe
-/// was skipped because the worker is not alive. `command` is the Run-only
-/// command-child probe ([`command_probe`]), `None` for every other kind and
-/// for a run entry with no recorded pid. With all inputs supplied, this is a
-/// pure decision table over `(status, pid, kind, origin, command,
-/// state_dir)`, which is what makes the classification unit-testable
-/// without touching the real state dir.
+/// Build the checks for one service — a pure decision table over `(status,
+/// pid, kind, origin, command, state_dir)`, which is what makes it
+/// unit-testable without touching the real state dir. `status` is the
+/// already-computed [`Service::status`] (passed in so `run` and the
+/// classification branch on one probe); `origin` is the origin-probe result,
+/// `None` when skipped because the worker is not alive; `command` is the
+/// Run-only child probe.
 fn service_checks(
     svc: &Service,
     status: ServiceStatus,
@@ -283,8 +242,8 @@ fn service_checks(
 
     // --- worker liveness --------------------------------------------------
     // `Service::status` already handles every pid subtlety (pid 0 → Starting
-    // without probing, foreground vs background probing, PID-reuse safety),
-    // so doctor only interprets its verdict — it must not reimplement it.
+    // without probing, foreground vs background probing, PID-reuse safety);
+    // doctor only interprets its verdict.
     match (status, svc.worker_pid) {
         (ServiceStatus::Stale, _) => checks.push(Check {
             name: format!("worker {}", svc.name),
@@ -297,10 +256,9 @@ fn service_checks(
             )),
         }),
         (ServiceStatus::Starting, 0) => {
-            // A pid-0 reservation: fresh ones are ordinary mid-start state
-            // (the parent is inside the reserve→spawn→record window), while
-            // one past the grace is an abandoned reservation — the same
-            // split `ft prune` makes via `start_in_progress`.
+            // A pid-0 reservation: fresh ones are ordinary mid-start state;
+            // one past the grace is abandoned — the same split `ft prune`
+            // makes via `start_in_progress`.
             if svc.start_in_progress() {
                 checks.push(Check {
                     name: format!("worker {}", svc.name),
@@ -339,20 +297,17 @@ fn service_checks(
     }
 
     // --- run command child: orphan detection ---------------------------------
-    // The TASK's motivating orphan: a Run service whose worker died WITHOUT
-    // tearing the command down. Only a Stale worker can orphan anything — a
-    // live worker owns its child (its monitor tears the command down on
-    // exit), so for live workers the command's state is told by the origin
-    // arm below instead. The pid is only existence-probed (no cmdline needle
-    // exists for an operator command), so NEITHER branch may attribute the
-    // live process — or the run's port — to the recorded pid outright: a
+    // The motivating orphan: a Run service whose worker died WITHOUT tearing
+    // the command down. Only a Stale worker can orphan anything — a live
+    // worker owns its child. The pid is only existence-probed (no cmdline
+    // needle exists for an operator command), so NEITHER branch may attribute
+    // the live process or the run's port to the recorded pid outright: a
     // recycled pid plus an unrelated port squatter would otherwise become a
-    // false orphan claim. The port answer only shifts the likelihood (a
-    // recycled pid rarely answers there); both details keep both readings
-    // open, and ONE shared verify-first hint serves the two, because the
-    // safe action is identical either way. A dead pid adds nothing: the
-    // stale worker warning above already says the tunnel is gone, and the
-    // command died with it (the ordinary end).
+    // false orphan claim. The port answer only shifts the likelihood; both
+    // details keep both readings open, and ONE shared verify-first hint
+    // serves the two (the safe action is identical). A dead pid adds
+    // nothing: the stale warning above already says the tunnel is gone, and
+    // the command died with it.
     if status == ServiceStatus::Stale
         && let Some(probe) = command
         && probe.alive
@@ -388,12 +343,11 @@ fn service_checks(
     }
 
     // --- origin probe -----------------------------------------------------
-    // Only reached with a live worker (run passes Some only then). This is
-    // THE doctor check: a Proxy fronts a port the operator owns, so the
-    // port dying underneath a healthy tunnel is invisible to everything
-    // else ft prints. For Static the worker itself hosts the server, so a
-    // closed port with a live worker contradicts the model — an anomaly,
-    // not a certainty.
+    // Only reached with a live worker. This is THE doctor check: a Proxy
+    // fronts a port the operator owns, so the port dying underneath a
+    // healthy tunnel is invisible to everything else ft prints. For
+    // Static/Hook/Drop the worker itself hosts the server, so a closed port
+    // with a live worker is an anomaly, not a certainty.
     if let Some(alive) = origin {
         if alive {
             checks.push(Check {
@@ -419,17 +373,13 @@ fn service_checks(
                         svc.name
                     )),
                 }),
-                // A run service fronts the port its spawned command should
-                // be bound to, so a live worker with nothing listening there
-                // 502s exactly like a proxy — same Fail, but the recorded
-                // command pid tells WHICH story to believe: a still-live pid
-                // is a command that has not bound the port (still starting,
-                // or its listener died under it), an exited one is a command
-                // the worker's monitor should reap within moments, and no
-                // recorded pid means the spawn has not landed yet. (The
-                // STALE-worker counterpart of this finding is the orphan
-                // check above — a dead tunnel with a surviving command is a
-                // different problem than a live tunnel fronting a dead one.)
+                // A run service fronts the port its spawned command should be
+                // bound to, so a live worker with nothing listening 502s
+                // exactly like a proxy — same Fail. The recorded command pid
+                // tells WHICH story: a still-live pid is a command that has
+                // not bound the port, an exited one is a command the worker's
+                // monitor should reap within moments, and no recorded pid
+                // means the spawn has not landed yet.
                 ServiceKind::Run => {
                     let (state, hint) = match command {
                         Some(p) if p.alive => (
@@ -464,12 +414,10 @@ fn service_checks(
                         hint: Some(hint),
                     });
                 }
-                // A3/A4 compile arms (semantically final): Hook and Drop
-                // workers also host their ft-owned origins in-process, so a
-                // live worker with a dead port contradicts the model exactly
-                // like Static — the "built-in server should be listening"
-                // anomaly, same wording. (command_probe stays Run-gated, so
-                // hook/drop entries are naturally probe-free.)
+                // Hook and Drop workers also host their ft-owned origins
+                // in-process, so a live worker with a dead port contradicts
+                // the model exactly like Static. (command_probe stays
+                // Run-gated, so hook/drop entries are probe-free.)
                 ServiceKind::Static | ServiceKind::Hook | ServiceKind::Drop => checks.push(Check {
                     name: format!("origin {}", svc.name),
                     status: CheckStatus::Warn,
@@ -587,7 +535,7 @@ mod tests {
     fn origin_alive_rejects_a_dead_port() {
         // Bind, note the port, then drop the listener: the port is closed
         // again, and nothing else realistically grabs that exact ephemeral
-        // port in the microseconds between (same pattern as proxy.rs).
+        // port in the microseconds between (same technique as `dead_loopback_port` in tests/integration.rs).
         let port = {
             let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
                 .expect("bind loopback listener");
