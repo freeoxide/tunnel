@@ -1,24 +1,14 @@
 //! The RUN command.
 //!
-//! `ft run --port <port> -- <command>` spawns the operator's command (a dev
-//! server), waits for it to accept connections on the port, then registers the
-//! result like any other service: a detached worker owns BOTH the command
-//! child and the `cloudflared` Quick Tunnel pointing straight at
-//! `http://127.0.0.1:<port>` — identical to PROXY. The default background flow
-//! uses the shared reserve-entry → spawn-worker → poll-for-URL scaffolding
-//! (see `cmd/start.rs`, which also hosts the shared foreground machinery
-//! `run_foreground_with_command`).
-//!
-//! The port wait is this command's pre-flight and can only run AFTER the child
-//! exists (the child IS the server, unlike PROXY's already-running upstream):
-//! a friendly "server never came up" — surfacing the command's captured output
-//! — beats a tunnel that comes up happily and then 502s every request. On
-//! timeout the worker's process group is torn down (worker + cloudflared; the
-//! worker's teardown relays to the command's group, which the child leads), so
-//! a failed run leaves nothing running.
-//!
-//! Unlike START there is no directory to resolve or confirm, so there is no
-//! `--yes` flag, and the port must be free (the child has to bind it).
+//! `ft run --port <port> -- <command>` spawns the operator's command, waits
+//! for it to accept connections on the port, then registers the result like
+//! any other service: a detached worker owns BOTH the command child and the
+//! Quick Tunnel pointing at it (PROXY otherwise). The port wait can only run
+//! AFTER the child exists (the child IS the server): a friendly "never came
+//! up" with the captured output beats a tunnel that 502s; on timeout the
+//! worker's group is torn down (relayed to the command's group) — a failed
+//! run leaves nothing running. No `--yes`: no directory to confirm; the port
+//! must be free (the child has to bind it).
 
 use std::ffi::OsString;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -36,26 +26,22 @@ use crate::proc;
 use crate::spawn;
 use crate::state::StateDir;
 
-/// Entry point for the RUN command.
 pub async fn run(
     port: u16,
     name: Option<String>,
     foreground: bool,
     command: &[OsString],
 ) -> Result<()> {
-    // Refuse before touching any state: an empty `--` tail parses cleanly in
-    // clap (a trailing separator with nothing after it), so this is the one
-    // check that keeps `ft run --port 3000 --` a usage error rather than a
-    // service that would run nothing.
+    // Refuse before touching any state: clap parses a trailing `--` with
+    // nothing after it, so this check is what keeps it a usage error.
     ensure!(
         !command.is_empty(),
         "no command given after `--` — pass the command to run and tunnel, e.g. \
          `ft run --port 3000 -- npm start`"
     );
 
-    // Unlike PROXY (whose upstream must already exist) the child here has to
-    // be able to BIND the port, so an occupied one is a friendly up-front
-    // failure instead of a child that dies mid-boot for a non-obvious reason.
+    // The child has to BIND the port (unlike PROXY's existing upstream), so
+    // an occupied one is a friendly up-front failure.
     ensure!(
         port::is_port_free(port),
         "port {port} is already in use — the command ft spawns must be able to \
@@ -63,21 +49,16 @@ pub async fn run(
     );
 
     if foreground {
-        // Shared foreground machinery from cmd/start.rs: no static server, ft
-        // spawns the command itself and fronts it. The foreground operator is
-        // watching the command's output live, so there is deliberately no
-        // port-wait here — the "never came up" surface is the command exiting
-        // (which tears the tunnel down) rather than a silent timeout.
+        // No port-wait in the foreground: the operator watches the command
+        // live; the "never came up" surface is the command exiting.
         crate::cmd::start::run_foreground_with_command(name, Some(port), command).await
     } else {
         run_background(port, name, command).await
     }
 }
 
-/// True when something accepts connections on `127.0.0.1:port` — the async
-/// twin of `doctor::origin_alive` (this runs inside the poll loop, where a
-/// blocking connect would stall the runtime). Loopback-only by construction;
-/// nothing is ever read from the socket.
+/// Async twin of `doctor::origin_alive` — this runs inside the poll loop,
+/// where a blocking connect would stall the runtime. Loopback-only by build.
 async fn origin_ready(port: u16) -> bool {
     let addr = SocketAddr::new(IpAddr::from(Ipv4Addr::LOCALHOST), port);
     matches!(
@@ -86,9 +67,7 @@ async fn origin_ready(port: u16) -> bool {
     )
 }
 
-/// Display form of the child command for error messages: the full argv,
-/// lossily joined (commands are operator-typed and overwhelmingly UTF-8; the
-/// message must never fail over a weird byte).
+/// The full argv, lossily joined — the message must never fail on a weird byte.
 fn command_display(command: &[OsString]) -> String {
     command
         .iter()
@@ -97,26 +76,20 @@ fn command_display(command: &[OsString]) -> String {
         .join(" ")
 }
 
-/// Background flow: reserve the entry, spawn the detached worker (carrying
-/// the child command in its argv), then poll for the tunnel URL AND the
-/// command's port (failing fast if the worker dies first). Unlike the shared
-/// poll loop, a published URL alone is not success: cloudflared connects
-/// lazily, so "running" means the command is actually listening.
+/// Background flow: reserve, spawn the worker (command in its argv), poll for
+/// URL AND port — cloudflared connects lazily: "running" means listening.
 async fn run_background(port: u16, name: Option<String>, command: &[OsString]) -> Result<()> {
     let state = StateDir::new()?;
 
     // --- cloudflared ------------------------------------------------------
-    // Looked up BEFORE reserving anything, so a missing binary fails without
-    // leaving a half-started entry to clean up (same ordering as START/PROXY).
+    // Looked up BEFORE reserving: a missing binary leaves no half-started entry.
     cloudflared::ensure_installed()?;
 
     state.ensure()?;
 
     // --- Reserve name + id + entry atomically -----------------------------
-    // The shared reservation (see `cmd/start.rs::reserve_entry`), including
-    // the START_GRACE protection during the reserve→spawn→record window. The
-    // command child's pid is NOT known here — the worker spawns it and
-    // records `command_pid` itself.
+    // Shared reservation incl. START_GRACE; the command pid lands later
+    // (the worker spawns it and records `command_pid`).
     let (id, name) = start::reserve_entry(
         &state,
         ServiceKind::Run,
@@ -130,8 +103,8 @@ async fn run_background(port: u16, name: Option<String>, command: &[OsString]) -
     )?;
 
     // --- Spawn worker -----------------------------------------------------
-    // `dir: None` spawns a directory-less worker; the child command rides in
-    // the argv after `--` and only a Run-kind worker ever reads it.
+    // `dir: None` = directory-less worker; the command rides the argv
+    // after `--`, read only by a Run worker.
     let worker_pid = match spawn::spawn_worker_with_command(id, &name, None, port, command) {
         Ok(pid) => pid,
         Err(e) => {
@@ -142,11 +115,8 @@ async fn run_background(port: u16, name: Option<String>, command: &[OsString]) -
     start::record_worker_pid(&state, id, worker_pid)?;
 
     // --- Poll for the tunnel URL and the command's port -------------------
-    // Same mtime-gated loop as the shared poll (the worker rewrites
-    // registry.json only when it discovers the URL or self-removes), with one
-    // extra condition: cloudflared connects lazily, so a published URL alone
-    // proves nothing about the origin — "running" means the command is
-    // actually listening too.
+    // Shared mtime-gated loop + one extra condition: cloudflared connects
+    // lazily — the command must actually be listening.
     let registry_path = state.registry_path();
     let mut last_mtime = std::fs::metadata(&registry_path)
         .and_then(|m| m.modified())
@@ -168,9 +138,8 @@ async fn run_background(port: u16, name: Option<String>, command: &[OsString]) -
             last_mtime = new_mtime;
             Some(Registry::load(&state)?.find(&id.to_string()).cloned())
         } else {
-            // Registry unchanged: probe the recorded pid directly to keep the
-            // fail-fast behaviour (the worker may have died silently between
-            // rewrites).
+            // Registry unchanged: probe the recorded pid directly to keep
+            // fail-fast (the worker may have died silently between rewrites).
             if !proc::pid_alive(worker_pid) {
                 return fail_start(&state, &id, &name, worker_pid, command, origin_up).await;
             }
@@ -189,14 +158,12 @@ async fn run_background(port: u16, name: Option<String>, command: &[OsString]) -
             }
             Some(Some(svc)) if !proc::pid_alive(svc.worker_pid) => {
                 // Worker died before publishing — surface the reason inline
-                // (the entry is removed, so the user cannot go to `ft logs`
-                // afterwards).
+                // (the entry is removed; `ft logs` won't exist afterwards).
                 return fail_start(&state, &id, &name, worker_pid, command, origin_up).await;
             }
             Some(None) => {
-                // Our entry vanished — a concurrent `ft kill`, or the worker
-                // self-removed on its own failure. Tear the worker down now
-                // instead of polling the full 30 s with a live orphan.
+                // Our entry vanished — concurrent `ft kill` or the worker's
+                // own self-remove; tear down, don't poll 30 s with an orphan.
                 return fail_start(&state, &id, &name, worker_pid, command, origin_up).await;
             }
             // Still starting, or unchanged registry: poll again.
@@ -204,12 +171,8 @@ async fn run_background(port: u16, name: Option<String>, command: &[OsString]) -
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
-    // Timed out: the worker + cloudflared + command may still be alive, so
-    // tear them all down (the group kill takes the worker and cloudflared
-    // down directly; the worker's teardown relays to the command child's
-    // group). The message depends on WHICH half never arrived: a dead origin
-    // gets the command's captured output — same reasoning as PROXY's
-    // pre-flight.
+    // Timed out: tear everything down (group kill + relay to the command's
+    // group); the message names WHICH half never arrived.
     start::teardown(&state, id, worker_pid, "URL timeout").await;
     let reason = last_reason(&state, &name);
     if origin_up {
@@ -223,10 +186,8 @@ async fn run_background(port: u16, name: Option<String>, command: &[OsString]) -
     }
 }
 
-/// Tear the just-started service down and fail: the poll loop's fail-fast
-/// arms (worker death, vanished entry). The group kill reaches cloudflared
-/// directly while the worker's own teardown relays to the command child's
-/// group; the surfaced reason for a run is usually the command's own output.
+/// The poll loop's fail-fast arm (worker death, vanished entry): teardown +
+/// a reason that for a run is usually the command's own output.
 async fn fail_start(
     state: &StateDir,
     id: &u64,
@@ -238,9 +199,8 @@ async fn fail_start(
     start::teardown(state, *id, worker_pid, "worker death").await;
     let reason = last_reason(state, name);
     if origin_up {
-        // The port WAS answering; its death is the command exiting. Same
-        // message shape as the never-came-up case: the operator's next step
-        // is the same — read the command's output.
+        // The port WAS answering; its death is the command exiting — same
+        // message shape, the operator's next step is the same.
         bail!(
             "'{}' exited before the tunnel came up{reason}",
             command_display(command)
@@ -250,10 +210,8 @@ async fn fail_start(
     }
 }
 
-/// Best-effort last non-empty log line for a start-failure message. Unlike
-/// the shared `start::last_reason` (tunnel.log first), a run checks
-/// `worker.log` first: the interesting failure is almost always the command's
-/// own captured output, teed into worker.log by the worker.
+/// Like the shared `start::last_reason` but `worker.log` FIRST: a run's
+/// interesting failure is almost always the command's own captured output.
 fn last_reason(state: &StateDir, name: &str) -> String {
     let pick = [state.worker_log(name), state.tunnel_log(name)]
         .into_iter()
@@ -282,9 +240,8 @@ mod tests {
 
     #[tokio::test]
     async fn origin_ready_rejects_a_dead_port() {
-        // Bind, note the port, then drop the listener: the port is closed
-        // again, and nothing else realistically grabs that exact ephemeral
-        // port in the microseconds between (same technique as cmd/doctor.rs).
+        // Bind then drop the listener: nothing else grabs that exact
+        // ephemeral port in between (same technique as cmd/doctor.rs).
         let port = {
             let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
                 .expect("bind loopback listener");

@@ -1,35 +1,14 @@
 //! The DROP command: `ft drop <dir>` runs an ft-owned upload-receiver origin
-//! (see `drop_server`) behind a cloudflared Quick Tunnel. The background flow
-//! mirrors START's reserve-entry → spawn-worker → poll-for-URL shape,
-//! sharing `cmd/start.rs`'s fail-fast helpers (`fail_start`/`fail_timeout`);
-//! the poll loop itself is drop-specific (the success arm also prints the
-//! token). The worker binds the origin itself on `127.0.0.1:<port>`
-//! (fail-fast on a bind error), so success is "URL published" — no separate
-//! origin probe.
+//! (see `drop_server`) behind a Quick Tunnel, mirroring START's reserve →
+//! spawn-worker → poll-for-URL shape (sharing start's fail-fast helpers); the
+//! worker binds the origin itself, so success is "URL published".
 //!
-//! The START flow's directory safety checks (`resolve_dir` +
-//! `is_sensitive_dir`) run BEFORE any state is touched, and the worker
-//! re-runs them (same defense-in-depth split as Static). A sensitive
-//! directory is refused UNCONDITIONALLY — no `--yes` exists here: a drop
-//! bucket is WRITE-touched by the public tunnel, strictly more dangerous
-//! than a read-only static publish, and a detached worker could not confirm
-//! anyway.
-//!
-//! The token is resolved before any state exists (`--token`, non-empty after
-//! a single trim, or a fresh [`drop_server::generate_token`] mint), stored
-//! 0600 in the service's state dir after the entry is reserved and before
-//! the worker spawns (the worker reads it back fail-fast), printed once on
-//! success, and shown by `ft detail`.
-//!
-//! One bucket, one owner: a directory already a drop target refuses a second
-//! drop service (checked inside the reserve's flock — see
-//! [`find_drop_dir_conflict`]); the origin's write path is cross-process safe
-//! on its own regardless (see `drop_server`).
-//!
-//! The foreground flow mirrors `cmd/start.rs::run_foreground_inner`'s shape
-//! but stays separate: a merge needs a fourth origin variant (static/proxy/
-//! run + drop), and the drop-specific parts (token file before the origin,
-//! token block printed as soon as the origin is up) read clearer inline.
+//! `resolve_dir` + `is_sensitive_dir` run before any state (the worker
+//! re-runs them); a sensitive directory is refused UNCONDITIONALLY — no
+//! `--yes`: a drop bucket is WRITE-touched by the public tunnel. The token is
+//! resolved before any state (trimmed once, or a fresh mint), stored 0600
+//! after the reserve and before the worker spawns. One bucket, one owner: a
+//! directory already a drop target refuses a second drop service.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -56,7 +35,6 @@ use crate::server::drop_server::{self, DropStore};
 use crate::spawn;
 use crate::state::StateDir;
 
-/// Entry point for the DROP command.
 pub async fn run(
     dir: PathBuf,
     port: Option<u16>,
@@ -65,9 +43,8 @@ pub async fn run(
     token: Option<String>,
     max_size: Option<u64>,
 ) -> Result<()> {
-    // Pre-flight 1: the upload target. Resolves like a static publish;
-    // sensitive directories are refused unconditionally (see module docs) —
-    // before any state is touched, so a rejection leaves zero state.
+    // Pre-flight 1: the upload target — resolved like a static publish;
+    // sensitive dirs refused unconditionally (module docs), zero state left.
     let dir = resolve_dir(&dir)?;
     ensure!(
         !is_sensitive_dir(&dir),
@@ -76,9 +53,8 @@ pub async fn run(
         dir.display()
     );
 
-    // Pre-flight 2: ft's own origin, so the port must be FREE — a friendly
-    // up-front failure beats a tunnel fronting a worker that dies on its bind
-    // check seconds later.
+    // Pre-flight 2: ft's own origin, so the port must be FREE — fail up
+    // front rather than a worker dying on its bind check seconds later.
     let port = match port {
         Some(p) => {
             ensure!(
@@ -91,11 +67,8 @@ pub async fn run(
         None => port::allocate_free_port()?,
     };
 
-    // Resolved TRIMMED ONCE, HERE: the value every downstream consumer sees —
-    // token file, printed credential, the origin's comparison value — so an
-    // edge-whitespace shell quote cannot 401 its own pasted twin. An
-    // explicitly empty (or whitespace-only) token is refused rather than
-    // silently minted (the operator asked for a specific secret).
+    // Resolved TRIMMED ONCE, HERE — the single binding every consumer sees
+    // (file, printed credential, comparison): no 401 on a pasted twin.
     let token = resolve_token(token)?;
     // The per-upload cap; the total-store cap is the fixed
     // drop_server::MAX_TOTAL_STORE.
@@ -108,9 +81,8 @@ pub async fn run(
     }
 }
 
-/// Resolve the drop access token: the operator's `--token` trimmed once,
-/// refused when whitespace-only, or a freshly minted CSPRNG one when
-/// omitted. The returned value is the single binding every consumer sees.
+/// Resolve the drop token: `--token` trimmed once (refused when empty), or
+/// a freshly minted CSPRNG one when omitted.
 fn resolve_token(token: Option<String>) -> Result<String> {
     match token {
         Some(t) => {
@@ -122,10 +94,8 @@ fn resolve_token(token: Option<String>) -> Result<String> {
     }
 }
 
-/// Background flow: reserve the entry, write the token file, spawn the
-/// detached DROP worker (which binds the origin itself), then poll for the
-/// tunnel URL (failing fast if the worker dies first). A drop-specific
-/// sibling of start's `poll_for_url`: the success arm also prints the token.
+/// Background flow: reserve, write the token file, spawn the detached DROP
+/// worker, poll for the URL (fail-fast); the success arm also prints the token.
 async fn run_background(
     dir: PathBuf,
     port: u16,
@@ -141,18 +111,12 @@ async fn run_background(
 
     state.ensure()?;
 
-    // Reserve name + id + entry atomically. `worker_pid: 0` + a fresh
-    // `created_at` put the entry inside `model::START_GRACE`, so a concurrent
-    // `ft kill`/`ft prune` refuses to reap it during the reserve→spawn→record
-    // window below (do NOT add pid-0 staleness handling of our own —
-    // `Service::start_in_progress` owns it). Token/spawn failure, worker
-    // death, and the URL timeout below all remove the entry by id,
-    // bypassing the grace guard.
+    // Reserve atomically under the grace-window contract of start's
+    // `reserve_entry`; every failure path below removes the entry by id.
     let (id, name, service_dir) = reserve_entry(&state, &dir, port, name, 0, false)?;
 
-    // Written BEFORE the worker is spawned (it reads the token at startup and
-    // fail-fasts without it) and after the reserve, so the file's lifetime is
-    // bounded by the entry's. A failure here removes the entry.
+    // Written AFTER the reserve (lifetime bounded by the entry's) and BEFORE
+    // the worker spawn (it reads the token at startup, fail-fast without it).
     if let Err(e) = drop_server::store_token(&service_dir, &token) {
         let _ = Registry::update(&state, |reg| {
             reg.remove(id);
@@ -161,9 +125,8 @@ async fn run_background(
             .with_context(|| format!("storing the drop token in {}", service_dir.display()));
     }
 
-    // The worker carries the real `dir` (unlike hook's directory-less worker)
-    // and the `--max-size` cap; the DROP arm binds the origin after reading
-    // the token file back.
+    // The worker carries the real `dir` and the `--max-size` cap; the DROP
+    // arm binds the origin after reading the token file back.
     let worker_pid = match spawn::spawn_drop_worker(id, &name, &dir, port, max_size) {
         Ok(pid) => pid,
         Err(e) => {
@@ -172,9 +135,7 @@ async fn run_background(
             return Err(e);
         }
     };
-    // Record the real worker pid under the lock, keyed by the stable numeric
-    // id (the name may be reused after a kill; an id key is immune to that
-    // and matches how the worker looks itself up).
+    // Keyed by id: the name may be reused after a kill.
     Registry::update(&state, |reg| {
         if let Some(svc) = reg.find_mut(&id.to_string()) {
             svc.worker_pid = worker_pid;
@@ -205,8 +166,7 @@ async fn run_background(
                 Ok(reg) => Some(reg.find(&id.to_string()).cloned()),
                 Err(e) => {
                     // Registry unreadable mid-poll: tear the live worker down
-                    // (start::teardown's shutdown-then-remove-by-id) first —
-                    // bailing bare would orphan it — then surface the cause.
+                    // first (bailing bare would orphan it), then surface the cause.
                     teardown(&state, id, worker_pid, "registry read error").await;
                     return Err(e).context("re-reading the registry during the drop start poll");
                 }
@@ -223,22 +183,19 @@ async fn run_background(
         match snapshot {
             Some(Some(svc)) if svc.public_url.is_some() => {
                 // No extra origin probe (unlike RUN): the worker bound the
-                // drop origin (and read the token file) before spawning
-                // cloudflared, so a published URL already implies an origin.
+                // origin before spawning cloudflared — URL implies origin.
                 output::print_started(&svc);
                 output::print_drop_token(&token, svc.public_url.as_deref().unwrap_or(""));
                 return Ok(());
             }
             Some(Some(svc)) if !proc::pid_alive(svc.worker_pid) => {
                 // Worker died before publishing — surface the reason inline
-                // (the entry is removed below, so the user cannot go to
-                // `ft logs` afterwards).
+                // (the entry is removed; `ft logs` won't exist afterwards).
                 return fail_start(&state, id, &name, worker_pid).await;
             }
             Some(None) => {
-                // Entry vanished — a concurrent `ft kill`, or the worker
-                // self-removed on its own failure. Tear the worker down and
-                // bail instead of polling the full 30s with a live orphan.
+                // Entry vanished — concurrent `ft kill` or the worker's own
+                // self-remove; tear down, don't poll 30 s with a live orphan.
                 return fail_start(&state, id, &name, worker_pid).await;
             }
             // Still starting, or unchanged registry: poll again.
@@ -251,10 +208,8 @@ async fn run_background(
     fail_timeout(&state, id, &name, worker_pid).await
 }
 
-/// Reserve the drop entry inside the `Registry::update` flock. Drop-specific
-/// (not the shared `start::reserve_entry`): it refuses a second drop service
-/// on the same bucket (see [`find_drop_dir_conflict`]) and returns the
-/// service dir so the caller can store the token file before spawning.
+/// Reserve the drop entry inside the flock — drop-specific: refuses a second
+/// drop service on the same bucket and returns the service dir for the token.
 fn reserve_entry(
     state: &StateDir,
     dir: &Path,
@@ -279,8 +234,7 @@ fn reserve_entry(
                 ensure!(!reg.name_exists(n), "a service named '{n}' already exists");
                 n.clone()
             }
-            // drop-{port} in BOTH flows (mirroring the hook-{port}
-            // convention), so both modes of `ft drop` produce the same name.
+            // drop-{port} in both flows, mirroring the hook-{port} convention.
             None => name::unique_name(reg, &format!("drop-{port}")),
         };
         let service_dir = state.ensure_service_dir(&name)?;
@@ -307,15 +261,12 @@ fn reserve_entry(
     })?
 }
 
-/// One bucket, one owner: find an existing Drop service whose upload target
-/// IS `dir` (canonical comparison — aliases and `..` spellings resolve to
-/// the same answer), returning its name. Two origins on one directory would
-/// race writes and stack their 1 GiB total-cap allowances. Checked INSIDE
-/// the `Registry::update` flock, so concurrent `ft drop`s are serialized.
-/// Only Drop-vs-Drop conflicts: a read-only Static publish of the same
-/// directory is untouched by uploads and stays allowed. An unresolvable
-/// entry dir cannot be PROVEN equal, so it does not conflict (the worker's
-/// own resolve_dir check refuses such a bucket at startup anyway).
+/// One bucket, one owner: find an existing Drop service whose target IS
+/// `dir` (canonical comparison — aliases and `..` spellings resolve alike).
+/// Two origins would race writes and stack their total-cap allowances.
+/// Checked INSIDE the flock, so concurrent `ft drop`s serialize. Only
+/// Drop-vs-Drop: a read-only Static publish of the same dir stays allowed.
+/// An unresolvable entry dir cannot be PROVEN equal, so no conflict.
 fn find_drop_dir_conflict(reg: &Registry, dir: &Path) -> Option<String> {
     let target = std::fs::canonicalize(dir).ok()?;
     reg.services
@@ -336,11 +287,8 @@ enum ReaderExit {
     Signal,
 }
 
-/// Foreground flow: run the drop origin and tunnel in THIS process and block
-/// until cloudflared exits, Ctrl-C is received, or (Unix) SIGTERM arrives.
-/// Drop-specific: the origin writes uploads into the target directory, the
-/// token file is written before the origin starts, and the token block is
-/// printed as soon as the origin is up.
+/// Foreground flow: origin + tunnel in THIS process until cloudflared exits,
+/// Ctrl-C, or SIGTERM; token file before the origin, token block right after.
 async fn run_foreground(
     dir: PathBuf,
     port: u16,
@@ -355,9 +303,8 @@ async fn run_foreground(
 
     cloudflared::ensure_installed()?;
 
-    // Reserve a FOREGROUND entry whose worker_pid is THIS process, so `ft
-    // ls/detail/logs/open` see the tunnel on every platform (notably Windows,
-    // where foreground is the only practical mode).
+    // Reserve a FOREGROUND entry, worker_pid = THIS process (visible to
+    // ls/detail/logs/open on every platform).
     let (id, name, service_dir) =
         reserve_entry(&state, &dir, port, name, std::process::id(), true)?;
 
@@ -378,17 +325,14 @@ async fn run_foreground(
             .with_context(|| format!("opening tunnel log {}", tunnel_log.display()))?,
     ));
 
-    // Install the SIGTERM handler (Unix) BEFORE spawning the server +
-    // cloudflared: if it fails, the `?` returns with only the (guard
-    // protected) entry to clean up — no orphaned server task or child.
+    // Install the SIGTERM handler BEFORE spawning server + cloudflared: on
+    // failure the `?` leaves only the guard-protected entry, no orphans.
     #[cfg(unix)]
     let mut sig_term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("installing SIGTERM handler")?;
 
-    // The origin: ft's own drop server in THIS process. `serve` binds
-    // 127.0.0.1:<port> and installs its own Ctrl-C drain; the JoinHandle is
-    // kept so the drain can be bounded below. A store that cannot open
-    // fails here — inside the guard, before anything else is spawned.
+    // ft's own drop server in THIS process; `serve` installs its own Ctrl-C
+    // drain, bounded below. A store that cannot open fails inside the guard.
     let store = DropStore::open(&dir, token.clone(), max_size, drop_server::MAX_TOTAL_STORE)
         .with_context(|| format!("opening the drop bucket at {}", dir.display()))?;
     let router = drop_server::router(store);
@@ -413,9 +357,8 @@ async fn run_foreground(
     };
     let tunnel_pid = child.id();
 
-    // Mirror cloudflared output to stdout AND tunnel.log, and publish the
-    // public URL on first discovery (so `ft open`/`ft detail` work too) —
-    // via start's shared drain_and_announce.
+    // Mirror cloudflared output to stdout AND tunnel.log, publish the URL on
+    // first discovery — via start's shared drain_and_announce.
     let found = Arc::new(AtomicBool::new(false));
     let mut tasks = Vec::new();
     if let Some(out) = child.stdout.take() {
@@ -443,9 +386,8 @@ async fn run_foreground(
         )));
     }
 
-    // Keep the foreground alive until cloudflared exits, Ctrl-C, or (Unix)
-    // SIGTERM; racing child.wait() tears down instead of hanging if
-    // cloudflared dies before the URL is found (or any time later).
+    // Race child.wait() against Ctrl-C/SIGTERM so a cloudflared that dies
+    // tears down instead of hanging.
     #[cfg(unix)]
     let exit_reason = tokio::select! {
         status = child.wait() => {
@@ -480,9 +422,7 @@ async fn run_foreground(
     };
 
     // If cloudflared may still be alive, shut it down and reap it (on
-    // ChildExited the select's wait() already reaped it). The
-    // signal/escalation/reap sequence is shared with the detached worker via
-    // [`cloudflared::shutdown`].
+    // ChildExited the select's wait() already reaped it).
     if matches!(exit_reason, ReaderExit::Signal) {
         cloudflared::shutdown(tunnel_pid, &mut child).await;
     }
@@ -504,7 +444,6 @@ async fn run_foreground(
         }
     }
 
-    // The `_entry` guard removes our registry entry on return.
     Ok(())
 }
 
@@ -553,10 +492,8 @@ mod tests {
 
     #[test]
     fn resolve_token_trims_once_and_refuses_whitespace_only() {
-        // Regression: --token used to be validated via `t.trim()` but STORED
-        // and PRINTED untrimmed, so an edge-whitespace token 401'd every
-        // background upload. The resolved value is the single binding every
-        // consumer sees — it must BE the trimmed secret.
+        // Regression: --token used to be validated via trim() but stored
+        // untrimmed — an edge-whitespace token 401'd every upload.
         assert_eq!(
             resolve_token(Some("  sekrit  ".to_string())).expect("padded token"),
             "sekrit",
@@ -658,9 +595,8 @@ mod tests {
 
     #[test]
     fn unresolvable_existing_dir_is_no_conflict() {
-        // An entry whose dir cannot be proven equal (missing, or dir-less
-        // via hand-edit) does not conflict; the worker's own resolve_dir
-        // check refuses such a bucket at startup anyway.
+        // An entry whose dir cannot be proven equal does not conflict; the
+        // worker's own resolve_dir check refuses such a bucket at startup.
         let tmp = tempfile::tempdir().expect("tempdir");
         let bucket = tmp.path().join("bucket");
         std::fs::create_dir_all(&bucket).expect("mkdir");

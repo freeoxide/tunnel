@@ -1,17 +1,11 @@
-//! Cross-platform filesystem helpers for private file/directory creation.
-//!
-//! On Unix, log files and the state directory can contain request URIs and
-//! local paths, so they are created owner-only (0600/0700). On Windows the
-//! std API has no chmod equivalent; the state tree lives under the user's
-//! profile and its ACL, so the helpers fall back to a plain create there.
+//! Private file/dir creation: Unix owner-only (0600/0700 — logs can hold
+//! request URIs/paths); Windows plain creates (profile-dir ACL, no chmod).
 
 use std::path::Path;
 
 use anyhow::Context;
 
-/// Open (creating if missing) `path` in append mode with owner-only permissions
-/// on Unix, or a plain append-create on Windows. Returns the blocking file
-/// handle.
+/// Append-create (owner-only on Unix, plain on Windows); blocking handle.
 pub fn open_private_append(path: impl AsRef<Path>) -> std::io::Result<std::fs::File> {
     let path = path.as_ref();
     #[cfg(unix)]
@@ -56,8 +50,7 @@ pub async fn open_private_append_async(path: impl AsRef<Path>) -> std::io::Resul
     }
 }
 
-/// Create `dir` (and parents) with owner-only permissions on Unix, or a plain
-/// recursive create on Windows. Pre-existing directories are left as-is.
+/// Create `dir` (+parents), owner-only on Unix; pre-existing dirs re-sealed.
 pub fn ensure_private_dir(dir: impl AsRef<Path>) -> anyhow::Result<()> {
     let dir = dir.as_ref();
     #[cfg(unix)]
@@ -81,8 +74,8 @@ pub fn ensure_private_dir(dir: impl AsRef<Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Apply owner-only (0600) permissions to an [`std::fs::OpenOptions`] builder
-/// on Unix; a no-op on Windows (profile-dir ACL, no chmod equivalent).
+/// Owner-only (0600) mode on an [`std::fs::OpenOptions`] builder; no-op on
+/// Windows (profile-dir ACL, no chmod equivalent).
 pub fn apply_private_mode(opts: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOptions {
     #[cfg(unix)]
     {

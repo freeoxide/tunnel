@@ -1,9 +1,5 @@
-//! Discovery and lifecycle of the `cloudflared` Quick Tunnel process.
-//!
-//! `cloudflared` is an external binary downloaded by the user; we never
-//! vendor it. This module locates it on `PATH`, parses the Quick Tunnel URL
-//! from its log output, and spawns it as a tokio child whose `stdout` and
-//! `stderr` are piped back to the caller.
+//! cloudflared discovery + lifecycle: locate the (never vendored) binary on
+//! PATH, parse the tunnel URL from its log output, spawn it with piped stdio.
 
 use crate::error::Result;
 use anyhow::{Context, bail};
@@ -28,10 +24,7 @@ Install cloudflared, then try again:
     macOS:   brew install cloudflared
     Windows: winget install Cloudflare.cloudflared";
 
-/// Ensure `cloudflared` is installed and on `PATH`.
-///
-/// Returns the resolved path to the binary on success. On failure, bails
-/// out with the friendly install message rather than a raw lookup error.
+/// Resolve cloudflared on PATH or bail with the friendly install message.
 pub fn ensure_installed() -> Result<PathBuf> {
     match which::which("cloudflared") {
         Ok(path) => Ok(path),
@@ -39,13 +32,10 @@ pub fn ensure_installed() -> Result<PathBuf> {
     }
 }
 
-/// Extract the first Quick Tunnel URL from a line of `cloudflared` output.
-///
-/// Scans every `https://` occurrence left-to-right. For each candidate the
-/// host is taken by stripping the `https://` prefix and reading up to the
-/// first `/` or `?`. The first candidate whose host ends with
-/// `.trycloudflare.com` is returned (with trailing punctuation stripped);
-/// any earlier non-tunnel `https://` (e.g. a documentation link) is skipped.
+/// Extract the first Quick Tunnel URL from a line: scans `https://`
+/// occurrences left-to-right, taking each host up to the first `/` or `?`;
+/// the first `.trycloudflare.com` host wins — earlier non-tunnel URLs
+/// (e.g. doc links) are skipped.
 pub fn extract_url(text: &str) -> Option<String> {
     let mut search_from = 0;
     while let Some(rel) = text[search_from..].find("https://") {
@@ -55,7 +45,6 @@ pub fn extract_url(text: &str) -> Option<String> {
         let url = rest.split_whitespace().next()?;
         // Strip any trailing punctuation that cloudflared occasionally appends.
         let url = url.trim_end_matches(['.', ')', ',', ';', '"', '\'']);
-        // Host = after `https://`, up to the first `/` or `?`.
         let host = url
             .strip_prefix("https://")
             .map(|s| s.split(['/', '?']).next().unwrap_or(""))
@@ -69,11 +58,8 @@ pub fn extract_url(text: &str) -> Option<String> {
     None
 }
 
-/// True if `url` is an `https://` URL whose host ends with `.trycloudflare.com`.
-///
-/// Used to re-validate a stored `public_url` before it is handed to the browser
-/// launcher: `public_url` lives in the user-editable `registry.json`, so we
-/// cannot assume it still has the shape [`extract_url`] produced.
+/// Re-validates a stored `public_url` (user-editable registry.json) before
+/// the browser launcher sees it: https + host ending in .trycloudflare.com.
 pub fn is_tunnel_url(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("https://") else {
         return false;
@@ -82,11 +68,8 @@ pub fn is_tunnel_url(url: &str) -> bool {
     !host.is_empty() && host.ends_with(".trycloudflare.com")
 }
 
-/// Spawn a `cloudflared` Quick Tunnel pointing at the local server.
-///
-/// The child's `stdout` and `stderr` are piped; the caller is responsible
-/// for reading them line by line, applying [`extract_url`], and teeing the
-/// output to `tunnel.log`.
+/// Spawn a Quick Tunnel pointing at the local server; stdout/stderr piped —
+/// the caller reads them, applies [`extract_url`], tees to tunnel.log.
 pub fn spawn(port: u16) -> Result<Child> {
     let cloudflared = ensure_installed()?;
 
@@ -102,16 +85,11 @@ pub fn spawn(port: u16) -> Result<Child> {
     .stderr(std::process::Stdio::piped());
 
     // cloudflared deliberately inherits the spawner's process group: the
-    // worker's group kill reaches it directly (even if the worker already died
-    // and cannot relay a signal), and a terminal Ctrl+C reaches it in the
-    // foreground flow. NO setsid() here — that would orphan it on kill.
+    // worker's group kill reaches it directly (even if the worker already
+    // died), and terminal Ctrl-C reaches it in the foreground. NO setsid().
 
-    // On Linux, PDEATHSIG asks the kernel to SIGKILL cloudflared if the worker
-    // dies — even via SIGKILL/OOM — so no orphaned tunnel remains. The hook
-    // (shared with the command-child spawn) re-checks getppid() after prctl to
-    // close the fork→prctl reparenting window, and surfaces a failed prctl
-    // instead of exec'ing without the death signal. See
-    // [`crate::proc::parent_death_signal`].
+    // On Linux, PDEATHSIG SIGKILLs cloudflared if the worker dies (even via
+    // SIGKILL/OOM) — no orphaned tunnel. See [`crate::proc::parent_death_signal`].
     #[cfg(target_os = "linux")]
     unsafe {
         cmd.pre_exec(crate::proc::parent_death_signal);
@@ -123,11 +101,8 @@ pub fn spawn(port: u16) -> Result<Child> {
     Ok(child)
 }
 
-/// Shut down a `cloudflared` child this process owns, then reap it (shared by
-/// the detached worker and the foreground flow). Unix: SIGTERM by pid, then
-/// SIGKILL after [`SHUTDOWN_GRACE`]. Windows: no signal/group teardown — the
-/// owned child is force-killed (the worker's Job Object reaps it on the
-/// worker's exit). No-op after `child.wait()` has already reaped it.
+/// Shut down + reap an owned cloudflared: Unix SIGTERM → SIGKILL after
+/// [`SHUTDOWN_GRACE`]; Windows force-kills the handle. No-op if reaped.
 pub async fn shutdown(tunnel_pid: Option<u32>, child: &mut Child) {
     #[cfg(unix)]
     {
@@ -277,9 +252,8 @@ mod tests {
     use proptest::prelude::*;
 
     proptest! {
-        /// Anything extract_url returns is always a well-formed Quick Tunnel URL:
-        /// `https://` + a host ending in `.trycloudflare.com`, and it round-trips
-        /// through `is_tunnel_url`.
+        /// Anything extract_url returns is a well-formed Quick Tunnel URL
+        /// that round-trips through `is_tunnel_url`.
         #[test]
         fn extract_url_only_yields_tunnel_urls(
             prefix in "[a-zA-Z0-9 .,|:!?/<>\"'-]{0,40}",
@@ -297,9 +271,8 @@ mod tests {
             }
         }
 
-        /// With a non-tunnel `https://host` placed AFTER the tunnel URL, the
-        /// tunnel URL is still the one returned (exercises the scan-past loop
-        /// from the right side).
+        /// A non-tunnel `https://host` AFTER the tunnel URL does not
+        /// distract the scan-past loop.
         #[test]
         fn picks_tunnel_when_non_tunnel_follows(
             prefix in "[a-zA-Z0-9 .,|:!?/<>\"'-]{0,20}",

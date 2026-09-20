@@ -1,11 +1,8 @@
-//! Detached worker process spawning.
-//!
-//! The background start flows re-invoke the current binary as
-//! `ft run-worker ...` in a new session, so the worker (and its `cloudflared`
-//! child) survive the parent `ft` exiting. The worker's stdout/stderr are
-//! redirected to its `worker.log` (readable later via `ft logs`). On Unix the
-//! child is made a session/process-group leader via a `setsid()` `pre_exec`,
-//! so `kill(-worker_pid)` later reaches the worker and everything it spawned.
+//! Detached worker spawning: background starts re-invoke the binary as
+//! `ft run-worker ...` in a new session (worker + cloudflared survive the
+//! parent exiting); stdout/stderr append to `worker.log`. On Unix a
+//! `setsid()` pre_exec makes the child a group leader so `kill(-worker_pid)`
+//! reaches the whole tree.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -13,10 +10,8 @@ use std::path::Path;
 use crate::error::Result;
 use crate::state::StateDir;
 
-/// A best-effort handshake value handed to the spawned worker via its
-/// environment: the worker refuses to run without it, so `ft run-worker`
-/// cannot be invoked directly to bypass START's validation. A local handshake,
-/// not a network secret — it only needs to be *set*, never guessed.
+/// Handshake env value: the worker refuses to run without it, so a direct
+/// `ft run-worker` cannot bypass START's validation. Needs to be set, not guessed.
 fn worker_token() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -26,22 +21,14 @@ fn worker_token() -> String {
     format!("{mixed:016x}")
 }
 
-/// Stand-in value for the mandatory `--dir` flag when spawning a worker that
-/// has no directory (proxy/run/hook). clap rejects empty flag values, so such
-/// workers pass this deliberately non-existent path; the worker never reads it
-/// for those kinds (their spec comes from the registry entry), and a
-/// hand-crafted direct invocation against a mis-tagged `Static` entry fails
-/// closed: `resolve_dir` refuses the path, `is_sensitive_dir` fail-closes on
-/// the unresolvable one.
+/// Stand-in for the mandatory `--dir` flag when the worker has no directory
+/// (proxy/run/hook; clap rejects empty values). The worker never reads it for
+/// those kinds; a mis-tagged Static invocation fails closed on the
+/// unresolvable path.
 pub(crate) const PROXY_DIR_SENTINEL: &str = "/ft-proxy-has-no-directory";
 
-/// The `run-worker` argv prefix shared by the Unix and Windows spawn paths:
-/// `--dir` is the served/upload-target directory or [`PROXY_DIR_SENTINEL`];
-/// the Run worker's `command` rides after a trailing `--` (flag-looking child
-/// args are never parsed as worker flags); `keep`/`max_size` are the Hook/Drop
-/// runtime knobs (`None` for other kinds — the registry carries no fields for
-/// them). The Drop token deliberately does NOT ride the argv (`ps`
-/// visibility): the worker reads it from the service's private token file.
+/// The run-worker argv prefix. The Drop token does NOT ride the argv (`ps`
+/// visibility) — the worker reads it from the private token file.
 fn run_worker_args(
     id: u64,
     name: &str,
@@ -80,36 +67,26 @@ fn run_worker_args(
     args
 }
 
-/// Spawn the detached `run-worker` child for a service and return its pid.
-///
-/// `dir: None` spawns a worker that fronts a port rather than a directory
-/// (proxy, or run whose child is passed separately); `dir: Some(_)` spawns the
-/// usual STATIC worker. See [`spawn_worker_with_command`] for the detachment
-/// contract; this wrapper covers the flows that never spawn a command child.
+/// Spawn the detached STATIC (or directory-less) worker; the detachment
+/// contract is [`spawn_worker_with_command`]'s.
 pub fn spawn_worker(id: u64, name: &str, dir: Option<&Path>, port: u16) -> Result<u32> {
     spawn_worker_full(id, name, dir, port, &[], None, None)
 }
 
-/// Spawn the detached `run-worker` child for a HOOK service and return its
-/// pid: directory-less (the hook origin has no served tree) and carrying the
-/// retention value the worker applies to its request store.
+/// Spawn the HOOK worker: directory-less, carrying the retention value the
+/// worker applies to its request store.
 pub fn spawn_hook_worker(id: u64, name: &str, port: u16, keep: u16) -> Result<u32> {
     spawn_worker_full(id, name, None, port, &[], Some(keep), None)
 }
 
-/// Spawn the detached `run-worker` child for a DROP service and return its
-/// pid: the argv carries the upload target directory (the worker re-resolves
-/// and re-checks it) and the per-upload cap, while the access token travels
-/// via the service's private token file — never the argv (`ps` visibility).
+/// Spawn the DROP worker: argv carries the upload target (re-checked by the
+/// worker) and the cap; the token travels via the private file, never argv.
 pub fn spawn_drop_worker(id: u64, name: &str, dir: &Path, port: u16, max_size: u64) -> Result<u32> {
     spawn_worker_full(id, name, Some(dir), port, &[], None, Some(max_size))
 }
 
-/// Spawn the detached `run-worker` child for a service and return its pid,
-/// passing `command` (the `ft run -- <command>` child) to the worker. Fresh
-/// process group and session; stdin `/dev/null`; stdout+stderr appended to
-/// the service's `worker.log`. Not awaited and no `kill_on_drop`, so it keeps
-/// running after the parent exits.
+/// Spawn the detached run-worker with `command`: fresh group + session, logs
+/// appended, not awaited, no kill_on_drop — it outlives the parent.
 pub fn spawn_worker_with_command(
     id: u64,
     name: &str,
@@ -120,13 +97,8 @@ pub fn spawn_worker_with_command(
     spawn_worker_full(id, name, dir, port, command, None, None)
 }
 
-/// The platform-neutral setup behind every spawn: open the worker log twice
-/// (owned stdout/stderr handles, append+create so restarts are additive, 0600
-/// on Unix — the log can carry request/paths detail), resolve the current
-/// executable, and wire the argv, the `FT_WORKER_TOKEN` handshake env, and
-/// the stdio. The platform-specific detachment is layered on by the
-/// `spawn_worker_full` variants, which share this builder so their setup
-/// cannot drift apart.
+/// Platform-neutral spawn setup (log handles, exe, argv, FT_WORKER_TOKEN,
+/// stdio) — shared so the platform variants cannot drift.
 fn worker_command(
     id: u64,
     name: &str,
@@ -163,10 +135,8 @@ fn worker_command(
     Ok(cmd)
 }
 
-/// The single spawn path behind every entry point: each public wrapper pins
-/// the optional values its flow does not use (`command` empty / `keep` and
-/// `max_size` None), so historical argv shapes stay byte-identical while the
-/// hook flow adds only `--keep` and the drop flow only `--max-size`.
+/// The single spawn path: wrappers pin their unused optionals so historical
+/// argv shapes stay byte-identical (hook adds only --keep, drop --max-size).
 #[cfg(unix)]
 fn spawn_worker_full(
     id: u64,
@@ -183,10 +153,8 @@ fn spawn_worker_full(
 
     let mut cmd = worker_command(id, name, dir, port, command, keep, max_size)?;
 
-    // New session via setsid(): the child becomes a session/group leader
-    // (pgid = pid), so a later kill(-worker_pid) reaches the whole tree.
-    // NO process_group(0) as well: std applies that (setpgid) before
-    // pre_exec, which would make the child a group leader first and make
+    // setsid(): pgid = pid, so kill(-worker_pid) reaches the whole tree. NO
+    // process_group(0) as well — std's setpgid would run first and make
     // setsid() fail with EPERM. Errors propagate so a failed detach is loud.
     unsafe {
         cmd.pre_exec(|| {
@@ -210,11 +178,8 @@ fn spawn_worker_full(
     Ok(pid)
 }
 
-/// Windows: spawn the `run-worker` child detached, in its own process group
-/// with no console, so it survives the parent `ft` exiting; stdout/stderr go
-/// to the service's `worker.log`. The worker assigns itself to a Job Object
-/// (see [`crate::worker::run`]), so killing the worker cascades to its tree
-/// and a hard-killed worker still reaps it.
+/// Windows: detached, own group, no console; the worker's Job Object
+/// ([`crate::worker::run`]) cascades its kill to the tree.
 #[cfg(windows)]
 fn spawn_worker_full(
     id: u64,

@@ -1,16 +1,9 @@
-//! The PROXY command.
-//!
-//! `ft proxy <port>` attaches a tunnel to a server the operator already runs
-//! on a local port: ft starts no server of its own, it just spawns cloudflared
-//! pointing straight at `http://127.0.0.1:<port>` and registers the result
-//! like any other service. The background flow mirrors START's reserve-entry →
-//! spawn-worker → poll-for-URL shape; the shared foreground machinery lives in
-//! `cmd/start.rs`, where a `dir` of `None` selects proxy semantics.
-//!
-//! Unlike START there is no directory to resolve or confirm, so there is no
-//! `--yes` flag. Instead the CLI pre-flights the upstream
-//! (`doctor::origin_alive`): a friendly "nothing is listening" error beats a
-//! tunnel that comes up happily and then 502s every request.
+//! The PROXY command: attach a tunnel to a server the operator already runs —
+//! no ft server, just cloudflared pointing straight at the upstream. The
+//! background flow mirrors START's reserve → spawn-worker → poll-for-URL
+//! shape (foreground machinery in `cmd/start.rs`, `dir: None` = proxy). No
+//! `--yes` (no directory); the CLI pre-flights the upstream: a friendly
+//! "nothing is listening" beats a tunnel that 502s every request.
 
 use anyhow::ensure;
 
@@ -22,14 +15,9 @@ use crate::model::ServiceKind;
 use crate::spawn;
 use crate::state::StateDir;
 
-/// Entry point for the PROXY command.
 pub async fn run(port: u16, name: Option<String>, foreground: bool) -> Result<()> {
-    // CLI-level convenience ONLY: the worker itself deliberately never probes
-    // (cloudflared connects lazily, so a dead upstream is not a worker-side
-    // start failure). Hard error in BOTH modes by design — a tunnel that
-    // comes up against a dead port 502s every request, which is far more
-    // confusing than being told up front. No opt-out flag: attach after the
-    // server boots by starting the server first.
+    // CLI-level convenience ONLY — the worker never probes (cloudflared
+    // connects lazily); hard error in both modes, no opt-out by design.
     ensure!(
         doctor::origin_alive(port),
         "nothing is listening on 127.0.0.1:{port} — start the server you want to \
@@ -37,8 +25,7 @@ pub async fn run(port: u16, name: Option<String>, foreground: bool) -> Result<()
     );
 
     if foreground {
-        // `dir: None` selects proxy semantics (no static server; cloudflared
-        // fronts the upstream directly). No re-probe by design: the
+        // `dir: None` selects proxy semantics; no re-probe by design — the
         // pre-flight above already covered the port.
         start::run_foreground(None, name, Some(port)).await
     } else {
@@ -46,10 +33,8 @@ pub async fn run(port: u16, name: Option<String>, foreground: bool) -> Result<()
     }
 }
 
-/// Background flow: reserve the entry, spawn the detached worker, then poll
-/// for the public URL (failing fast if the worker dies first). Unlike START
-/// there is no directory resolution and no port freeness probe — the port IS
-/// the operator's upstream and is *supposed* to be in use.
+/// Background flow: the shared reserve → spawn-worker → poll-for-URL shape;
+/// no port-freeness probe — the port IS the upstream, supposed to be in use.
 async fn run_background(port: u16, name: Option<String>) -> Result<()> {
     let state = StateDir::new()?;
 

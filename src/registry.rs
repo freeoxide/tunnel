@@ -1,9 +1,8 @@
 //! Persistence and querying of the service registry.
 //!
 //! All mutations go through [`Registry::update`], which holds an exclusive
-//! `flock` on `registry.lock` for the whole load → modify → save sequence. This
-//! serializes concurrent `ft` invocations so they cannot clobber each other's
-//! writes, allocate duplicate IDs, or erase fields another writer just published.
+//! `flock` for the whole load → modify → save — concurrent `ft` invocations
+//! cannot clobber writes, duplicate IDs, or erase freshly published fields.
 
 use crate::error::Result;
 use crate::fsutil;
@@ -14,24 +13,16 @@ use fs2::FileExt;
 use std::fs::OpenOptions;
 use std::io::Write;
 
-/// An advisory lock on the registry, released on drop. `fs2` grants a
-/// cross-platform exclusive lock (flock/LOCK_EX, LockFileEx) bound to this
-/// file handle; both OSes release it when the handle closes, so drop frees it
-/// without an explicit unlock (calling `fs2::FileExt::unlock` trips a
-/// `clippy::incompatible_msrv` false positive).
+/// Exclusive advisory lock released on drop (both OSes release on close);
+/// no explicit unlock — it trips a `clippy::incompatible_msrv` false positive.
 struct RegistryLock(#[allow(dead_code)] std::fs::File);
 
-/// Hard upper bound on a persisted registry blob we are willing to read: the
-/// registry is a small operator-owned JSON document, so anything past this
-/// bound is corruption (e.g. a log redirected over `registry.json`), and
-/// bounding the READ itself stops a multi-GB stray file being slurped whole
-/// before the parser rejects it.
+/// Hard bound on a registry blob read: past this the file is corruption
+/// (e.g. a log redirected over registry.json) — bound the read, never slurp.
 const MAX_REGISTRY_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Read a persisted registry blob with the hard size bound above: at most
-/// `MAX_REGISTRY_BYTES + 1` bytes are ever read (the +1 lets callers tell
-/// "at the bound" from "past it" by length alone). Returns `None` when the
-/// file is missing or unreadable, mirroring plain `std::fs::read(path).ok()`.
+/// Read at most `MAX_REGISTRY_BYTES + 1` bytes (the +1 separates "at the
+/// bound" from "past it"); `None` when missing/unreadable, like `read().ok()`.
 fn read_registry_blob(path: &std::path::Path) -> Option<Vec<u8>> {
     use std::io::Read as _;
     let file = std::fs::File::open(path).ok()?;
@@ -53,17 +44,14 @@ fn acquire_lock(state: &StateDir) -> Result<RegistryLock> {
     // Block until we hold an exclusive advisory lock on the lock file.
     file.lock_exclusive()
         .with_context(|| format!("locking registry {}", path.display()))?;
-    // Now that we hold the exclusive lock, drop any leftover temp file from a
-    // save that crashed before its rename. Doing this HERE (under the lock)
-    // rather than on every unlocked `load` means a concurrent read-only command
-    // can never delete a writer's in-flight temp mid-save and fail its commit.
+    // Remove leftover tmp HERE (under the lock), not on unlocked loads: a
+    // read-only command must never delete a writer's in-flight temp.
     let _ = std::fs::remove_file(state.registry_path().with_extension("json.tmp"));
     Ok(RegistryLock(file))
 }
 
-/// Best-effort `fsync` of the directory holding `path`, so a rename/creat
-/// performed there survives a power loss. Errors (e.g. on filesystems that
-/// cannot sync a directory) are ignored — durability here is best-effort.
+/// Best-effort fsync of the directory holding `path`, so a rename there
+/// survives power loss; errors ignored (some filesystems cannot sync dirs).
 fn sync_parent_dir(path: &std::path::Path) {
     let Some(dir) = path.parent() else { return };
     if let Ok(f) = std::fs::File::open(dir) {
@@ -71,10 +59,8 @@ fn sync_parent_dir(path: &std::path::Path) {
     }
 }
 
-/// Best-effort re-seal of an existing file to owner-only (0600) on Unix, mirroring
-/// the directory re-seal in `StateDir::ensure`. No-op on Windows (file privacy
-/// comes from the profile-dir ACL). Used by `load`/`load_backup` so a registry
-/// created by an older build or hand-edited under a loose umask is healed on read.
+/// Best-effort re-seal of an existing file to 0600 (Unix; Windows privacy is
+/// the profile-dir ACL) — heals a loose-umask or legacy registry on read.
 fn seal_private_file(path: &std::path::Path) {
     #[cfg(unix)]
     {
@@ -88,24 +74,16 @@ fn seal_private_file(path: &std::path::Path) {
 }
 
 impl Registry {
-    /// Load the registry, returning an empty one if it does not yet exist.
-    ///
-    /// Cleans up any orphan `registry.json.tmp` (under the lock, in
-    /// `acquire_lock`), validates the parsed content, and falls back to
-    /// `registry.json.bak` if the live file is missing or unparseable — so a
-    /// botched commit cannot brick the whole CLI.
+    /// Load, empty if missing; validates, `.bak` fallback — a botched commit
+    /// cannot brick the CLI (tmp cleanup happens under the lock).
     pub fn load(state: &StateDir) -> Result<Registry> {
         let path = state.registry_path();
-        // NOTE: orphan-tmp cleanup lives in `acquire_lock`, not here — `load`
-        // is also called by unlocked read-only commands, which must not race a
-        // concurrent writer's temp.
 
         if let Some(bytes) = read_registry_blob(&path)
             && !bytes.iter().all(u8::is_ascii_whitespace)
         {
-            // Oversized = corruption: route it through the same recovery as a
-            // parse failure (backup, else a loud error), never the missing-file
-            // path — a stray huge file must not yield a silent fresh default.
+            // Oversized = corruption: same recovery as a parse failure
+            // (backup, else loud error) — never a silent fresh default.
             let parsed = if bytes.len() > MAX_REGISTRY_BYTES as usize {
                 Err(anyhow::anyhow!(
                     "blob is larger than the {MAX_REGISTRY_BYTES}-byte safety bound"
@@ -152,10 +130,8 @@ impl Registry {
         Some(parsed)
     }
 
-    /// Atomically and durably persist the registry: write a 0600 temp + fsync,
-    /// promote the previous blob to `.bak` (only if it parses+validates, so the
-    /// backup stays a known-good recovery point), rename temp → live, fsync the
-    /// parent dir.
+    /// Atomic durable persist: 0600 temp + fsync → rename; the previous blob
+    /// is promoted to `.bak` only if it parses+validates (known-good point).
     pub fn save(&self, state: &StateDir) -> Result<()> {
         let path = state.registry_path();
         let tmp = path.with_extension("json.tmp");
@@ -201,11 +177,8 @@ impl Registry {
         Ok(())
     }
 
-    /// Sanity-check a loaded registry: heal `next_id` past the highest id, and
-    /// reject clearly-broken state (reserved id 0, duplicate ids/names, empty
-    /// names, reserved port 0). Kind/dir consistency is strict — a `dir` on a
-    /// proxy entry (or its absence on a static one) is a hand-edited shape no
-    /// code path produces, so reject rather than guess.
+    /// Heal `next_id` past the highest id; reject id 0, duplicate ids/names,
+    /// empty names, port 0, and kind/dir inconsistency (hand-edit shapes).
     pub fn validate(&mut self) -> Result<()> {
         let mut ids = std::collections::HashSet::new();
         let mut names = std::collections::HashSet::new();
@@ -270,10 +243,8 @@ impl Registry {
         id
     }
 
-    /// Find a service by numeric ID (if `target` is all digits) or by name.
-    ///
-    /// Per the design, an all-digit target always resolves as an ID — never as
-    /// a (possibly numeric) name.
+    /// Find by numeric ID (all-digit target) or by name — an all-digit
+    /// target always resolves as an ID, never as a (numeric) name.
     pub fn find(&self, target: &str) -> Option<&Service> {
         match target.parse::<u64>() {
             Ok(id) => self.services.iter().find(|s| s.id == id),
@@ -627,9 +598,8 @@ mod tests {
 
     // --- save→load data-integrity round-trip + corrupt recovery --------------
 
-    /// Build a fully-populated Service with every field set to a non-default
-    /// value, so a round-trip can prove each one survives serde + the atomic
-    /// temp-write + .bak-copy + rename in `save`.
+    /// A fully-populated Service (every field non-default) so a round-trip
+    /// proves each survives serde + save()'s temp/.bak/rename path.
     fn fully_populated_service() -> Service {
         Service {
             id: 42,
@@ -674,9 +644,8 @@ mod tests {
 
     #[test]
     fn save_load_preserves_proxy_service() {
-        // A proxy entry (kind: "proxy", dir: null) must survive the same
-        // atomic save path — proving the null dir and the kind tag both
-        // persist and re-validate on load.
+        // A proxy entry (dir: null) must survive the same path — the null
+        // dir and the kind tag both persist and re-validate on load.
         use crate::state::StateDir;
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::new_at(tmp.path().join("ft-state"));
@@ -766,9 +735,8 @@ mod tests {
         let state = StateDir::new_at(tmp.path().join("ft-state"));
         state.ensure().expect("ensure");
 
-        // Seed a known-good registry, then snapshot it as the backup. next_id
-        // must be consistent with the service id, or validate() would heal it
-        // on load and this would test healing, not fallback.
+        // Seed known-good, snapshot as backup. next_id must match the
+        // service id or validate() would heal it — this tests fallback.
         let good = Registry {
             next_id: 43,
             services: vec![fully_populated_service()],
@@ -809,8 +777,7 @@ mod tests {
 
     #[test]
     fn load_treats_oversized_registry_as_corruption() {
-        // A stray huge file over registry.json is corruption: corrupt-file
-        // recovery (loud error here, backup fallback if one exists), never a
+        // A stray huge file is corruption: recovery/loud error, never a
         // silent fresh default over real state.
         use crate::state::StateDir;
         let tmp = tempfile::tempdir().expect("tempdir");

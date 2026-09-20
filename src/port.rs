@@ -5,14 +5,12 @@ use anyhow::Context;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-/// Bound for the loopback connect probe in [`is_port_free`]: the local
-/// kernel answers almost instantly, so this only bounds pathological stacks;
-/// nothing is ever read from the socket.
+/// Loopback connect-probe bound: the local kernel answers almost instantly,
+/// so this only bounds pathological stacks; nothing is read from the socket.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// Bind `127.0.0.1:0` so the OS picks a free port, then return it. Inherent
-/// TOCTOU: the port could be taken before the worker binds it for real — the
-/// worker's bind then fails loudly and the start path surfaces it.
+/// Bind `127.0.0.1:0` for an OS-picked port. Inherent TOCTOU: if it is taken
+/// before the real bind, that bind fails loudly and the start surfaces it.
 pub fn allocate_free_port() -> Result<u16> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").context("finding a free port")?;
     let port = listener
@@ -22,36 +20,23 @@ pub fn allocate_free_port() -> Result<u16> {
     Ok(port)
 }
 
-/// True if a TCP port appears free on localhost right now: connect to
-/// `127.0.0.1:port` and treat "refused" as free, anything else (accepted,
-/// timeout, unreachable) as occupied.
+/// True if the port appears free on localhost: connect; "refused" = free,
+/// anything else (accepted, timeout, unreachable) = occupied.
 ///
-/// Connect-based rather than bind-based on purpose: a just-stopped server's
-/// port sits in TIME_WAIT (up to a minute) where a plain bind without
-/// `SO_REUSEADDR` fails EADDRINUSE although nothing serves — but nothing
-/// ACCEPTS either, so the connect probe reads it free and a dev server
-/// (which sets `SO_REUSEADDR` itself) can rebind. `SO_REUSEADDR` was rejected
-/// as the probe mechanism because on Windows it permits binding over a LIVE
-/// listener (hijack hazard); the connect probe behaves identically everywhere.
-/// Accepted trade-off: a bound-but-not-yet-listening socket also refuses and
-/// reads free — transient, and the loser of that bind race fails loudly in
-/// its own captured output.
-///
-/// Port 0 stays reported free: the worker carries the dedicated "port 0 is
-/// reserved" bail, and a false here would swap it for a misleading
-/// "already in use" pre-flight.
+/// Connect-based on purpose: a just-stopped server's port sits in TIME_WAIT
+/// where a plain bind fails EADDRINUSE though nothing serves — nothing
+/// ACCEPTS either, so the probe reads it free and a dev server (which sets
+/// SO_REUSEADDR itself) can rebind. SO_REUSEADDR as the probe was rejected:
+/// on Windows it permits binding over a LIVE listener (hijack hazard). Port
+/// 0 stays free so the worker's dedicated "reserved" bail is what fires.
 pub fn is_port_free(port: u16) -> bool {
     if port == 0 {
         return true;
     }
     let addr = SocketAddr::new(IpAddr::from(Ipv4Addr::LOCALHOST), port);
     match std::net::TcpStream::connect_timeout(&addr, PROBE_TIMEOUT) {
-        // Something accepted: occupied.
         Ok(_) => false,
-        // Refused = nothing is listening = free to take (TIME_WAIT included).
         Err(e) => e.kind() == std::io::ErrorKind::ConnectionRefused,
-        // Any other error (timeout, unreachable) conservatively reads as
-        // occupied.
     }
 }
 
@@ -82,9 +67,8 @@ mod tests {
 
     #[test]
     fn a_port_left_in_time_wait_by_a_just_stopped_server_reads_free() {
-        // The just-stopped-server shape: server closes first (active close),
-        // then the client closes — leaving the serving port in TIME_WAIT with
-        // no listener. Nothing accepts, so a restart must be allowed.
+        // Server closes first (active close), then the client — the port sits
+        // in TIME_WAIT with no listener; a restart must be allowed.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("local_addr").port();
         let client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
@@ -100,8 +84,7 @@ mod tests {
 
     #[test]
     fn port_zero_stays_reported_free() {
-        // `--port 0` must reach the worker's dedicated "port 0 is reserved"
-        // bail, not a misleading "already in use" pre-flight refusal.
+        // Must reach the worker's dedicated "port 0 is reserved" bail.
         assert!(is_port_free(0), "port 0 must keep reading as free");
     }
 }

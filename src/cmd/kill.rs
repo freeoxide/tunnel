@@ -7,10 +7,8 @@ use crate::proc;
 use crate::state::StateDir;
 use anyhow::bail;
 
-/// How a service should be torn down. Extracted as a pure function so the
-/// safety-critical rule — a FOREGROUND service is never group-signalled (that
-/// would kill the operator's shell, which shares the foreground `ft`'s
-/// group) — is unit-testable without signalling anything.
+/// How a service is torn down — extracted pure so the shell-safety rule
+/// (foreground is NEVER group-signalled) is unit-testable.
 enum TeardownKind {
     /// Foreground: signal the single `ft` pid directly.
     ForegroundDirect,
@@ -26,28 +24,18 @@ fn teardown_kind(service: &Service) -> TeardownKind {
     }
 }
 
-/// What the locked lookup in [`run`] decided to do with the target entry.
-///
-/// Extracted (like [`teardown_kind`]) so the decision can be unit-tested
-/// without signalling anything.
+/// What the locked lookup in [`run`] decided — extracted for unit-testing.
 enum KillPlan {
     /// Remove the entry now and tear its process tree down (the normal path).
     Remove(Service),
-    /// Leave the entry in place: its worker pid has not been recorded yet and
-    /// the [`crate::model::START_GRACE`] window is still open. `run` reports
-    /// a friendly "still starting" error instead of reaping.
+    /// Leave the entry: pid not recorded yet, START_GRACE still open —
+    /// `run` reports a friendly "still starting" error instead of reaping.
     Starting(String),
 }
 
-/// Decide — atomically with the removal itself — whether `target` may be
-/// reaped right now. `None` means no service matches.
-///
-/// The M1 rule: a background start reserves the entry with `worker_pid == 0`
-/// and records the real pid in a second locked write. Reaping the entry
-/// inside that window would orphan the just-spawned worker (pid 0 never
-/// passes an identity probe, so nothing would tear it down), so a
-/// [`Service::start_in_progress`] entry is left untouched; once the grace
-/// expires the reservation is abandoned and removed with nothing to signal.
+/// Decide — atomically with the removal — whether `target` may be reaped
+/// (`None` = no match); a `start_in_progress` entry is left untouched
+/// (reaping mid-window would orphan the just-spawned worker).
 fn plan_kill(reg: &mut Registry, target: &str) -> Option<KillPlan> {
     let svc = reg.find(target)?.clone();
     if svc.start_in_progress() {
@@ -57,36 +45,23 @@ fn plan_kill(reg: &mut Registry, target: &str) -> Option<KillPlan> {
     Some(KillPlan::Remove(svc))
 }
 
-/// Stop the service matching `target` and remove its registry entry — the
-/// removal happens atomically under the lock BEFORE any signalling, so even a
-/// failed signal leaves no stale entry.
-///
-/// - **Background**: signal the worker's whole process group (`cloudflared`
-///   lives in that group). The group is only signalled when at least one
-///   member is confirmed ours (cmdline match), so a recycled PID/group is
-///   never signalled.
-/// - **Foreground**: signal the single `ft` pid directly — NEVER the group
-///   (the foreground `ft` shares the operator's shell's group), gated on an
-///   identity check.
-///
-/// Exception: an entry inside [`crate::model::START_GRACE`] with no recorded
-/// worker pid is left in place with a friendly "still starting" error (M1).
+/// Stop the target and remove its entry — atomically under the lock BEFORE
+/// any signalling, so a failed signal still leaves no stale entry.
+/// Background: group-signal only when a member is confirmed ours (cmdline
+/// match) — a recycled PID/group is never signalled. Foreground: the single
+/// `ft` pid only, NEVER the group (it shares the operator's shell's).
 pub async fn run(target: String) -> Result<()> {
     let state = StateDir::new()?;
 
-    // Resolve `target` with an UNLOCKED read first: this avoids creating
-    // `registry.lock` (which would fail with a raw 'No such file or directory'
-    // when the state dir does not exist) on a system with no services, and
-    // lets the friendly 'no service matches' message out without any dir.
+    // Resolve with an UNLOCKED read first: no registry.lock creation on a
+    // system with no services, and the friendly miss message needs no dir.
     let exists = Registry::load(&state)?.find(&target).is_some();
     if !exists {
         bail!("no service matches '{target}'");
     }
 
-    // Remove atomically under the lock; `find` is re-checked inside
-    // `plan_kill` in case the target vanished between the unlocked read and
-    // here, and the M1 guard there may leave the entry in place with the
-    // "still starting" error.
+    // Remove atomically under the lock; find is re-checked inside plan_kill
+    // in case the target vanished since the unlocked read.
     let service = match Registry::update(&state, |reg| plan_kill(reg, &target))? {
         Some(KillPlan::Remove(service)) => service,
         Some(KillPlan::Starting(name)) => {
@@ -109,9 +84,8 @@ pub async fn run(target: String) -> Result<()> {
             if worker_ours {
                 proc::terminate_foreground(service.worker_pid);
             }
-            // Make the data-flow invariant local and explicit: tunnel_ours can
-            // only be true when tunnel_pid is Some, but bind the pid directly so
-            // a future change to how tunnel_ours is computed can't panic here.
+            // Bind the pid directly: tunnel_ours implies tunnel_pid is Some,
+            // but a future change to that computation must not panic here.
             if let Some(p) = service.tunnel_pid
                 && tunnel_ours
             {
@@ -124,10 +98,8 @@ pub async fn run(target: String) -> Result<()> {
             }
         }
         TeardownKind::BackgroundGroup => {
-            // cloudflared lives in the worker's process group, so the group
-            // kill reaches both. Only signal when at least one member is
-            // confirmed ours (cmdline match), so a recycled PID/group is
-            // never signalled.
+            // cloudflared lives in the worker's group, so the group kill
+            // reaches both; signal only when a member is confirmed ours.
             let worker_alive = proc::pid_matches(service.worker_pid, "run-worker");
             let cloudflared_alive = service
                 .tunnel_pid
@@ -212,13 +184,12 @@ mod tests {
         ));
     }
 
-    // --- the M1 reserve→spawn→record guard -----------------------------------
+    // --- the reserve→spawn→record guard --------------------------------------
 
     #[test]
     fn starting_entry_is_left_in_place_inside_the_grace_window() {
         // Killing a reserved-but-unrecorded entry mid-window would orphan the
-        // just-spawned worker (pid 0 cannot be signalled), so the entry is
-        // kept and the caller reports a friendly error instead.
+        // just-spawned worker — kept, with a friendly error instead.
         let mut s = svc(false);
         s.worker_pid = 0;
         let mut reg = reg_with(s);
