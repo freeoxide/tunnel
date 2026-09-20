@@ -27,16 +27,14 @@ use crate::server::hook_server::HookLog;
 use crate::server::static_server;
 use crate::state::StateDir;
 
-/// How long to keep retrying the registry load looking for our entry.
 const REGISTRY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 const REGISTRY_LOOKUP_INTERVAL: Duration = Duration::from_millis(100);
 /// Drain bound; a stuck request aborts the server task so it can't hang the
 /// worker.
 const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Run the worker to completion. `dir` is the served directory (Static) or
-/// upload target (Drop), [`crate::spawn::PROXY_DIR_SENTINEL`] for the
-/// directory-less kinds; the kind itself comes from the registry entry.
+/// Run the worker to completion. `dir` is the served/upload directory
+/// ([`crate::spawn::PROXY_DIR_SENTINEL`] for the directory-less kinds).
 pub async fn run(
     id: u64,
     name: String,
@@ -46,9 +44,8 @@ pub async fn run(
     keep: Option<u16>,
     max_size: Option<u64>,
 ) -> Result<()> {
-    // Defense in depth against direct invocation (only spawn_worker launches
-    // this, setting FT_WORKER_TOKEN): a presence check — the load-bearing
-    // checks re-run below.
+    // Defense in depth against direct invocation (spawn_worker sets
+    // FT_WORKER_TOKEN): presence check only — the real checks re-run below.
     if std::env::var_os("FT_WORKER_TOKEN")
         .map(|v| v.is_empty())
         .unwrap_or(true)
@@ -77,9 +74,8 @@ pub async fn run(
         anyhow::bail!("port 0 is reserved; the worker needs an explicit port");
     }
 
-    // The parent's atomic save may not have landed yet — poll for the entry
-    // by id, not name: a name reused for a fresh service while a stale worker
-    // drains would bind us to the wrong entry.
+    // The parent's save may not have landed yet — poll for the entry by id,
+    // not name: a reused name would bind us to the wrong (fresh) service.
     let deadline = std::time::Instant::now() + REGISTRY_LOOKUP_TIMEOUT;
     if !await_entry(&state, id, deadline).await? {
         // Dying worker mustn't leave a stale entry; clear ours by id.
@@ -103,8 +99,7 @@ pub async fn run(
     let static_flags = entry.static_flags;
 
     // server.log opens only for a Static worker (only it emits tower_http
-    // traces); pre-kind exits fail to stderr, which the parent redirects
-    // into worker.log anyway.
+    // traces); pre-kind exits fail to stderr → worker.log via the parent.
     init_tracing(
         &worker_log,
         (kind == ServiceKind::Static).then_some(server_log.as_path()),
@@ -113,8 +108,7 @@ pub async fn run(
     tracing::info!("worker starting: id={id} name={name:?} port={port}");
 
     // Static and Drop: re-run the START directory checks before binding a
-    // public tunnel. A worker is non-interactive, so a sensitive directory
-    // is refused UNCONDITIONALLY (`--yes` cannot apply).
+    // public tunnel — refusal is UNCONDITIONAL (non-interactive, no `--yes`).
     let dir = match kind {
         ServiceKind::Proxy => {
             tracing::info!("proxy worker: fronting existing upstream http://127.0.0.1:{port}");
@@ -247,7 +241,6 @@ pub async fn run(
         ServiceKind::Proxy | ServiceKind::Run => no_server(),
     };
 
-    // cloudflared
     if let Err(e) = cloudflared::ensure_installed() {
         tracing::error!(%e, "cloudflared unavailable");
         stop_server(kind, shutdown_tx, &mut server_handle).await;
@@ -257,9 +250,8 @@ pub async fn run(
         return Err(e);
     }
 
-    // Run only: open the log sink BEFORE the child so a failure can never
-    // orphan a running command. Teed to worker.log; tunnel URLs come only
-    // from cloudflared's streams.
+    // Run only: open the log sink BEFORE the child (a failure must not
+    // orphan a running command); teed to worker.log, nothing extracted.
     let command_log_writer = match kind {
         ServiceKind::Run => match crate::fsutil::open_private_append_async(&worker_log).await {
             Ok(f) => Some(Arc::new(Mutex::new(f))),
@@ -277,8 +269,7 @@ pub async fn run(
 
     // Run only: the child leads its own process group, so the exit paths tear
     // the WHOLE subtree down via killpg without ever signalling this worker's
-    // group (cloudflared lives there). Monitor owns the handle; worker keeps
-    // the pid.
+    // group (cloudflared lives there).
     let (command_pid, mut command_monitor, command_out) = match kind {
         ServiceKind::Run => match crate::proc::spawn_command_child(&command, port) {
             Ok(mut c) => {
@@ -367,7 +358,6 @@ pub async fn run(
             // cloudflared is ALREADY live, so a bare `?` would orphan it: on
             // macOS neither PDEATHSIG nor the Job Object reaps it, and with
             // no URL published, prune can never find the orphaned tunnel.
-            // Tear down in normal-exit order.
             tracing::error!(%e, "failed to open the tunnel log");
             cloudflared::shutdown(tunnel_pid, &mut child).await;
             crate::proc::shutdown_child_command(command_pid, &mut command_monitor).await;
@@ -467,9 +457,8 @@ pub async fn run(
     // also on the cloudflared-exited path. Group-wide; no-op for other kinds.
     crate::proc::shutdown_child_command(command_pid, &mut command_monitor).await;
 
-    // Abort AND await: abort only schedules cancellation at the next .await,
-    // and a reader mid-`publish_url` (fs2 lock wait) could otherwise race
-    // the entry's removal by teardown.
+    // Abort AND await: abort only schedules cancellation at the next .await —
+    // a reader mid-`publish_url` could race the entry's removal by teardown.
     for task in reader_tasks {
         task.abort();
         let _ = task.await;

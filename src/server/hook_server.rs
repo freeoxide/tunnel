@@ -45,10 +45,8 @@ const MAX_KEEP: usize = 1000;
 /// The per-service store, a sibling of the logs so `ft logs` stays coherent.
 pub(crate) const REQUESTS_FILENAME: &str = "requests.json";
 
-/// The HTML inspection view path.
 const INSPECT_PATH: &str = "/__inspect";
 
-/// The JSON view path (`INSPECT_PATH` + `.json`).
 const JSON_PATH: &str = "/__inspect.json";
 
 /// An ALLOWLIST, not a denylist: only known-debugging headers are copied, so
@@ -66,13 +64,11 @@ const RECORDED_HEADERS: &[&str] = &[
     "x-gitlab-event",
 ];
 
-/// One recorded request: the disk/JSON unit of the hook store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordedRequest {
     /// Monotonic per-service counter (higher = newer); survives reloads, so
     /// ordering never depends on clock comparisons.
     pub seq: u64,
-    /// When the origin received the request (UTC, from [`crate::model::now_utc`]).
     pub received_at: DateTime<Utc>,
     pub method: String,
     pub path: String,
@@ -165,9 +161,8 @@ fn absolute_read_bound() -> u64 {
     store_read_bound(MAX_KEEP)
 }
 
-/// Read at most `bound + 1` bytes (the +1 tells at-the-bound from past-it by
-/// length alone). Bounding the READ, not just the parse — otherwise a stray
-/// huge file is slurped whole before the parser rejects it.
+/// Read at most `bound + 1` bytes (the +1 tells at-the-bound from past-it);
+/// bounding the READ, not just the parse, so no stray huge file is slurped.
 fn read_store_blob(path: &Path, bound: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
     let file = std::fs::File::open(path)?;
@@ -260,7 +255,6 @@ impl HookLog {
         self.requests.clone()
     }
 
-    /// Retained-record count without the clone.
     #[cfg(test)]
     fn len(&self) -> usize {
         self.requests.len()
@@ -308,14 +302,12 @@ pub fn router(log: Arc<Mutex<HookLog>>) -> Router {
         ))
 }
 
-/// Fallback handler: record, answer 200. A persist failure is a 500 —
-/// "acknowledged but written nowhere" would be a silent lie; a 500 lets the
-/// sender retry.
+/// Fallback handler: record, answer 200; a persist failure is a 500 so the
+/// sender can retry — never a silent "acknowledged but unwritten".
 async fn record(State(log): State<Arc<Mutex<HookLog>>>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
     // Second cap enforcement: the layer pre-rejects a DECLARED oversize
-    // (Content-Length), but a chunked body carries none — this bounded read
-    // is the enforcement for those.
+    // (Content-Length); chunked bodies carry none — this read caps those.
     let bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -357,8 +349,7 @@ async fn record(State(log): State<Arc<Mutex<HookLog>>>, request: Request) -> Res
 }
 
 /// Snapshot off the async thread: the record path holds this lock across
-/// persist's write (inside its own spawn_blocking), so an async-side lock()
-/// here could park a tokio worker for that window.
+/// persist's write, so an async-side lock() could park a tokio worker.
 async fn snapshot_offline(log: &Arc<Mutex<HookLog>>) -> Vec<RecordedRequest> {
     let log = Arc::clone(log);
     tokio::task::spawn_blocking(move || lock(&log).snapshot())
@@ -366,7 +357,6 @@ async fn snapshot_offline(log: &Arc<Mutex<HookLog>>) -> Vec<RecordedRequest> {
         .unwrap_or_default()
 }
 
-/// `GET /__inspect` — the HTML inspection view, newest-first.
 async fn inspect_html(State(log): State<Arc<Mutex<HookLog>>>) -> Html<String> {
     let requests = snapshot_offline(&log).await;
     Html(render_inspection(&requests))
@@ -411,7 +401,6 @@ fn render_inspection(requests: &[RecordedRequest]) -> String {
     html_page(&escape_html(&title), &body)
 }
 
-/// `GET /__inspect.json` — the records as a newest-first JSON array.
 async fn inspect_json(State(log): State<Arc<Mutex<HookLog>>>) -> Json<Vec<RecordedRequest>> {
     Json(snapshot_offline(&log).await)
 }
@@ -744,9 +733,8 @@ mod tests {
         assert_eq!(log.len(), 0);
     }
 
-    /// A read error that is NOT NotFound (a regular file occupying the
-    /// store's parent-directory slot → ENOTDIR on Unix; Windows path
-    /// semantics differ, hence the gate).
+    /// A read error that is NOT NotFound: a regular file occupying the
+    /// store's parent slot (ENOTDIR on Unix; Windows differs, hence the gate).
     #[cfg(unix)]
     #[test]
     fn load_fails_fast_on_a_non_not_found_read_error_without_clobbering() {

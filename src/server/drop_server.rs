@@ -45,9 +45,8 @@ pub(crate) const MAX_FILE_COUNT: u64 = 10_000;
 /// (see [`DropStore::temp_path`]).
 const TEMP_NAME_OVERHEAD: usize = 1 + ".part-".len() + 8;
 
-/// Longest accepted name — a BUDGET, not NAME_MAX: the temp file stores the
-/// LONGER dot-prefixed form first, so this keeps the publish path within
-/// 255-byte NAME_MAX.
+/// Longest accepted name — a BUDGET, not NAME_MAX: the temp name is LONGER
+/// (dot-prefixed), so this keeps the publish path within 255-byte NAME_MAX.
 const MAX_NAME_BYTES: usize = 255 - TEMP_NAME_OVERHEAD;
 
 /// The 0600 token file inside the service's state dir; shown by `ft detail`.
@@ -56,9 +55,8 @@ const TOKEN_FILENAME: &str = "drop-token";
 /// Minted tokens are 65 bytes; anything near this bound is not a token.
 const TOKEN_READ_BOUND: u64 = 4096;
 
-/// 32 OS-CSPRNG bytes as 64 lowercase hex chars; no weak fallback — the
-/// token is the only guard against public arbitrary writes, so a missing
-/// entropy source must fail the start.
+/// 32 OS-CSPRNG bytes as 64 hex chars; no weak fallback — the token is the
+/// only guard against public writes, so missing entropy must fail the start.
 pub(crate) fn generate_token() -> std::io::Result<String> {
     let mut bytes = [0u8; 32];
     fill_random(&mut bytes)?;
@@ -139,9 +137,8 @@ pub(crate) fn store_token(dir: &Path, token: &str) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
-/// `Ok(None)` = no token file; `Err` = a real read error (or an
-/// over-bound/undecodable file) — callers must not swallow an Err as "no
-/// token".
+/// `Ok(None)` = no token file; `Err` = a real read error or an over-bound
+/// file — callers must not swallow an Err as "no token".
 pub(crate) fn read_token(dir: &Path) -> std::io::Result<Option<String>> {
     use std::io::Read as _;
     let file = match std::fs::File::open(dir.join(TOKEN_FILENAME)) {
@@ -226,8 +223,7 @@ pub(crate) struct DropStore {
 
 impl DropStore {
     /// Open (not create) the canonicalised root (the confinement base must
-    /// be the REAL path) and measure existing content against the caps;
-    /// startup-path sync I/O — must not migrate to a request path.
+    /// be REAL) and measure it against the caps; startup-only sync I/O.
     pub(crate) fn open(
         root: &Path,
         token: String,
@@ -270,9 +266,8 @@ impl DropStore {
         }))
     }
 
-    /// This service's temp for `name`: token-scoped so two services on one
-    /// directory never share a temp, dot-prefixed so both API sides keep it
-    /// unreachable.
+    /// This service's temp for `name`: token-scoped (two services on one
+    /// directory never share a temp) and dot-prefixed (API-unreachable).
     fn temp_path(&self, name: &str) -> PathBuf {
         let tag = token_tag(&self.token);
         self.root.join(format!(".{name}.part-{tag}"))
@@ -332,8 +327,7 @@ enum StoreError {
 }
 
 /// The drop origin's [`Router`]; layering mirrors
-/// [`crate::server::static_server::router_with`] — the token guard 401s
-/// unauthenticated mutations before the body is read.
+/// [`crate::server::static_server::router_with`].
 pub(crate) fn router(store: Arc<DropStore>) -> Router {
     Router::new()
         .fallback_service(ServeDir::new(store.root.clone()))
@@ -373,9 +367,8 @@ fn bearer_token(value: &str) -> Option<&str> {
     scheme.eq_ignore_ascii_case("bearer").then_some(credentials)
 }
 
-/// Token-check middleware: GET/HEAD pass (reads are public); every other
-/// method must present the token, constant-time compared, BEFORE its body is
-/// read (an unauthenticated client pays no bytes into us).
+/// GET/HEAD pass (reads are public); every other method must present the
+/// token BEFORE its body is read (no bytes in from the unauthenticated).
 async fn require_token(
     State(store): State<Arc<DropStore>>,
     request: Request,
@@ -522,9 +515,8 @@ async fn upload(store: Arc<DropStore>, request: Request) -> Response {
     }
 }
 
-/// Blocking half of [`upload`], under the upload lock: cap checks, temp
-/// write, hard-link publish — and only then grow the counter (a failed write
-/// never charges bytes; a counted byte is always on disk).
+/// Blocking half of [`upload`], under the upload lock; only a published
+/// write grows the counter (a counted byte is always on disk).
 fn store_write(store: &DropStore, name: &str, bytes: &[u8]) -> Result<(), StoreError> {
     let mut used = store
         .used
@@ -563,6 +555,8 @@ fn store_write(store: &DropStore, name: &str, bytes: &[u8]) -> Result<(), StoreE
     // create `target` only if absent, so never-overwrite rests on no
     // check-then-act race. A pre-existing entry (even a symlink — the link
     // lands on the NAME) is a 409.
+    // Hard-link-less filesystems (FAT/exFAT) fail here — a loud 500, never
+    // a silent no-clobber weakening.
     let target = store.root.join(name);
     let linked = std::fs::hard_link(&tmp, &target);
     if let Err(e) = linked {

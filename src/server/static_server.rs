@@ -31,8 +31,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REQUEST_BODY: usize = 1024;
 
 /// Serve `dir` at `/` under the given flags (persisted on the registry
-/// entry, so the detached worker re-applies them). The layer order below is
-/// load-bearing; each site says why.
+/// entry, so the worker re-applies them); the layer order is load-bearing.
 pub fn router_with(dir: PathBuf, flags: crate::model::StaticFlags) -> Router {
     let root = std::fs::canonicalize(&dir).unwrap_or(dir);
     let crate::model::StaticFlags { spa, cors, token } = flags;
@@ -53,9 +52,8 @@ pub fn router_with(dir: PathBuf, flags: crate::model::StaticFlags) -> Router {
     if let Some(expected) = token {
         router = router.layer(from_fn_with_state(expected, require_token));
     }
-    // Above the token guard so 401s carry the headers too. Preflight OPTIONS
-    // stays unanswered (ServeDir's 405): with --token a cross-origin Bearer
-    // could never pass one — preferred to faking an allowance.
+    // Above the token guard so 401s carry the headers. Preflight stays
+    // unanswered (405): with --token cross-origin Bearer can never work.
     if cors {
         router = router
             .layer(SetResponseHeaderLayer::overriding(
@@ -177,8 +175,7 @@ fn render_listing(candidate: &Path, root: &Path) -> Option<String> {
 }
 
 /// Shared scaffold for the ft-owned origins' generated pages. Inputs must be
-/// pre-escaped by the caller — the scaffold interpolates them raw (a missed
-/// escape would be an injection).
+/// pre-escaped — the scaffold interpolates them raw.
 pub(crate) fn html_page(escaped_title: &str, escaped_body: &str) -> String {
     format!(
         "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n\
@@ -262,9 +259,8 @@ pub(crate) fn escape_html(s: &str) -> String {
     out
 }
 
-/// Any decoded segment starting with `.` — dotfiles, `.`, `..` — refused
-/// EARLIER than ServeDir's own `..` check; shared by [`confine`] and
-/// [`spa_fallback`] so the policy cannot drift.
+/// Any decoded segment starting with `.` — refused EARLIER than ServeDir's
+/// own `..` check; shared by [`confine`] and [`spa_fallback`] (no drift).
 fn has_dot_segment(decoded: &str) -> bool {
     decoded
         .trim_start_matches('/')
@@ -272,9 +268,8 @@ fn has_dot_segment(decoded: &str) -> bool {
         .any(|seg| seg.starts_with('.'))
 }
 
-/// Rebuild the target under `root` exactly the way ServeDir resolves it —
-/// one shared builder so [`confine`], [`serve_or_list`], and
-/// [`spa_fallback`] decide on the same candidate.
+/// Rebuild the target under `root` exactly the way ServeDir resolves it;
+/// one shared builder so every guard decides on the same candidate.
 fn candidate_path(root: &Path, decoded: &str) -> PathBuf {
     let mut candidate = root.to_owned();
     for seg in decoded.trim_start_matches('/').split('/') {
@@ -445,9 +440,8 @@ fn query_param(query: &str, key: &str) -> Option<String> {
     })
 }
 
-/// Constant-time comparison: XOR-folds every byte AND the length difference
-/// into one accumulator — no early return. An empty expected token matches
-/// nothing. Byte-in-sync twin of `drop_server::tokens_match`; keep in sync.
+/// Constant-time compare (length folded in, no early return; empty expected
+/// matches nothing). Twin of `drop_server::tokens_match`; keep in sync.
 fn tokens_match(provided: &str, expected: &str) -> bool {
     if expected.is_empty() {
         return false;
@@ -499,7 +493,6 @@ pub async fn serve_on(
     Ok(())
 }
 
-/// The no-flags [`router_with`] most HTTP tests exercise.
 #[cfg(test)]
 fn plain_router(dir: PathBuf) -> Router {
     router_with(dir, crate::model::StaticFlags::default())
