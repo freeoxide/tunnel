@@ -19,7 +19,7 @@
 //!   to be credited.
 //! - Names are REJECTED, never mangled ([`sanitize_filename`], a 400 naming
 //!   the rule); a collision with an existing name is a 409.
-//! - Reads go through [`crate::static_server::confine`] verbatim in front of
+//! - Reads go through [`crate::server::static_server::confine`] verbatim in front of
 //!   the same ServeDir, so GET behaves like `ft <dir>`. Writes only create
 //!   regular files: bytes land in a private, dot-prefixed, token-scoped temp
 //!   (`.name.part-<tag8>`, invisible to the API from both sides), published
@@ -49,7 +49,7 @@ use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
 
-use crate::static_server::{confine, encode_href, escape_html, html_page};
+use crate::server::static_server::{confine, encode_href, escape_html, html_page};
 
 /// Hard upper bound on any single request: bounds stalled public clients and
 /// the worker's graceful drain alike.
@@ -1722,7 +1722,7 @@ mod tests {
         let addr = listener.local_addr().expect("local addr");
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
-            crate::static_server::serve_on(router(store), listener, async {
+            crate::server::static_server::serve_on(router(store), listener, async {
                 let _ = shutdown_rx.await;
             })
             .await

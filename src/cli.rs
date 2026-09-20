@@ -256,7 +256,7 @@ pub enum Command {
         #[arg(
             long,
             value_name = "BYTES",
-            value_parser = clap::value_parser!(u64).range(1..=crate::drop_server::MAX_TOTAL_STORE)
+            value_parser = clap::value_parser!(u64).range(1..=crate::server::drop_server::MAX_TOTAL_STORE)
         )]
         max_size: Option<u64>,
     },

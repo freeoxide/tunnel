@@ -310,7 +310,7 @@ fn href_base(candidate: &Path, root: &Path) -> String {
 }
 
 /// Percent-encode a name for use in an href: keep the unreserved set plus
-/// `/`, encode everything else. Shared with [`crate::drop_server`], whose
+/// `/`, encode everything else. Shared with [`crate::server::drop_server`], whose
 /// listing renders upload names into the same scaffold.
 pub(crate) fn encode_href(name: &str) -> String {
     const FRAGMENT: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
@@ -339,7 +339,7 @@ pub(crate) fn encode_href(name: &str) -> String {
 }
 
 /// Minimal HTML text escaping for markup. Shared with
-/// [`crate::hook_server`], whose inspector renders request-derived text —
+/// [`crate::server::hook_server`], whose inspector renders request-derived text —
 /// any text from outside must pass through here before touching markup.
 pub(crate) fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -389,7 +389,7 @@ fn candidate_path(root: &Path, decoded: &str) -> PathBuf {
 /// longer `starts_with(root)`; missing paths also fail canonicalize and 404,
 /// as ServeDir would).
 ///
-/// Shared verbatim with [`crate::drop_server`]: the drop bucket's GET side
+/// Shared verbatim with [`crate::server::drop_server`]: the drop bucket's GET side
 /// must behave exactly like the static server's.
 ///
 /// All filesystem syscalls run inside [`tokio::task::spawn_blocking`]:

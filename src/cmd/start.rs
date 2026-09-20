@@ -564,7 +564,7 @@ async fn run_foreground_inner(
     command: Option<&[OsString]>,
     static_flags: StaticFlags,
 ) -> Result<()> {
-    use crate::static_server;
+    use crate::server::static_server;
     use tokio::sync::Mutex;
 
     let state = StateDir::new()?;

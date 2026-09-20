@@ -34,13 +34,13 @@ use tokio::sync::Mutex;
 
 use crate::cloudflared;
 use crate::cmd::start::{is_sensitive_dir, resolve_dir};
-use crate::drop_server::{self, DropStore};
 use crate::error::Result;
-use crate::hook_server;
-use crate::hook_server::HookLog;
 use crate::model::{Registry, ServiceKind};
+use crate::server::drop_server::{self, DropStore};
+use crate::server::hook_server;
+use crate::server::hook_server::HookLog;
+use crate::server::static_server;
 use crate::state::StateDir;
-use crate::static_server;
 
 /// How long to keep retrying the registry load looking for our entry.
 const REGISTRY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
@@ -1109,9 +1109,9 @@ mod tests {
         // must DRAIN (an in-flight recording finishes writing) rather than
         // abort — pins the Hook arm of the kind split.
         let tmp = tempdir().expect("tempdir");
-        let store = crate::hook_server::HookLog::load(
+        let store = crate::server::hook_server::HookLog::load(
             tmp.path().join("requests.json"),
-            usize::from(crate::hook_server::DEFAULT_KEEP),
+            usize::from(crate::server::hook_server::DEFAULT_KEEP),
         )
         .expect("load");
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -1119,7 +1119,7 @@ mod tests {
             .expect("bind ephemeral loopback listener");
         let addr = listener.local_addr().expect("local addr");
         let (shutdown_tx, mut server_handle) = serve_origin(
-            crate::hook_server::router(Arc::new(std::sync::Mutex::new(store))),
+            crate::server::hook_server::router(Arc::new(std::sync::Mutex::new(store))),
             listener,
         );
         let started = std::time::Instant::now();
@@ -1141,11 +1141,11 @@ mod tests {
         // Same contract, Drop flavour: DRAIN so an in-flight upload finishes
         // writing — pins the Drop arm of the kind split.
         let tmp = tempdir().expect("tempdir");
-        let store = crate::drop_server::DropStore::open(
+        let store = crate::server::drop_server::DropStore::open(
             tmp.path(),
             "tok".to_string(),
-            crate::drop_server::DEFAULT_MAX_SIZE,
-            crate::drop_server::MAX_TOTAL_STORE,
+            crate::server::drop_server::DEFAULT_MAX_SIZE,
+            crate::server::drop_server::MAX_TOTAL_STORE,
         )
         .expect("open drop store");
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -1153,7 +1153,7 @@ mod tests {
             .expect("bind ephemeral loopback listener");
         let addr = listener.local_addr().expect("local addr");
         let (shutdown_tx, mut server_handle) =
-            serve_origin(crate::drop_server::router(store), listener);
+            serve_origin(crate::server::drop_server::router(store), listener);
         let started = std::time::Instant::now();
         stop_server(ServiceKind::Drop, shutdown_tx, &mut server_handle).await;
         assert!(started.elapsed() < SERVER_SHUTDOWN_TIMEOUT);

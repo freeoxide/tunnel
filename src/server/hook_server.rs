@@ -61,7 +61,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
 
-use crate::static_server::{escape_html, html_page};
+use crate::server::static_server::{escape_html, html_page};
 
 /// Hard upper bound on any single request, mirroring the static server's
 /// layering: the timeout bounds slow/stalled clients (and the graceful
@@ -1207,7 +1207,7 @@ mod tests {
         // asserting on the store afterwards.
         let server_log = log.clone();
         let server = tokio::spawn(async move {
-            crate::static_server::serve_on(router(server_log), listener, async {
+            crate::server::static_server::serve_on(router(server_log), listener, async {
                 let _ = shutdown_rx.await;
             })
             .await

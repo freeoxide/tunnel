@@ -25,9 +25,9 @@ use tokio::sync::Mutex;
 use super::start;
 use crate::cloudflared;
 use crate::error::Result;
-use crate::hook_server::{self, HookLog};
 use crate::model::ServiceKind;
 use crate::port;
+use crate::server::hook_server::{self, HookLog};
 use crate::spawn;
 use crate::state::StateDir;
 
@@ -131,7 +131,7 @@ enum ReaderExit {
 /// differences: the kind is always Hook, the origin is the hook server, and
 /// there is no command child.
 async fn run_foreground(port: u16, name: Option<String>, keep: u16) -> Result<()> {
-    use crate::static_server;
+    use crate::server::static_server;
 
     let state = StateDir::new()?;
     state.ensure()?;

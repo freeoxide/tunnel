@@ -9,19 +9,17 @@
 mod cli;
 mod cloudflared;
 mod cmd;
-mod drop_server;
 mod error;
 mod fsutil;
-mod hook_server;
 mod model;
 mod name;
 mod output;
 mod port;
 mod proc;
 mod registry;
+mod server;
 mod spawn;
 mod state;
-mod static_server;
 mod worker;
 
 use clap::Parser;

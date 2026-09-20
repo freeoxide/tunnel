@@ -199,7 +199,7 @@ pub fn print_detail(service: &Service) {
         // The token's durable home is the private token file; detail is where
         // the operator recovers it. A missing/unreadable file renders `-`
         // rather than failing the whole detail.
-        let token = crate::drop_server::read_token(&service.state_dir)
+        let token = crate::server::drop_server::read_token(&service.state_dir)
             .ok()
             .flatten()
             .unwrap_or_else(|| "-".to_string());

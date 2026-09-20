@@ -46,13 +46,13 @@ use crate::cmd::start::{
     EntryGuard, SERVER_SHUTDOWN_TIMEOUT, drain_and_announce, fail_start, fail_timeout,
     is_sensitive_dir, remove_reservation, resolve_dir, teardown,
 };
-use crate::drop_server::{self, DropStore};
 use crate::error::Result;
 use crate::model::{Registry, Service, ServiceKind};
 use crate::name;
 use crate::output;
 use crate::port;
 use crate::proc;
+use crate::server::drop_server::{self, DropStore};
 use crate::spawn;
 use crate::state::StateDir;
 
@@ -348,7 +348,7 @@ async fn run_foreground(
     token: String,
     max_size: u64,
 ) -> Result<()> {
-    use crate::static_server;
+    use crate::server::static_server;
 
     let state = StateDir::new()?;
     state.ensure()?;
