@@ -1,48 +1,9 @@
-//! End-to-end integration tests for the `ft` binary.
-//!
-//! This is a binary crate (`[[bin]] name = "ft"`), so integration tests cannot
-//! import internal modules. Instead we spawn the freshly-built binary via the
-//! `CARGO_BIN_EXE_ft` env var that Cargo injects for integration tests, and
-//! drive the real CLI dispatch, registry load/validate/save, and process
-//! liveness probes as a black box.
-//!
-//! Each test pins `XDG_STATE_HOME` to a private tempdir (passed only to the
-//! spawned subprocess via `Command::env`, never mutated on the test process)
-//! so `ft` resolves its state tree (`$XDG_STATE_HOME/freeoxide/tunnel`)
-//! there. We seed `registry.json` directly to exercise the on-disk
-//! load → validate → classify → save round-trip that unit tests can only
-//! cover in pieces.
-//!
-//! The cloudflared/URL-discovery happy path is intentionally NOT covered here:
-//! it needs a real `cloudflared` binary and network, so it is out of scope for
-//! CI. These tests target the registry/proc seams that `ft ls`, `ft prune`,
-//! and `ft detail` exercise without any external process.
-//!
-//! The `ft proxy` command is covered on the same terms: its loopback upstream
-//! pre-flight runs BEFORE cloudflared is looked up or any state is created, so
-//! the failure path is drivable with a dead ephemeral port, and the proxy
-//! rendering/lifecycle surface is drivable with `"kind": "proxy"` seeded
-//! fixtures (kill/prune/logs are kind-agnostic — they target pids).
-//!
-//! `ft doctor` is covered the same way: it must exit 0 whether or not
-//! `cloudflared` is installed (a missing binary is a finding, never an error —
-//! CI has none), and its motivating 502 finding is drivable by seeding a
-//! foreground "running" proxy (the test's own pid + a public URL) whose
-//! upstream port is a freshly dead ephemeral one.
-//!
-//! `ft sanitize` is covered on those same fixtures, with one wrinkle: its
-//! foreground liveness is prune's PID-reuse-safe `--foreground` cmdline
-//! probe (NOT `Service::status`'s plain existence check), so a "running"
-//! foreground entry needs a worker whose cmdline actually carries the token
-//! — a decoy `sh -c 'while :; do sleep 30; done' --foreground` child
-//! (sanitize never signals a foreground worker, so the decoy is safe; the
-//! loop form keeps the token in the shell's argv — see
-//! `spawn_foreground_worker`).
-//! Its origin port is either really bound or freshly dead, plus the seeded
-//! stale / reservation bodies prune uses. A live BACKGROUND zombie (which
-//! sanitize would tear down with real group signals) needs a real
-//! `run-worker` process, so that arm is not black-box drivable and stays
-//! covered by the pure decision table's unit tests in `cmd/sanitize.rs`.
+//! End-to-end tests for the `ft` binary, driven as a black box: no lib
+//! target, so tests spawn the freshly-built binary via `CARGO_BIN_EXE_ft`
+//! and pin `XDG_STATE_HOME` to a private tempdir (set on the subprocess
+//! only, never the test process's env). Cloudflared/network paths are out of
+//! scope — only paths that stop before the cloudflared lookup run here; the
+//! origin behaviour itself is covered by the server unit tests.
 
 #![cfg(unix)] // proc::pid_alive uses a Unix-only cmdline identity probe.
 
@@ -53,14 +14,10 @@ use std::process::Command;
 
 use tempfile::TempDir;
 
-/// Absolute path to the freshly-built `ft` binary (Cargo provides this env var
-/// to integration tests). Resolving up front (rather than per-test) surfaces a
-/// clear panic if the harness forgets to set it.
 fn ft_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_ft"))
 }
 
-/// Where `ft` reads/writes its registry for a given `XDG_STATE_HOME` root.
 fn registry_path(xdg_root: &std::path::Path) -> PathBuf {
     xdg_root
         .join("freeoxide")
@@ -68,12 +25,6 @@ fn registry_path(xdg_root: &std::path::Path) -> PathBuf {
         .join("registry.json")
 }
 
-/// Build a minimal-but-valid single-service registry blob.
-///
-/// Fields mirror `model::Service`. `worker_pid`/`foreground`/`public_url` are
-/// the levers the liveness probe and `ft prune` branch on, so they are the
-/// test knobs; everything else is fixed boilerplate that satisfies
-/// `Registry::validate` (non-zero id, non-empty unique name, non-zero port).
 fn registry_json(worker_pid: u32, foreground: bool, public_url: Option<&str>) -> String {
     let url_field = match public_url {
         Some(u) => format!("{u:?}"),
@@ -102,12 +53,6 @@ fn registry_json(worker_pid: u32, foreground: bool, public_url: Option<&str>) ->
     )
 }
 
-/// Proxy-flavoured counterpart of [`registry_json`]: a single-service
-/// registry whose entry carries `"kind": "proxy"` and `"dir": null` — exactly
-/// the on-disk shape `ft proxy` reserves. `worker_pid` and `created_at` are
-/// the levers: the staleness probes branch on the pid (0 = reserved, a huge
-/// pid = recorded-but-dead worker), and the M1 start-grace tests need to pin
-/// a fresh vs an expired `created_at`.
 fn proxy_registry_json(worker_pid: u32, created_at: &str, public_url: Option<&str>) -> String {
     let url_field = match public_url {
         Some(u) => format!("{u:?}"),
@@ -136,14 +81,8 @@ fn proxy_registry_json(worker_pid: u32, created_at: &str, public_url: Option<&st
     )
 }
 
-/// Registry body for a foreground proxy that reads Running through sanitize's
-/// real probes: the given (live) pid with `foreground: true` plus a published
-/// public URL, fronting `port`. Whether its origin is alive depends only on
-/// whether the caller bound a listener on `port` first — exactly the seam
-/// doctor's finding and sanitize's double-probe decide on. The pid must come
-/// from [`spawn_foreground_worker`]: sanitize checks foreground liveness with
-/// the PID-reuse-safe `--foreground` cmdline probe (prune's rule), so a bare
-/// "own pid" fixture would — correctly — read as stale.
+/// The pid must come from [`spawn_foreground_worker`]: sanitize probes foreground
+/// liveness via the `--foreground` cmdline token, so a bare own-pid fixture reads stale.
 fn foreground_proxy_json(pid: u32, port: u16) -> String {
     format!(
         r#"{{
@@ -168,13 +107,8 @@ fn foreground_proxy_json(pid: u32, port: u16) -> String {
     )
 }
 
-/// A decoy "foreground worker" owned by the test that spawned it: dropping
-/// the guard kills and reaps the shell, so a panic between spawn and the
-/// test's cleanup point cannot leak the decoy — the endless loop would
-/// otherwise outlive the test for the machine's remaining uptime. Killing
-/// the shell does not reach its children, so the in-flight `sleep 30` can
-/// orphan for up to 30 s more before its own timer expires: bounded, and
-/// documented rather than hidden.
+/// Dropping the guard kills and reaps the decoy shell; its in-flight `sleep 30`
+/// child can orphan for up to 30 s (killing the shell does not reach children).
 struct DecoyWorker {
     child: std::process::Child,
 }
@@ -187,33 +121,18 @@ impl DecoyWorker {
 
 impl Drop for DecoyWorker {
     fn drop(&mut self) {
-        // Best-effort: both calls fail harmlessly on an already-dead child,
-        // and wait() reaps it so the pid cannot linger as a zombie.
+        // wait() reaps so the pid cannot linger as a zombie.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
 
-/// Block until the decoy's command line — as `ps` prints it — carries the
-/// `--foreground` token the binary's identity probe gates on.
-///
-/// A readiness barrier, not paranoia: the cmdline surfaces the probe reads
-/// (`/proc/<pid>/cmdline` on Linux, KERN_PROCARGS2 on macOS) can lag the
-/// fork, and losing that race makes the probe CORRECTLY read the decoy as
-/// stale — surfacing as a baffling assertion failure deep inside `ft
-/// sanitize`'s output instead of an error at the spawn site. Polling here
-/// turns any such platform quirk into a clear setup error, and the timeout
-/// panic reports the LAST observation — ps's output, or the error of a ps
-/// that could not run — keeping "token absent" distinct from "ps
-/// unavailable".
+/// Readiness barrier: the cmdline the probe reads can lag the fork (platform
+/// quirk); losing that race makes the probe correctly read the decoy as stale.
 fn wait_for_foreground_token(pid: u32) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    // The last poll's observation — the ps output when it ran, the error
-    // when it did not — so the timeout panic cannot conflate the two.
     let mut last_seen = String::from("`ps` has not completed a poll yet");
     while std::time::Instant::now() < deadline {
-        // `ps -o command= -p PID` prints the full argv on Linux and macOS
-        // alike — a black-box view of the same cmdline the probe reads.
         let poll = Command::new("ps")
             .arg("-o")
             .arg("command=")
@@ -235,49 +154,16 @@ fn wait_for_foreground_token(pid: u32) {
     panic!("decoy never became probe-ready for pid {pid}: {last_seen}");
 }
 
-/// Spawn a decoy "foreground worker": a live process whose cmdline contains
-/// `--foreground` — the exact identity sanitize's foreground liveness probe
-/// gates on — staying alive until killed, which the returned [`DecoyWorker`]
-/// guard does on drop.
-///
-/// A real foreground worker is an `ft <dir> --foreground` process, which
-/// needs `cloudflared` and the network, so the black-box tests drive just
-/// the identity seam instead: `sh -c CMD NAME` puts NAME (`--foreground`)
-/// into the sh process's cmdline, where `/proc/<pid>/cmdline` (and macOS's
-/// KERN_PROCARGS2) happily report it. Sanitize never signals a foreground
-/// worker — it only reports it — so the decoy cannot become collateral
-/// damage of the very rule it stands in for.
-///
-/// The `-c` body is deliberately an endless sleep LOOP (`while :; do
-/// sleep 30; done`), not the simple command — or `;`-separated list — a
-/// tidy-minded pass would reduce it to: several shells silently REPLACE
-/// their own process image with a final external command, taking the token
-/// with them. bash (macOS's /bin/sh) does it for a lone `-c` simple
-/// command — the macOS CI flake: argv collapsed to bare `sleep 30` and the
-/// probe correctly read the entry stale — and busybox ash demonstrably
-/// tail-execs the LAST command of a top-level `;` list as well (the same
-/// EV_EXIT/shellexec tail-exec runs throughout the dash/ash/ksh lineage;
-/// Debian dash 0.5.12 happens to fork instead, but one build's behaviour
-/// is not a portable guarantee). A loop body is never in tail position on
-/// any of them — the shell must return to run the next iteration — so the
-/// token stays in the shell's argv for its whole life, and the loop also
-/// never ends: the [`DecoyWorker`] guard's Drop is the decoy's only exit.
-/// The post-spawn [`wait_for_foreground_token`] poll then guarantees the
-/// token is visible before the caller seeds state, so the decoy's identity
-/// is a checked fact rather than a hope.
+/// A decoy whose cmdline carries `--foreground` (the identity probe's needle);
+/// the guard reaps it on drop. The `-c` body must stay an endless LOOP — shells
+/// tail-exec a final `-c` command, replacing argv and dropping the token.
 fn spawn_foreground_worker() -> DecoyWorker {
-    // The guard is built BEFORE the readiness barrier runs: if the barrier
-    // panics, unwinding drops the guard and reaps the decoy — a bare
-    // `std::process::Child`'s Drop is a no-op and would leak the endless
-    // loop for the machine's remaining uptime.
+    // Build the guard BEFORE the barrier: if the barrier panics, unwinding
+    // reaps the decoy — a bare `Child`'s Drop is a no-op and would leak the loop.
     let worker = DecoyWorker {
         child: Command::new("sh")
             .arg("-c")
-            // An endless loop on purpose — see the doc comment above before
-            // simplifying.
             .arg("while :; do sleep 30; done")
-            // Becomes the shell's $0 and a cmdline token for the identity
-            // probe.
             .arg("--foreground")
             .spawn()
             .expect("spawning decoy foreground worker"),
@@ -286,7 +172,6 @@ fn spawn_foreground_worker() -> DecoyWorker {
     worker
 }
 
-/// Seed `registry.json` under `xdg_root` with one service and return its path.
 fn seed_registry(xdg_root: &std::path::Path, body: &str) -> PathBuf {
     let path = registry_path(xdg_root);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -294,17 +179,13 @@ fn seed_registry(xdg_root: &std::path::Path, body: &str) -> PathBuf {
     path
 }
 
-/// Run `ft <args>` against an isolated state dir. Returns (status, combined
-/// stdout+stderr) so assertions can look at either stream.
 fn run_ft(xdg_root: &std::path::Path, args: &[&str]) -> (bool, String) {
     let output = Command::new(ft_bin())
         .args(args)
-        // Isolate the subprocess's state tree to our tempdir. Setting this on
-        // the Command affects ONLY the child — no mutation of the test
-        // process's env, which would be `unsafe` in edition 2024.
+        // Child-only env: mutating the test process's env would be `unsafe`
+        // in edition 2024.
         .env("XDG_STATE_HOME", xdg_root)
-        // Keep the binary from inheriting a noisy RUST_LOG that would pollute
-        // stdout (where our assertions look) with trace output.
+        // Hermeticity: a stray RUST_LOG would pollute the asserted-on stdout.
         .env("RUST_LOG", "")
         .output()
         .expect("spawning `ft` binary");
@@ -313,8 +194,6 @@ fn run_ft(xdg_root: &std::path::Path, args: &[&str]) -> (bool, String) {
     (output.status.success(), combined)
 }
 
-/// `run_ft` with extra env pairs for the subprocess (same isolation rules:
-/// nothing is mutated on the test process).
 fn run_ft_with_env(
     xdg_root: &std::path::Path,
     args: &[&str],
@@ -333,14 +212,8 @@ fn run_ft_with_env(
     (output.status.success(), combined)
 }
 
-/// A loopback port with nothing listening on it.
-///
-/// Bind an ephemeral listener, note its port, then drop it: the port is closed
-/// again immediately (same technique as the in-module `origin_alive` tests
-/// in `cmd/doctor.rs`; only loopback is ever touched). Another process could
-/// theoretically re-grab that exact ephemeral port in the microseconds before
-/// `ft` probes it, but the kernel does not hand out just-released ephemeral
-/// ports that eagerly — accepted risk, same as the unit tests.
+/// Bind an ephemeral listener, drop it. Another process could re-grab the port
+/// before `ft` probes it — accepted risk.
 fn dead_loopback_port() -> u16 {
     let listener =
         TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral loopback listener");
@@ -349,40 +222,27 @@ fn dead_loopback_port() -> u16 {
     port
 }
 
-/// A loopback port left in TIME_WAIT by a just-stopped server.
-///
-/// Bind an ephemeral listener, connect a client, then close the SERVER side
-/// first (listener, then the accepted stream, while the client is still
-/// open): the active close leaves the server endpoint — bound to the returned
-/// port — held by FIN_WAIT/TIME_WAIT sockets instead of a listener. Loopback
-/// only, same accepted-risk note as [`dead_loopback_port`].
+/// Close the server side first (listener, then accepted stream, while the
+/// client is open): the active close leaves the port in FIN_WAIT/TIME_WAIT.
 fn time_wait_loopback_port() -> u16 {
     let listener =
         TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral loopback listener");
     let port = listener.local_addr().expect("local addr").port();
     let client = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).expect("connect");
     let accepted = listener.accept().expect("accept").0;
-    // Drop order is the point: the server closes while the client is still
-    // open, so the close is ACTIVE on the server endpoint.
+    // Drop order is the point: the close must be ACTIVE on the server endpoint.
     drop(listener);
     drop(accepted);
     drop(client);
     port
 }
 
-/// Every file AND directory under `root`, recursively; empty when `root` does
-/// not exist yet.
-///
-/// Pins the proxy pre-flight's "zero state" guarantee precisely: not just "no
-/// registry entry" but also no `services/` dir and no `registry.lock`.
-/// Directories are collected too — `StateDir::ensure` creates an empty root +
-/// `services/` with zero files, so a files-only walk would let exactly that
-/// regression pass the emptiness assertion.
+/// Files AND directories, recursively: `StateDir::ensure` creates an empty
+/// root + `services/`, so a files-only walk could not pin "zero state".
 fn tree_paths(root: &std::path::Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        // A missing dir simply contributes nothing (its children cannot exist).
         if let Ok(entries) = fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -396,13 +256,8 @@ fn tree_paths(root: &std::path::Path) -> Vec<PathBuf> {
     paths
 }
 
-/// The current UTC time as an RFC 3339 `YYYY-MM-DDTHH:MM:SSZ` timestamp.
-///
-/// Needed to seed a `created_at` INSIDE `model::START_GRACE` (60 s), which a
-/// fixed fixture date can never be. `chrono` is a regular dependency (not a
-/// dev-dependency) and this crate has no lib target, so integration tests
-/// cannot use it — the civil-from-days conversion is done by hand instead
-/// (Howard Hinnant's algorithm; ranges are exact over i64 division).
+/// Seeding a `created_at` inside START_GRACE (60 s) needs NOW; integration
+/// tests cannot use chrono (no lib target), hence the hand-rolled conversion.
 fn now_rfc3339() -> String {
     fn civil_from_days(days: i64) -> (i64, u32, u32) {
         let z = days + 719_468;
@@ -432,9 +287,6 @@ fn now_rfc3339() -> String {
 
 #[test]
 fn ls_on_empty_registry_reports_no_services() {
-    // No seeded registry file at all: `Registry::load` falls back to a fresh
-    // default, and `ft ls` must print the empty-registry sentinel rather than
-    // erroring on the missing file.
     let dir = TempDir::new().unwrap();
     let (ok, out) = run_ft(dir.path(), &["ls"]);
     assert!(ok, "`ft ls` on an empty registry failed: {out}");
@@ -446,9 +298,7 @@ fn ls_on_empty_registry_reports_no_services() {
 
 #[test]
 fn prune_reaps_stale_entry_and_persists() {
-    // Seed a background entry whose worker_pid points at a process that does
-    // not exist (4_000_000 is far outside any real pid namespace). `ft prune`
-    // must classify it as stale, remove it, and persist the empty registry.
+    // 4_000_000 is far outside any real pid namespace, so the worker reads dead.
     let dir = TempDir::new().unwrap();
     let reg = seed_registry(
         dir.path(),
@@ -466,15 +316,12 @@ fn prune_reaps_stale_entry_and_persists() {
         "expected the pruned service's name in the output, got: {out}"
     );
 
-    // The registry on disk must now be empty: prune went through the real
-    // load → classify → save pipeline and committed the change.
     let after = fs::read_to_string(&reg).unwrap();
     assert!(
         !after.contains("seed-svc"),
         "prune should have removed the stale entry, but registry is still: {after}"
     );
 
-    // A follow-up `ft prune` is idempotent and reports nothing to do.
     let (ok2, out2) = run_ft(dir.path(), &["prune"]);
     assert!(ok2, "second `ft prune` failed: {out2}");
     assert!(
@@ -483,22 +330,13 @@ fn prune_reaps_stale_entry_and_persists() {
     );
 }
 
-// Limited to Linux/macOS: the "stale" expectation below hinges on the
-// cmdline-needle behaviour of `pid_alive`, which only those two (plus Windows)
-// implement. On other Unix `pid_alive` falls back to a plain signal-0 probe,
-// which would read our live `sleep` child as alive and flip the expectation.
+// Linux/macOS only: the "stale" expectation hinges on pid_alive's cmdline
+// needle; other Unix falls back to signal-0 and reads the live child as alive.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn ls_reports_status_through_real_proc_probe() {
-    // Two seeded entries exercising the status probe end-to-end through the
-    // binary's real `Service::status` (which calls into `proc::pid_alive` /
-    // `proc::process_exists`):
-    //   - id 1: worker_pid 0  -> "starting" (no probe; reserved-id path).
-    //   - id 2: worker_pid = a live `sleep` child of THIS test. Because the
-    //     child's cmdline lacks the `run-worker` needle, the cmdline-aware
-    //     `pid_alive` reads it as a foreign (PID-reused) process -> "stale".
-    //     This is the exact seam the START poll loop and prune rely on, driven
-    //     here through the real binary rather than a unit test.
+    // The live `sleep` child's cmdline lacks the `run-worker` needle, so the
+    // cmdline-aware probe reads it as foreign (PID-reused) -> "stale".
     let dir = TempDir::new().unwrap();
     let mut sleep = Command::new("sleep")
         .arg("30")
@@ -560,8 +398,6 @@ fn ls_reports_status_through_real_proc_probe() {
 
 #[test]
 fn detail_round_trips_a_seeded_entry() {
-    // `ft detail <id>` reads, validates, and renders a single entry through the
-    // real binary — covering the detail dispatch + registry find seam.
     let dir = TempDir::new().unwrap();
     seed_registry(
         dir.path(),
@@ -587,7 +423,6 @@ fn detail_round_trips_a_seeded_entry() {
         "expected the seeded public url, got: {out_by_id}"
     );
 
-    // Name target resolves to the same entry.
     let (ok_by_name, out_by_name) = run_ft(dir.path(), &["detail", "seed-svc"]);
     assert!(ok_by_name, "`ft detail seed-svc` failed: {out_by_name}");
     assert!(
@@ -600,15 +435,10 @@ fn detail_round_trips_a_seeded_entry() {
 
 #[test]
 fn proxy_dead_upstream_fails_friendly_and_leaves_no_state() {
-    // The pre-flight runs before cloudflared is looked up and before ANY state
-    // is created, so a dead port exercises the whole command through the real
-    // binary with neither cloudflared nor network: friendly error, exit 1,
-    // and a completely untouched state tree.
     let dir = TempDir::new().unwrap();
     let port = dead_loopback_port();
     let port_arg = port.to_string();
 
-    // Background mode.
     let (ok, out) = run_ft(dir.path(), &["proxy", &port_arg]);
     assert!(!ok, "a dead upstream must fail `ft proxy`, got: {out}");
     assert!(
@@ -616,8 +446,6 @@ fn proxy_dead_upstream_fails_friendly_and_leaves_no_state() {
         "expected the friendly pre-flight error naming the port, got: {out}"
     );
 
-    // Foreground mode: the pre-flight precedes the mode split, so it must
-    // fail identically rather than attaching against a dead port.
     let (ok_fg, out_fg) = run_ft(dir.path(), &["proxy", &port_arg, "--foreground"]);
     assert!(
         !ok_fg,
@@ -628,14 +456,12 @@ fn proxy_dead_upstream_fails_friendly_and_leaves_no_state() {
         "expected the same friendly error in foreground mode, got: {out_fg}"
     );
 
-    // Zero state: no registry entry, no services/ dir, no lock file.
     assert!(
         tree_paths(dir.path()).is_empty(),
         "a failed proxy start must leave no state, found: {:?}",
         tree_paths(dir.path())
     );
 
-    // And the registry still reads as empty afterwards.
     let (ok_ls, out_ls) = run_ft(dir.path(), &["ls"]);
     assert!(ok_ls, "`ft ls` after a failed proxy start failed: {out_ls}");
     assert!(
@@ -666,9 +492,6 @@ fn proxy_help_documents_the_command() {
 
 #[test]
 fn proxy_rejects_missing_and_invalid_ports_with_usage_errors() {
-    // Port validation is clap's (range 1..=65535), so every bad port is a
-    // usage error (exit 2) before anything runs — and therefore also leaves
-    // no state.
     let dir = TempDir::new().unwrap();
     for (args, expected) in [
         (&["proxy"][..], "required arguments were not provided"),
@@ -697,10 +520,6 @@ fn proxy_rejects_missing_and_invalid_ports_with_usage_errors() {
 
 #[test]
 fn proxy_fixture_renders_in_ls_and_detail() {
-    // Mixed registry — one static and one proxy entry, the state after
-    // `ft ./dist` and `ft proxy 3000` coexist. Both pids are recorded-but-
-    // dead (4_000_000 is far outside any real pid namespace) so the status
-    // column is deterministic (`stale`) for both kinds.
     let dir = TempDir::new().unwrap();
     let body = r#"{
   "next_id": 3,
@@ -737,8 +556,6 @@ fn proxy_fixture_renders_in_ls_and_detail() {
 }"#;
     seed_registry(dir.path(), body);
 
-    // `ls` is kind-agnostic: both rows render, and the proxy's PORT column
-    // carries its upstream port.
     let (ok_ls, out_ls) = run_ft(dir.path(), &["ls"]);
     assert!(ok_ls, "`ft ls` on a mixed registry failed: {out_ls}");
     assert!(
@@ -750,9 +567,6 @@ fn proxy_fixture_renders_in_ls_and_detail() {
         "expected the proxy's upstream port in its row, got: {out_ls}"
     );
 
-    // `detail` is kind-aware for the proxy: Mode names the kind, Upstream
-    // replaces Directory, and the Logs list has no server.log (a proxy runs
-    // no static server, so its worker never creates one).
     let (ok, out) = run_ft(dir.path(), &["detail", "seed-proxy"]);
     assert!(ok, "`ft detail seed-proxy` failed: {out}");
     assert!(
@@ -780,7 +594,6 @@ fn proxy_fixture_renders_in_ls_and_detail() {
         "expected the seeded public url, got: {out}"
     );
 
-    // The static entry in the same registry keeps its historical shape.
     let (ok_static, out_static) = run_ft(dir.path(), &["detail", "seed-svc"]);
     assert!(ok_static, "`ft detail seed-svc` failed: {out_static}");
     assert!(
@@ -795,9 +608,6 @@ fn proxy_fixture_renders_in_ls_and_detail() {
 
 #[test]
 fn kill_removes_a_stale_proxy_entry_like_a_static_one() {
-    // kill is kind-agnostic (it targets pids): a recorded-but-dead worker pid
-    // makes the entry stale, and killing it reports the stale removal and
-    // persists the emptied registry — exactly like the static fixture test.
     let dir = TempDir::new().unwrap();
     let reg = seed_registry(
         dir.path(),
@@ -846,11 +656,6 @@ fn prune_reaps_a_stale_proxy_entry_and_persists() {
 
 #[test]
 fn kill_refuses_a_fresh_proxy_reservation_within_the_start_grace() {
-    // M1 grace window, proxy flavour: a pid-0 reservation younger than
-    // START_GRACE (60 s) reads as "still starting", so `ft kill` must refuse
-    // with the friendly error and leave the entry for the parent's imminent
-    // pid record. `created_at` has to be NOW (hence the hand-formatted
-    // timestamp); the fixture date used elsewhere is long past the grace.
     let dir = TempDir::new().unwrap();
     let reg = seed_registry(dir.path(), &proxy_registry_json(0, &now_rfc3339(), None));
 
@@ -864,7 +669,6 @@ fn kill_refuses_a_fresh_proxy_reservation_within_the_start_grace() {
         "expected the still-starting refusal, got: {out}"
     );
 
-    // The reserved entry survives the refused kill and still lists as starting.
     let after = fs::read_to_string(&reg).unwrap();
     assert!(
         after.contains("seed-proxy"),
@@ -880,10 +684,6 @@ fn kill_refuses_a_fresh_proxy_reservation_within_the_start_grace() {
 
 #[test]
 fn prune_keeps_a_fresh_proxy_reservation_and_reaps_an_expired_one() {
-    // Two pid-0 proxy reservations: one fresh (inside START_GRACE — a parent
-    // may be mid reserve→spawn→record) and one expired (the parent died
-    // mid-start). Prune must reap exactly the expired one; classification is
-    // purely created_at-vs-grace, kind plays no role.
     let dir = TempDir::new().unwrap();
     let body = format!(
         r#"{{
@@ -942,13 +742,6 @@ fn prune_keeps_a_fresh_proxy_reservation_and_reaps_an_expired_one() {
 }
 
 // --- `ft run` (usage, occupied-port pre-flight, seeded fixtures; no cloudflared)
-//
-// Like the proxy section, only paths that stop BEFORE cloudflared is looked up
-// are driven here: everything past `cloudflared::ensure_installed` would
-// depend on whether this machine has cloudflared — and, worse, on machines
-// that do, would really spawn workers + the command child + a live tunnel.
-// The spawned flow itself is covered by the unit seams in cmd/run.rs,
-// worker.rs, and spawn.rs.
 
 #[test]
 fn run_help_documents_the_command() {
@@ -973,9 +766,6 @@ fn run_help_documents_the_command() {
 
 #[test]
 fn run_usage_errors_leave_no_state() {
-    // Every rejected invocation must fail before the state tree exists: a
-    // usage error (clap) or the empty-command check (runtime, deliberately
-    // first in cmd::run) means nothing was reserved, spawned, or written.
     let dir = TempDir::new().unwrap();
     for (args, expected) in [
         (&["run"][..], "required arguments were not provided"),
@@ -1021,11 +811,6 @@ fn run_usage_errors_leave_no_state() {
 
 #[test]
 fn run_refuses_an_occupied_port_and_leaves_no_state() {
-    // The child ft spawns must be able to BIND the port, so an occupied one
-    // fails the pre-flight — before cloudflared is looked up and before any
-    // state exists — with a message that names the port. This holds on every
-    // machine regardless of cloudflared, because the check precedes that
-    // lookup entirely.
     let dir = TempDir::new().unwrap();
     let listener =
         TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral loopback listener");
@@ -1053,18 +838,8 @@ fn run_refuses_an_occupied_port_and_leaves_no_state() {
 
 #[test]
 fn run_accepts_a_port_a_just_stopped_server_left_in_time_wait() {
-    // R3-2 end-to-end: `is_port_free` used to be a plain bind probe, so a
-    // port still held by TIME_WAIT sockets after a server-side close read as
-    // occupied and `ft run` refused the restart spuriously. Drive the real
-    // binary against such a port: the pre-flight must NOT refuse with
-    // "already in use".
-    //
-    // PATH is stripped so the run deterministically stops at the cloudflared
-    // lookup — the gate right after the port pre-flight — on every machine:
-    // with cloudflared installed, the run would otherwise proceed to spawn a
-    // real worker and tunnel. Stopping there (with zero state, since
-    // `ensure_installed` precedes `state.ensure`) proves the pre-flight let
-    // the TIME_WAIT port through.
+    // Empty PATH stops the run at the cloudflared lookup (right after the
+    // port pre-flight); with cloudflared installed it would spawn a real worker.
     let dir = TempDir::new().unwrap();
     let port = time_wait_loopback_port();
     let port_arg = port.to_string();
@@ -1096,14 +871,6 @@ fn run_accepts_a_port_a_just_stopped_server_left_in_time_wait() {
 
 #[test]
 fn run_fixture_renders_in_ls_and_detail() {
-    // A seeded `"kind": "run"` entry (the on-disk shape `ft run` reserves,
-    // including the run-only `command_pid`) must render through the same
-    // lifecycle commands as any other kind: kind-agnostic in `ls`, kind-aware
-    // in `detail` — Mode names the run, the Command PID row carries the
-    // recorded child (the field orphan detection reads), there is no
-    // Directory row (a run fronts a port, not a directory), and the Logs list
-    // has no server.log (no ft-owned server exists; the command's output is
-    // teed into worker.log).
     let dir = TempDir::new().unwrap();
     let body = r#"{
   "next_id": 3,
@@ -1166,9 +933,6 @@ fn run_fixture_renders_in_ls_and_detail() {
         "expected the seeded public url, got: {out}"
     );
 
-    // kill is kind-agnostic (it targets pids): a recorded-but-dead worker pid
-    // makes the entry stale, and killing it reports the stale removal and
-    // persists the emptied registry.
     let reg = registry_path(dir.path());
     let (ok_kill, out_kill) = run_ft(dir.path(), &["kill", "seed-run"]);
     assert!(ok_kill, "`ft kill seed-run` failed: {out_kill}");
@@ -1184,12 +948,6 @@ fn run_fixture_renders_in_ls_and_detail() {
 }
 
 // --- `ft drop` (usage, pre-flights, seeded fixtures; no cloudflared) --------
-//
-// Only paths that stop BEFORE cloudflared is looked up run here: the
-// pre-flights (upload target resolution/sensitivity, occupied port, empty
-// token) all run ahead of that lookup. The origin itself (token auth, caps,
-// sanitization, GET-side confinement) is covered by the drop_server unit
-// tests driving the Router directly with tower::oneshot.
 
 #[test]
 fn drop_help_documents_the_command() {
@@ -1212,13 +970,10 @@ fn drop_help_documents_the_command() {
     );
     assert!(out.contains("--token"), "missing --token in: {out}");
     assert!(out.contains("--max-size"), "missing --max-size in: {out}");
-    // The token also reads FT_TOKEN (help must advertise the env channel).
     assert!(
         out.contains("[env: FT_TOKEN]"),
         "missing the FT_TOKEN env pin in: {out}"
     );
-    // The token is the bucket's write credential: the help must explain that
-    // uploads REQUIRE it and that one is minted and printed when omitted.
     assert!(
         out.contains("token"),
         "the help must mention the token in: {out}"
@@ -1231,19 +986,14 @@ fn drop_help_documents_the_command() {
 
 #[test]
 fn drop_usage_errors_and_preflight_refusals_leave_no_state() {
-    // Every rejected invocation must fail before the state tree exists: clap
-    // usage errors and the command's own pre-flights all precede any
-    // reservation or spawn.
     let dir = TempDir::new().unwrap();
     let missing = dir.path().join("does-not-exist");
     let missing = missing.to_string_lossy().into_owned();
-    // A neutral EXISTING directory for the token-refusal cases: a sibling
-    // tempdir, not an ancestor of ft's state root (an ancestor would be —
-    // correctly — refused as sensitive, R3-7).
+    // A sibling tempdir, not an ancestor of ft's state root — an ancestor
+    // would (correctly) be refused as sensitive.
     let neutral = TempDir::new().unwrap();
     let neutral_arg = neutral.path().to_string_lossy().into_owned();
     for (args, expected) in [
-        // clap: the DIR positional is required.
         (&["drop"][..], "required arguments were not provided"),
         (
             &["drop", "inbox", "--port", "abc"][..],
@@ -1261,16 +1011,12 @@ fn drop_usage_errors_and_preflight_refusals_leave_no_state() {
             &["drop", "inbox", "--max-size", "1073741825"][..],
             "1073741825 is not in 1..=1073741824",
         ),
-        // Runtime pre-flights (before any state): the target must exist, must
-        // not be sensitive, and an explicit token must be non-empty.
         (&["drop", &missing][..], "does not exist"),
         (&["drop", "/"][..], "sensitive directory"),
         (
             &["drop", &neutral_arg, "--token", ""][..],
             "--token must be a non-empty secret",
         ),
-        // A WHITESPACE-ONLY token is refused too — the trim happens once, at
-        // token resolution, before anything is stored or printed.
         (
             &["drop", &neutral_arg, "--token", "   "][..],
             "--token must be a non-empty secret",
@@ -1297,9 +1043,6 @@ fn drop_usage_errors_and_preflight_refusals_leave_no_state() {
 
 #[test]
 fn drop_refuses_an_occupied_port_and_leaves_no_state() {
-    // The drop origin is ft's OWN server, so an occupied port fails the
-    // pre-flight — before cloudflared is looked up and before any state
-    // exists — with a message that names the port (same as `ft hook`).
     let dir = TempDir::new().unwrap();
     let bucket = TempDir::new().unwrap();
     let bucket_arg = bucket.path().to_string_lossy().into_owned();
@@ -1336,21 +1079,14 @@ fn drop_refuses_an_occupied_port_and_leaves_no_state() {
 
 #[test]
 fn drop_refuses_fts_own_state_tree_in_every_overlap() {
-    // R3-7: ft's state root holds registry.json, logs, hook records, and
-    // every service's drop-token file — all non-dotfile, so a bucket placed
-    // ON the state tree made them publicly readable via unauthenticated GETs
-    // (and WRITE-touched the tree on top). The shared sensitive-dir check
-    // must refuse every overlap — root, subtree, ancestor — before any state
-    // is touched. The plain-bucket counterpart above pins that a NON-state
-    // dir still passes this pre-flight and fails later, at the port check.
+    // SECURITY: a bucket on ft's own state tree would expose registry.json,
+    // logs, and token files via unauthenticated GETs — refuse every overlap.
     let dir = TempDir::new().unwrap();
     let state_root = dir.path().join("freeoxide").join("tunnel");
     let services = state_root.join("services");
     let ancestor = dir.path().join("freeoxide");
     fs::create_dir_all(&services).unwrap();
 
-    // The bucket argument accepts any of the three overlap shapes; each must
-    // be refused with the sensitive-directory message.
     for bucket in [state_root.clone(), services.clone(), ancestor.clone()] {
         let arg = bucket.to_string_lossy().into_owned();
         let (ok, out) = run_ft(dir.path(), &["drop", &arg]);
@@ -1366,8 +1102,6 @@ fn drop_refuses_fts_own_state_tree_in_every_overlap() {
         );
     }
 
-    // Refusal happened before any state: no registry, and the pre-created
-    // (test-fixture) services dir gained nothing.
     assert!(
         !registry_path(dir.path()).exists(),
         "a refused drop must not create a registry"
@@ -1381,11 +1115,6 @@ fn drop_refuses_fts_own_state_tree_in_every_overlap() {
 
 #[test]
 fn start_refuses_fts_own_state_dir_noninteractively() {
-    // R3-7 tightens the START caller too (the check is shared): `ft <state-
-    // dir>` without --yes and without a TTY must refuse with the sensitive-
-    // directory error, like $HOME does. (--yes keeps its existing
-    // confirmed-sensitive override semantics, as for $HOME itself — the fix
-    // is the denylist entry, not a new refusal class.)
     let dir = TempDir::new().unwrap();
     let state_root = dir.path().join("freeoxide").join("tunnel");
     fs::create_dir_all(&state_root).unwrap();
@@ -1409,17 +1138,8 @@ fn start_refuses_fts_own_state_dir_noninteractively() {
 
 #[test]
 fn drop_fixture_renders_in_ls_detail_and_kill() {
-    // A seeded `"kind": "drop"` entry (the on-disk shape `ft drop` reserves;
-    // `dir` IS carried, like static) must render through the same lifecycle
-    // commands as any other kind: kind-agnostic in `ls`, kind-aware in
-    // `detail` — Mode names the drop, the Directory row names the upload
-    // target, the Token row reads the service's private token file (seeded
-    // here so the display contract is pinned end-to-end), and the Logs list
-    // has no server.log. kill stays kind-agnostic: a dead worker pid makes
-    // the entry stale and removable.
     let dir = TempDir::new().unwrap();
-    // Anchor the service's state_dir inside the test's tempdir so the token
-    // file the detail command reads is private to this test.
+    // state_dir anchors in the tempdir: `ft detail` reads the token file from it.
     let state_dir = dir.path().join("seed-drop-state");
     fs::create_dir_all(&state_dir).unwrap();
     fs::write(state_dir.join("drop-token"), "tok-seeded-abc\n").unwrap();
@@ -1486,9 +1206,6 @@ fn drop_fixture_renders_in_ls_detail_and_kill() {
         "expected the seeded public url, got: {out}"
     );
 
-    // kill is kind-agnostic (it targets pids): a recorded-but-dead worker pid
-    // makes the entry stale, and killing it reports the stale removal and
-    // persists the emptied registry.
     let reg = registry_path(dir.path());
     let (ok_kill, out_kill) = run_ft(dir.path(), &["kill", "seed-drop"]);
     assert!(ok_kill, "`ft kill seed-drop` failed: {out_kill}");
@@ -1507,11 +1224,6 @@ fn drop_fixture_renders_in_ls_detail_and_kill() {
 
 #[test]
 fn doctor_on_a_missing_registry_exits_zero_with_no_service_checks() {
-    // Fresh install: no registry file at all is the ordinary "no services
-    // yet" state — NOT a finding (only an unloadable registry is). Doctor
-    // must run, exit 0, print the cloudflared check (whatever it found on
-    // this machine — CI has no cloudflared, and its absence is a finding,
-    // not an error), print a summary line, and run no per-service checks.
     let dir = TempDir::new().unwrap();
     let (ok, out) = run_ft(dir.path(), &["doctor"]);
     assert!(
@@ -1530,7 +1242,6 @@ fn doctor_on_a_missing_registry_exits_zero_with_no_service_checks() {
         out.contains("all checks passed") || out.contains("problem(s)"),
         "expected a summary line (which one depends on cloudflared), got: {out}"
     );
-    // Read-only: even after running, the state tree is still empty.
     assert!(
         tree_paths(dir.path()).is_empty(),
         "doctor must create nothing, found: {:?}",
@@ -1540,11 +1251,8 @@ fn doctor_on_a_missing_registry_exits_zero_with_no_service_checks() {
 
 #[test]
 fn doctor_flags_a_live_proxy_whose_upstream_port_is_dead() {
-    // The motivating case end-to-end: the worker reads Running through the
-    // real foreground liveness probe (the test's own pid with `foreground:
-    // true` and a published URL — the same trick as the model.rs unit
-    // tests), while the port it fronts has nothing listening. Doctor must
-    // still exit 0 and report the 502 finding with its remediation hint.
+    // Doctor's worker check is plain existence, so the test's own pid reads
+    // Running here — unlike sanitize's `--foreground` cmdline probe.
     let dir = TempDir::new().unwrap();
     let port = dead_loopback_port();
     let body = format!(
@@ -1596,12 +1304,10 @@ fn doctor_flags_a_live_proxy_whose_upstream_port_is_dead() {
         out.contains("problem(s)"),
         "the summary must count the finding, got: {out}"
     );
-    // The worker itself is healthy: only its origin check fails.
     assert!(
         out.contains("worker seed-proxy: worker pid") && out.contains("fail origin seed-proxy:"),
         "expected an ok worker line and a fail origin line, got: {out}"
     );
-    // Read-only: doctor seeded nothing, changed nothing.
     let after = fs::read_to_string(registry_path(dir.path())).unwrap();
     assert!(
         after.contains("seed-proxy"),
@@ -1611,14 +1317,6 @@ fn doctor_flags_a_live_proxy_whose_upstream_port_is_dead() {
 
 #[test]
 fn doctor_flags_a_stale_run_service_whose_command_is_still_running() {
-    // The Run orphan finding, end to end (the one doctor surface A2 could not
-    // reach from its unit-only paths): a stale run entry — dead worker pid,
-    // so its tunnel is gone — carrying a command_pid that IS alive (this test
-    // process's own pid, probed by the doctor child as plain existence) plus
-    // a run port that still answers (a real listener the test holds). That is
-    // the confident "tunnel dead, command still running" signature. Doctor
-    // must exit 0, flag the `command <name>` check with its verify-first
-    // hint, and stay read-only.
     let dir = TempDir::new().unwrap();
     let listener =
         TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral loopback listener");
@@ -1669,7 +1367,6 @@ fn doctor_flags_a_stale_run_service_whose_command_is_still_running() {
         out.contains("stop it if it is the command") && out.contains("`ft kill seed-run`"),
         "expected the shared verify-first hint naming the kill, got: {out}"
     );
-    // Read-only: doctor reports the orphan but never touches the entry.
     let after = fs::read_to_string(registry_path(dir.path())).unwrap();
     assert!(
         after.contains("seed-run"),
@@ -1681,10 +1378,6 @@ fn doctor_flags_a_stale_run_service_whose_command_is_still_running() {
 
 #[test]
 fn sanitize_on_a_missing_registry_reports_nothing_and_creates_no_state() {
-    // Fresh machine: no registry file at all is the ordinary "no services"
-    // state, not an error. Sanitize must exit 0 with the nothing-to-do
-    // message and — like doctor, and unlike a seeded prune — must not even
-    // create the state tree: nothing was judged, so no lock is ever taken.
     let dir = TempDir::new().unwrap();
     let (ok, out) = run_ft(dir.path(), &["sanitize"]);
     assert!(ok, "`ft sanitize` on a fresh machine failed: {out}");
@@ -1701,12 +1394,6 @@ fn sanitize_on_a_missing_registry_reports_nothing_and_creates_no_state() {
 
 #[test]
 fn sanitize_keeps_a_healthy_live_service() {
-    // A foreground service reading Running through sanitize's REAL probes:
-    // a decoy worker carrying the `--foreground` cmdline token plus a
-    // published URL, and a REAL loopback listener bound on the fronted port
-    // so the origin double-probe finds it answering. Nothing is dangling —
-    // the entry must survive, the report must say there was nothing to do,
-    // and the command exits 0.
     let dir = TempDir::new().unwrap();
     let worker = spawn_foreground_worker();
     let listener =
@@ -1715,8 +1402,7 @@ fn sanitize_keeps_a_healthy_live_service() {
     seed_registry(dir.path(), &foreground_proxy_json(worker.pid(), port));
 
     let (ok, out) = run_ft(dir.path(), &["sanitize"]);
-    // The listener (and worker) must outlive the run: the probes happen
-    // inside it. Dropping the DecoyWorker guard kills and reaps the decoy.
+    // The listener (and worker) must outlive the run: the probes happen inside it.
     drop(listener);
     drop(worker);
 
@@ -1738,21 +1424,14 @@ fn sanitize_keeps_a_healthy_live_service() {
 
 #[test]
 fn sanitize_reports_but_never_removes_a_foreground_zombie() {
-    // The motivating zombie, in the one shape black-box tests can drive: a
-    // foreground service whose decoy worker (cmdline: `--foreground`) is
-    // alive and Running while its port is freshly dead. Sanitize must NEVER
-    // kill or remove a foreground service — its worker is an `ft` attached
-    // to the operator's terminal — so the expectation is the left-alone
-    // note, the entry still on disk, and exit 0. (A live BACKGROUND zombie
-    // needs a real run-worker process; the pure decision table in
-    // cmd/sanitize.rs covers that arm instead.)
     let dir = TempDir::new().unwrap();
     let worker = spawn_foreground_worker();
     let port = dead_loopback_port();
     seed_registry(dir.path(), &foreground_proxy_json(worker.pid(), port));
 
     let (ok, out) = run_ft(dir.path(), &["sanitize"]);
-    // The decoy only needs to outlive the run itself; the guard reaps it.
+    // The decoy must outlive the run: the liveness probe reads its cmdline
+    // inside it.
     drop(worker);
 
     assert!(ok, "a skipped foreground zombie is not a failure: {out}");
@@ -1777,11 +1456,6 @@ fn sanitize_reports_but_never_removes_a_foreground_zombie() {
 
 #[test]
 fn sanitize_reaps_a_stale_proxy_entry() {
-    // Through the `clean` alias, to prove the alias routes end-to-end: a
-    // recorded-but-dead worker pid (4_000_000 is far outside any real pid
-    // namespace) makes the entry stale, and sanitize — a superset of prune —
-    // removes it with its per-entry reason bullet and persists the empty
-    // registry.
     let dir = TempDir::new().unwrap();
     let reg = seed_registry(
         dir.path(),
@@ -1808,11 +1482,6 @@ fn sanitize_reaps_a_stale_proxy_entry() {
 
 #[test]
 fn sanitize_keeps_a_fresh_reservation_and_reaps_an_expired_one() {
-    // The pid-0 grace split, end to end: a fresh reservation (inside
-    // START_GRACE — a parent may be mid reserve→spawn→record) is kept, while
-    // an expired one (the parent died mid-start) is removed with the
-    // abandoned-reservation reason. Classification is purely
-    // created_at-vs-grace; kind plays no role.
     let dir = TempDir::new().unwrap();
     let body = format!(
         r#"{{
@@ -1875,14 +1544,6 @@ fn sanitize_keeps_a_fresh_reservation_and_reaps_an_expired_one() {
 }
 
 // --- `ft hook` (usage, occupied-port pre-flight, seeded fixtures; no cloudflared)
-//
-// Like the proxy/run sections, only paths that stop BEFORE cloudflared is
-// looked up are driven here: `ft hook` is ft's own origin, so an occupied
-// port fails the pre-flight ahead of that lookup, and everything past it
-// would depend on whether this machine has cloudflared. The origin itself
-// (recording, /__inspect HTML + JSON views, retention, body cap) is covered
-// by the hook_server unit tests driving the Router directly with
-// tower::oneshot.
 
 #[test]
 fn hook_help_documents_the_command() {
@@ -1908,9 +1569,6 @@ fn hook_help_documents_the_command() {
 
 #[test]
 fn hook_usage_errors_leave_no_state() {
-    // Every rejected invocation must fail before the state tree exists: a
-    // usage error (clap value-parser ranges) means nothing was reserved,
-    // spawned, or written.
     let dir = TempDir::new().unwrap();
     for (args, expected) in [
         (
@@ -1946,11 +1604,6 @@ fn hook_usage_errors_leave_no_state() {
 
 #[test]
 fn hook_refuses_an_occupied_port_and_leaves_no_state() {
-    // The hook origin is ft's OWN server, so an occupied port fails the
-    // pre-flight — before cloudflared is looked up and before any state
-    // exists — with a message that names the port. This holds on every
-    // machine regardless of cloudflared, because the check precedes that
-    // lookup entirely (the inverse of proxy's dead-upstream pre-flight).
     let dir = TempDir::new().unwrap();
     let listener =
         TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral loopback listener");
@@ -1975,13 +1628,6 @@ fn hook_refuses_an_occupied_port_and_leaves_no_state() {
 
 #[test]
 fn hook_fixture_renders_in_ls_and_detail() {
-    // A seeded `"kind": "hook"` entry (the on-disk shape `ft hook` reserves)
-    // must render through the same lifecycle commands as any other kind:
-    // kind-agnostic in `ls`, kind-aware in `detail` — Mode names the hook,
-    // there is no Directory/Upstream row (a hook serves no directory and
-    // fronts no operator upstream), and the Logs list carries the hook's
-    // request store (requests.json) but no server.log (the hook origin's
-    // record IS requests.json — there is no traced static server).
     let dir = TempDir::new().unwrap();
     let body = r#"{
   "next_id": 3,
@@ -2043,9 +1689,6 @@ fn hook_fixture_renders_in_ls_and_detail() {
         "expected the seeded public url, got: {out}"
     );
 
-    // kill is kind-agnostic (it targets pids): a recorded-but-dead worker pid
-    // makes the entry stale, and killing it reports the stale removal and
-    // persists the emptied registry.
     let reg = registry_path(dir.path());
     let (ok_kill, out_kill) = run_ft(dir.path(), &["kill", "seed-hook"]);
     assert!(ok_kill, "`ft kill seed-hook` failed: {out_kill}");
@@ -2060,23 +1703,16 @@ fn hook_fixture_renders_in_ls_and_detail() {
     );
 }
 
-// --- static-origin flags on `ft <dir>` (A5): CLI surface, never-on-proxy,
-// --- registry persistence + detail rendering. No cloudflared: the origin
-// --- behaviour itself (SPA fallback, CORS headers, 401 token gate) is covered
-// --- by the static_server unit tests driving `router_with` directly; these
-// --- binary-level tests pin the plumbing around it.
+// --- static-origin flags on `ft <dir>` (CLI surface, registry persistence) ---
 
 #[test]
 fn start_help_documents_the_static_origin_flags() {
-    // The implicit START's help is the flags' only documentation surface at
-    // the CLI level (README is A6's sweep): all three must be listed.
     let dir = TempDir::new().unwrap();
     let (ok, out) = run_ft(dir.path(), &["--help"]);
     assert!(ok, "`ft --help` failed: {out}");
     assert!(out.contains("--spa"), "missing --spa in: {out}");
     assert!(out.contains("--cors"), "missing --cors in: {out}");
     assert!(out.contains("--token"), "missing --token in: {out}");
-    // The token also reads FT_TOKEN (help must advertise the env channel).
     assert!(
         out.contains("[env: FT_TOKEN]"),
         "missing the FT_TOKEN env pin in: {out}"
@@ -2085,9 +1721,6 @@ fn start_help_documents_the_static_origin_flags() {
 
 #[test]
 fn token_flags_read_the_ft_token_env() {
-    // Both --token args (the implicit START's static origin and DROP's
-    // bucket) fall back to FT_TOKEN: a whitespace-only env value is refused
-    // exactly like a whitespace-only --token would be.
     let dir = TempDir::new().unwrap();
     let site = dir.path().join("site");
     fs::create_dir_all(&site).unwrap();
@@ -2116,9 +1749,8 @@ fn token_flags_read_the_ft_token_env() {
         "the drop origin must surface the env-fed token refusal, got: {out}"
     );
 
-    // argv beats env (clap's documented precedence): the whitespace-only
-    // --token WINS over a perfectly valid FT_TOKEN, so the refusal still
-    // fires — had env won, the start would have sailed past the token check.
+    // argv beats env (clap precedence): the whitespace-only --token wins over
+    // a valid FT_TOKEN.
     for args in [
         vec![&site, "--token", "  "],
         vec!["drop", &inbox, "--token", "  "],
@@ -2139,17 +1771,15 @@ fn token_flags_read_the_ft_token_env() {
 
 #[test]
 fn printing_commands_piped_to_head_exit_quietly() {
-    // Regression: Rust ignores SIGPIPE, so `ft logs <svc> | head` panicked
-    // with "failed printing to stdout: Broken pipe" (exit 101). Printing
-    // commands restore the default disposition, so the kernel kills the
-    // process silently once the pipe closes.
+    // Rust ignores SIGPIPE, so `ft logs | head` used to panic with
+    // "Broken pipe"; printing commands restore the default disposition.
     let dir = TempDir::new().unwrap();
     seed_registry(
         dir.path(),
         &registry_json(4000000, false, Some("https://x.trycloudflare.com")),
     );
-    // Both logs larger than the 64 KiB pipe buffer: writes are guaranteed to
-    // continue past `head -1` exiting, so the broken pipe is actually hit.
+    // Logs exceed the 64 KiB pipe buffer so writes continue past `head`
+    // exiting — the broken pipe is actually hit.
     let svc = dir.path().join("freeoxide/tunnel/services/seed-svc");
     fs::create_dir_all(&svc).unwrap();
     let fat_line = format!("{}\n", "x".repeat(2048));
@@ -2183,12 +1813,6 @@ fn printing_commands_piped_to_head_exit_quietly() {
 
 #[test]
 fn proxy_takes_no_static_origin_flags() {
-    // NEVER-ON-PROXY (hard exclusion, binary level): the static-origin flags
-    // exist only on the implicit START, so `ft proxy` with any of them is a
-    // clap usage error — before any preflight, state, or cloudflared lookup —
-    // and `ft proxy --help` does not even advertise them. A proxy fronts the
-    // operator's own server; ft-owned origin policy must be unparsable there,
-    // not silently ignored.
     let dir = TempDir::new().unwrap();
     for args in [
         vec!["proxy", "--help"],
@@ -2225,11 +1849,6 @@ fn proxy_takes_no_static_origin_flags() {
 
 #[test]
 fn static_flags_fixture_renders_in_detail() {
-    // A seeded static entry carrying `static_flags` (the on-disk shape `ft
-    // <dir> --spa --cors --token s` reserves) must render the flags in `ft
-    // detail` — SPA/CORS always (on/off) and the token only when configured —
-    // while a plain static entry in the same registry keeps the historical
-    // shape (SPA/CORS off, no Token row).
     let dir = TempDir::new().unwrap();
     let body = r#"{
   "next_id": 3,
@@ -2296,12 +1915,6 @@ fn static_flags_fixture_renders_in_detail() {
 
 #[test]
 fn static_flags_persist_through_a_full_registry_rewrite() {
-    // The re-apply story end to end at the registry layer: the detached worker
-    // re-applies the flags by reading them off the entry, so they must survive
-    // a real load → update → save cycle through the binary. Prune reaps the
-    // EXPIRED pid-0 reservation but keeps the FRESH one (M1 grace) — and the
-    // kept entry must come out of the rewrite with its static_flags intact,
-    // byte-identical in meaning, in the compact JSON the save path writes.
     let dir = TempDir::new().unwrap();
     let body = format!(
         r#"{{
@@ -2349,8 +1962,6 @@ fn static_flags_persist_through_a_full_registry_rewrite() {
         "expected exactly the expired reservation reaped, got: {out}"
     );
 
-    // The rewrite kept the flagged entry WITH its flags (so a re-started or
-    // inspected service still re-applies them), through the real save path.
     let after = fs::read_to_string(&reg).unwrap();
     assert!(
         after.contains("flagged-fresh")
