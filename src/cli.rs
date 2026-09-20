@@ -1,10 +1,6 @@
-//! Command-line interface definition for `ft`.
-//!
-//! Uses clap derive. `ft` with no subcommand is the implicit START command
-//! against a positional directory (`ft ./site`). The static-origin flags
-//! (`--spa`/`--cors`/`--token`) live on the top-level command only — the
-//! implicit START's origin is the only one they can configure, and `ft proxy`
-//! structurally takes none (a parse-level guarantee).
+//! CLI definition for `ft` (clap derive). No subcommand = the implicit START
+//! against a positional `dir`; the static-origin flags live on the top level
+//! only — `ft proxy` structurally takes none (parse-level guarantee).
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -256,7 +252,7 @@ pub enum Command {
         #[arg(
             long,
             value_name = "BYTES",
-            value_parser = clap::value_parser!(u64).range(1..=crate::drop_server::MAX_TOTAL_STORE)
+            value_parser = clap::value_parser!(u64).range(1..=crate::server::drop_server::MAX_TOTAL_STORE)
         )]
         max_size: Option<u64>,
     },
@@ -320,11 +316,8 @@ mod tests {
     /// in `parse` with every parse, so parallel test threads cannot race it.
     static FT_TOKEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Parse `ft <args>` (the binary name is prepended for clap's usage
-    /// strings, exactly like a real invocation). FT_TOKEN is cleared first:
-    /// an ambient exported value would fill the env-backed `--token` fields
-    /// and flip the token-absence asserts (the env channel itself is pinned
-    /// hermetically by the integration tests' subprocess runs).
+    /// Parse `ft <args>`. FT_TOKEN is cleared first — an ambient value would
+    /// fill the env-backed `--token` fields and flip the token-absence asserts.
     fn parse(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
         let _guard = FT_TOKEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the test binary's only env mutation, and every clap parse
@@ -508,10 +501,8 @@ mod tests {
 
     #[test]
     fn run_requires_the_separator_and_a_command() {
-        // `ft run` alone is a usage error. A port without a `--` tail parses
-        // to an EMPTY command (clap keeps the `last = true` positional
-        // optional), so the empty-command refusal is deliberately owned by
-        // cmd::run's runtime check, before any state is touched.
+        // A port without a `--` tail parses to an EMPTY command (clap keeps
+        // `last = true` optional) — the refusal is owned by cmd::run at runtime.
         assert!(parse(&["run"]).is_err(), "missing port and command");
         match parse(&["run", "--port", "3000"])
             .expect("port-only must parse")
@@ -840,9 +831,8 @@ mod tests {
 
     #[test]
     fn proxy_takes_no_static_origin_flags() {
-        // NEVER-ON-PROXY: ft-owned origin policy (SPA/CORS/token) is a
-        // parse-level error everywhere but the implicit START, never a
-        // silently ignored flag.
+        // NEVER-ON-PROXY: static-origin policy is a parse-level error
+        // everywhere but the implicit START, never silently ignored.
         for flag in [["--spa"].as_slice(), &["--cors"], &["--token", "sekrit"]] {
             let mut args = vec!["proxy", "3000"];
             args.extend_from_slice(flag);

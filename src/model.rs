@@ -38,21 +38,14 @@ pub enum ServiceKind {
     /// The operator already runs a server on [`Service::port`]; the tunnel
     /// fronts it directly and `ft` starts no server of its own.
     Proxy,
-    /// `ft run -- <command>`: `ft` spawns the operator's command (a dev
-    /// server) as the origin on [`Service::port`]. Unlike `Proxy`, `ft` OWNS
-    /// the child: it runs in its own process group so `ft kill` tears tunnel
-    /// and command down together, and [`Service::command_pid`] records it so
-    /// a survivor can still be found after the worker is gone.
+    /// `ft run`: ft spawns the command as the origin and OWNS it (own group,
+    /// dies with the tunnel); [`Service::command_pid`] records it for orphans.
     Run,
-    /// `ft hook`: ft's own webhook receiver/inspector origin on
-    /// [`Service::port`] (like `Static`, inside the worker), recording every
-    /// request through the tunnel to the service's `requests.json` — no
-    /// served directory.
+    /// `ft hook`: ft's own webhook receiver/inspector origin (like `Static`,
+    /// inside the worker), recording requests to the service's `requests.json`.
     Hook,
-    /// `ft drop <dir>`: ft's own upload-receiver origin on [`Service::port`]
-    /// (ft-owned like Static/Hook) that accepts token-gated uploads into
-    /// [`Service::dir`] (carried like Static's) and serves the stored files
-    /// back GET-only.
+    /// `ft drop <dir>`: ft's own upload-receiver origin, token-gated uploads
+    /// into [`Service::dir`] (carried like Static's), stored files back GET-only.
     Drop,
 }
 
@@ -68,39 +61,22 @@ impl ServiceKind {
     }
 }
 
-/// Static-origin behaviour flags (`ft <dir> --spa/--cors/--token`), carried on
-/// a [`Service`] so the detached worker re-applies what the operator asked for.
-/// They travel on the registry entry — not the worker argv — because the
-/// worker already reloads the entry before starting, and an argv channel would
-/// put the `token` secret in `ps` output. Meaningless for non-Static kinds
-/// (the CLI only accepts them on the implicit START; `ft proxy` structurally
-/// has none).
-///
-/// See also `static_server`'s module docs — the normative semantics for
-/// `--spa`/`--cors`/`--token` (this doc and the CLI help summarize them).
+/// Static-origin flags (`ft <dir> --spa/--cors/--token`), carried on the
+/// entry so the detached worker re-applies them — NOT the worker argv, which
+/// would put the `token` secret in `ps` output. Meaningless for non-Static
+/// kinds (the CLI only accepts them on the implicit START). Normative
+/// semantics: `static_server`'s module docs.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StaticFlags {
-    /// `--spa`: fall unmatched paths (404s for non-existent files) back to the
-    /// root `index.html` for client-side-router deep links. Refusal 404s keep
-    /// their meaning: dotfiles, traversal, and symlink escapes are never
-    /// rewritten; a root without an `index.html` keeps the honest 404.
+    /// `--spa`: rewrite unmatched paths to the root `index.html` — never
+    /// dotfiles/traversal/symlink-escape refusals (see static_server docs).
     pub spa: bool,
-    /// `--cors`: stamp permissive CORS headers (`Access-Control-Allow-Origin:
-    /// *`, methods GET/HEAD/OPTIONS, wildcard request headers) on every
-    /// response. Preflight OPTIONS is deliberately NOT answered with success
-    /// (it 405s like any non-GET/HEAD), so with `--token` a cross-origin
-    /// BROWSER can never complete a Bearer-authenticated request (it falls
-    /// back to `?token=`); same-origin pages and non-browser clients are
-    /// unaffected.
+    /// `--cors`: permissive CORS headers; preflight deliberately 405s, so a
+    /// cross-origin browser cannot use Bearer auth (falls back to `?token=`).
     pub cors: bool,
-    /// `--token <secret>`: require this operator-chosen secret on EVERY
-    /// request (the static origin's whole value is its content — no safe
-    /// unauthenticated subset, unlike the drop bucket's write-only gate) via
-    /// `Authorization: Bearer` or `?token=`, constant-time compared, 401
-    /// before confinement so a 404-scanner cannot probe the tree shape.
-    /// Never auto-generated; stored here because the registry save path is
-    /// owner-only 0600, like the drop token's private file.
+    /// `--token`: required on every request (Bearer or `?token=`),
+    /// constant-time, 401 BEFORE confinement — no 404 tree probing.
     pub token: Option<String>,
 }
 
@@ -112,70 +88,49 @@ pub struct Service {
     pub id: u64,
     /// Human-friendly name, usable as a target.
     pub name: String,
-    /// How this service sources its local origin: ft's own static file server
-    /// ([`Static`]), the operator's existing upstream ([`Proxy`]), a command
-    /// `ft` spawns itself ([`Run`]), ft's own webhook receiver ([`Hook`]), or
-    /// ft's own upload receiver ([`Drop`]). Defaults to `Static` on
+    /// How this service sources its origin. Defaults to `Static` on
     /// deserialize so pre-proxy registries (no `kind` key) keep their meaning.
     #[serde(default)]
     pub kind: ServiceKind,
-    /// Absolute path to the directory being served: `Some` for `Static` (the
-    /// served tree) and `Drop` (the upload target); `None` for `Proxy`/`Run`/
-    /// `Hook`, which front a port instead. Nullable and defaulted so those
-    /// entries may omit it on disk.
+    /// Served tree for `Static`, upload target for `Drop`; `None` for the
+    /// port-fronting kinds. Nullable/defaulted for on-disk omission.
     #[serde(default)]
     pub dir: Option<PathBuf>,
-    /// Local port. For `Static` services this is the port ft's own server
-    /// binds; for `Proxy` services it IS the operator's upstream port
-    /// (there is no separate local server port).
+    /// The port ft's server binds (`Static`) — or the operator's upstream
+    /// port IS the service port (`Proxy` — no separate local server port).
     pub port: u16,
     /// e.g. `http://127.0.0.1:PORT` — ft's server for `Static`, the
     /// operator's upstream for `Proxy`.
     pub local_url: String,
     /// Public trycloudflare URL. `None` until the worker discovers it.
     pub public_url: Option<String>,
-    /// PID of the detached worker process. For `Static` services it hosts
-    /// the static server in-process; for `Proxy` services it only owns the
-    /// `cloudflared` child. Either way it owns that child.
+    /// The detached worker: hosts the server in-process (`Static`) or only
+    /// owns the cloudflared child (`Proxy`). Either way it owns that child.
     pub worker_pid: u32,
     /// PID of the `cloudflared` child, once spawned.
     pub tunnel_pid: Option<u32>,
-    /// Static-origin flags for `Static` services (`--spa`/`--cors`/`--token`),
-    /// persisted so the detached worker re-applies them — see [`StaticFlags`]
-    /// for why they live here rather than on the worker argv. Serde-defaulted
-    /// so pre-flag registries and non-Static entries load with all flags off.
+    /// Static-origin flags persisted for the detached worker — see
+    /// [`StaticFlags`] for why they live here, not the worker argv.
     #[serde(default)]
     pub static_flags: StaticFlags,
-    /// PID of the user's command child, for `Run` services only: recorded
-    /// under the registry lock so the child stays reachable by id even if the
-    /// worker dies without tearing it down (`ft doctor`'s orphan detection
-    /// reads this field). Only the pid is registry state — the command line
-    /// travels in the worker's argv and is deliberately not persisted.
+    /// Run-only: the command child's pid, recorded under the lock so a
+    /// survivor stays findable after the worker dies (doctor's orphan check).
     #[serde(default)]
     pub command_pid: Option<u32>,
     pub created_at: DateTime<Utc>,
     /// Per-service directory holding its log files.
     pub state_dir: PathBuf,
-    /// True when the server + cloudflared run in-process inside the `ft`
-    /// process the operator is watching (`--foreground`) rather than a
-    /// detached `run-worker` child. Drives status/kill behaviour: the
-    /// worker_pid is the `ft` process itself (cmdline lacks the
-    /// `"run-worker"` token, so the cmdline-aware probe must not be used),
-    /// and `ft kill` signals that single pid, never the whole group (which
-    /// would include the operator's shell). Defaults to `false`.
+    /// `--foreground`: worker_pid is the `ft` process itself (no `run-worker`
+    /// cmdline token — plain liveness probe); `ft kill` signals that pid only.
     #[serde(default)]
     pub foreground: bool,
 }
 
-/// How long a freshly reserved entry whose worker pid has not been recorded
-/// (`worker_pid == 0`) is protected from `ft kill` / `ft prune` — see
-/// [`Service::start_in_progress`]. The background flow reserves with pid 0,
-/// spawns the worker, then records the pid; during that window there is
-/// nothing safe to signal (pid 0 never passes an identity probe, and reaping
-/// the entry would orphan the just-spawned worker). Every live start resolves
-/// the window in milliseconds or removes the entry on failure (bounded by the
-/// 30 s poll), so 60 s is well above all of those: past the grace, a pid-0
-/// entry is an abandoned reservation (parent died mid-start), fair game.
+/// How long a pid-0 reserved entry is protected from `ft kill`/`ft prune` —
+/// during the reserve→spawn→record window there is nothing safe to signal
+/// (reaping would orphan the just-spawned worker); every live start resolves
+/// the window in milliseconds, so 60 s cleanly separates it from an abandoned
+/// reservation (parent died mid-start).
 pub const START_GRACE: Duration = Duration::from_secs(60);
 
 impl Service {
@@ -187,11 +142,8 @@ impl Service {
         if self.worker_pid == 0 {
             return ServiceStatus::Starting;
         }
-        // A foreground service's worker_pid is the `ft` process itself (no
-        // `"run-worker"` cmdline token), so the cmdline-aware `pid_alive`
-        // would wrongly read false for a live tunnel — use a plain liveness
-        // probe there. Background workers keep the cmdline check so a
-        // recycled foreign pid can never read as ours.
+        // Foreground: plain liveness (the cmdline-aware probe would read
+        // false); background keeps the cmdline check against recycled pids.
         let alive = if self.foreground {
             crate::proc::process_exists(self.worker_pid)
         } else {
@@ -204,11 +156,8 @@ impl Service {
         }
     }
 
-    /// True while this entry sits in the reserve→spawn→record window that
-    /// `ft kill` / `ft prune` must leave alone (the M1 race). Complements
-    /// [`status`]'s pid-0 case: that renders `Starting` for display, this
-    /// decides reapability — fresh reservations are protected for
-    /// [`START_GRACE`], expired ones are abandoned and fair game.
+    /// True inside the reserve→spawn→record window that kill/prune must
+    /// leave alone; complements [`status`]'s display-grade pid-0 Starting.
     pub fn start_in_progress(&self) -> bool {
         if self.worker_pid != 0 {
             return false;
@@ -242,11 +191,8 @@ impl Default for Registry {
     }
 }
 
-/// Current UTC instant, from `SystemTime` rather than chrono's `Utc::now()`:
-/// `clock` stays disabled so the crate never pulls `iana-time-zone` (and, on
-/// macOS, the CoreFoundation framework), which lets the binary link under a
-/// cross-linker without the Apple SDK. `From<SystemTime> for DateTime<Utc>`
-/// exists under just the `std` feature.
+/// UTC now from `SystemTime`: keeps chrono's `clock` off (no
+/// iana-time-zone/CoreFoundation) — links under a cross-linker, no Apple SDK.
 pub fn now_utc() -> DateTime<Utc> {
     std::time::SystemTime::now().into()
 }
@@ -529,7 +475,7 @@ mod tests {
         );
     }
 
-    // --- the reserve→spawn→record protection window (M1) ---------------------
+    // --- the reserve→spawn→record protection window --------------------------
 
     #[test]
     fn start_in_progress_true_for_fresh_reservation() {

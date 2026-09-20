@@ -1,20 +1,15 @@
-//! Terminal output formatting for `ft` commands.
-//!
-//! The fixed-format output blocks (start banner, ls table, detail report,
-//! doctor/sanitize reports, stop confirmations) live here so command modules
-//! stay focused on control flow; inherently sequential printing (prompts,
-//! streamed log lines) stays in the commands. Output shapes are fixed by the
-//! CLI's public contract.
+//! Terminal output for `ft`: fixed-format blocks live here; sequential
+//! printing stays in the commands. Shapes are CLI contract.
 
 use crate::cmd::doctor::{Check, CheckStatus};
 use crate::model::{Service, ServiceKind};
 use chrono::{Datelike, Timelike};
 use comfy_table::{Cell, ContentArrangement, Table};
 
-/// Restore the default SIGPIPE disposition so a short-lived printing command
-/// piped to a consumer (`ft ls | head`) dies quietly on the broken pipe
-/// instead of panicking. NEVER call on a serving path (start/run/hook/drop/
-/// proxy, the worker): a SigDfl server dies on the first client disconnect.
+/// Restore default SIGPIPE so a short-lived printing command piped to a
+/// consumer (`ft ls | head`) dies quietly instead of panicking. NEVER call
+/// on a serving path (start/run/hook/drop/proxy, the worker): a SigDfl
+/// server dies on the first client disconnect.
 pub fn reset_sigpipe() {
     #[cfg(unix)]
     {
@@ -44,17 +39,7 @@ fn url_or_pending(service: &Service) -> &str {
     service.public_url.as_deref().unwrap_or("(pending)")
 }
 
-/// Print the success block emitted by the START command.
-///
-/// Shape (trailing blank line between the banner and the fields is intentional):
-/// ```text
-/// Started <name>
-///
-/// ID:      <id>
-/// Local:   <local_url>
-/// Public:  <public_url>
-/// Logs:    <service_dir>/
-/// ```
+/// The START success block (the blank line between banner and fields is fixed).
 pub fn print_started(service: &Service) {
     println!("Started {}", service.name);
     println!();
@@ -65,10 +50,8 @@ pub fn print_started(service: &Service) {
     println!("Logs:    {}/", service.state_dir.display());
 }
 
-/// Print the drop bucket's access-token block, ONCE per successful `ft drop`:
-/// the token is the write credential, so the operator must leave the start
-/// command with it in hand (it also lives in the token file and `ft detail`).
-/// The example embeds `example_origin` so it is copy-pasteable.
+/// The drop token block, printed ONCE per successful start: the token is the
+/// write credential the operator must leave with. Example is copy-pasteable.
 pub fn print_drop_token(token: &str, example_origin: &str) {
     println!();
     println!("Token:   {token}");
@@ -81,9 +64,8 @@ pub fn print_drop_token(token: &str, example_origin: &str) {
     println!("Recover it later with `ft detail <name>`.");
 }
 
-/// Print the service list as a table, or `(no services)` when empty.
-/// Columns `ID NAME STATUS PORT URL` are a fixed output contract — the kind
-/// is visible in `ft detail`'s `Mode:` row, not here.
+/// The service table, or `(no services)` when empty. Columns
+/// `ID NAME STATUS PORT URL` are fixed — the kind shows in `ft detail`.
 pub fn print_list(services: &[Service]) {
     if services.is_empty() {
         println!("(no services)");
@@ -127,17 +109,11 @@ fn dir_or_dash(service: &Service) -> String {
         .map_or_else(|| "-".to_string(), |d| d.display().to_string())
 }
 
-/// Print a key/value detail block for a single service, including a Logs
-/// section listing its log paths.
-///
-/// The `Mode`/`Directory` rows are kind-aware: Proxy renders `Upstream:`
-/// (its `local_url` IS the operator's server), Run/Hook render no directory
-/// (a run's `Command PID:` row is its origin fact; a hook's `Requests:` file
-/// sits in the Logs section), Drop renders its upload target's `Directory:`
-/// plus a `Token:` row read back from the private token file — the token is
-/// NOT registry state, so that file is the only way `ft detail` can recover
-/// it (`-` when unreadable). Only a Static service renders the static-origin
-/// flag rows and a `server.log` (other kinds run no traced static server).
+/// The key/value detail block. The `Mode`/`Directory` rows are kind-aware:
+/// Proxy renders `Upstream:`; Drop renders its target plus a `Token:` row
+/// read from the private token file (the token is NOT registry state — that
+/// file is the only recovery path); only Static renders the origin-flag rows
+/// and a `server.log`.
 pub fn print_detail(service: &Service) {
     println!("Name:         {}", service.name);
     println!("ID:           {}", service.id);
@@ -165,8 +141,7 @@ pub fn print_detail(service: &Service) {
             );
             println!("Directory:    {}", dir_or_dash(service));
             // Always rendered on/off so the shape is predictable; the token
-            // row only when one is configured (the operator chose it — same
-            // recovery convenience as the drop bucket's token row).
+            // row only when configured (operator's choice, like drop's).
             println!(
                 "SPA:          {}",
                 if service.static_flags.spa {
@@ -196,10 +171,9 @@ pub fn print_detail(service: &Service) {
     println!("Local URL:    {}", service.local_url);
     println!("Public URL:   {}", url_or_pending(service));
     if service.kind == ServiceKind::Drop {
-        // The token's durable home is the private token file; detail is where
-        // the operator recovers it. A missing/unreadable file renders `-`
-        // rather than failing the whole detail.
-        let token = crate::drop_server::read_token(&service.state_dir)
+        // The token's durable home is the private file; `-` on a missing or
+        // unreadable one rather than failing the whole detail.
+        let token = crate::server::drop_server::read_token(&service.state_dir)
             .ok()
             .flatten()
             .unwrap_or_else(|| "-".to_string());
@@ -231,17 +205,8 @@ pub fn print_removed_stale(name: &str) {
     println!("Removed stale service {name}.");
 }
 
-/// Print the DOCTOR report: one line per check (`ok`/`warn`/`fail`,
-/// width-aligned), an indented `hint:` under any problem carrying one, then a
-/// blank line and the `N problem(s), M note(s)` summary (`all checks passed`
-/// when both are zero). Rendering only — the decision logic lives in
-/// `cmd/doctor.rs`.
-///
-/// ```text
-/// ok    cloudflared: found at /usr/local/bin/cloudflared
-/// fail  origin api: proxying 3000 but nothing is listening — the tunnel will 502 every request
-///       hint: start the upstream server or stop the service (`ft kill api`)
-/// ```
+/// The DOCTOR report: aligned `ok/warn/fail` check lines, indented `hint:`
+/// lines, then the problem/note summary. Rendering only.
 pub fn print_doctor(checks: &[Check]) {
     for check in checks {
         // Width 4 aligns `ok` under `warn`/`fail`.
@@ -270,18 +235,8 @@ pub fn print_doctor(checks: &[Check]) {
     }
 }
 
-/// Print the SANITIZE report (rendering only — the decision logic lives in
-/// `cmd/sanitize.rs`): `Nothing to clean.` or a `Sanitized N service(s):`
-/// bullet list of `(name, reason)`, plus the left-alone note for skipped
-/// foreground services (the operator's cue to stop them by hand).
-///
-/// ```text
-/// Sanitized 2 service(s):
-///   - proxy-3000 (upstream 127.0.0.1:3000 is dead — tunnel was 502ing every request)
-///   - demo (worker no longer running)
-/// Left 1 foreground service(s) alone (stop it with Ctrl-C in its terminal):
-///   - web
-/// ```
+/// The SANITIZE report: `Nothing to clean.` or a bullet list, plus the
+/// left-alone foreground note. Rendering only — decisions in `cmd/sanitize.rs`.
 pub fn print_sanitized(removed: &[(String, String)], skipped_foreground: &[String]) {
     if removed.is_empty() {
         println!("Nothing to clean.");

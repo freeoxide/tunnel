@@ -28,10 +28,8 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Map every char outside `[A-Za-z0-9_-]` to `-`, preserving everything else
-/// verbatim INCLUDING leading/trailing dashes. Whether those are trimmed is
-/// the caller's policy: [`generate_name`] trims for display names; the
-/// state-dir segment builder does not (trimming collided `"-a"` with `"a"`).
+/// Outside `[A-Za-z0-9_-]` becomes `-`, dashes kept verbatim; trimming them
+/// is the caller's policy (display names trim; the state-dir segment cannot).
 pub(crate) fn dash_sanitize(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -59,10 +57,8 @@ pub fn generate_name(dir: &Path) -> String {
     }
 }
 
-/// Produce a name unique within the registry: `base`, `base-2`, `base-3`, ...
-/// The scan is capped so a registry pre-filled with `base-2`..`base-N` cannot
-/// make allocation spin unboundedly; at the cap the last candidate is returned
-/// (collision beats dropping the start request).
+/// `base`, `base-2`, ... unique in the registry; the scan is capped (a
+/// pre-filled registry cannot spin it) — at the cap, collision beats dropping.
 pub fn unique_name(registry: &Registry, base: &str) -> String {
     const LIMIT: u64 = 100_000;
     let taken: HashSet<&str> = registry.services.iter().map(|s| s.name.as_str()).collect();

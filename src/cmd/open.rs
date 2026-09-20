@@ -7,14 +7,8 @@ use crate::error::Result;
 use crate::model::Registry;
 use crate::state::StateDir;
 
-/// Resolve `target` and open its public URL.
-///
-/// Always prints the URL first. Then attempts to launch the default browser;
-/// on a headless box (VPS, no `DISPLAY`/`WAYLAND_DISPLAY`, or no `xdg-open`)
-/// the launch simply fails and we surface the URL for manual use — this never
-/// crashes or exits non-zero just because there is no browser.
-///
-/// Bails only if the target is unknown or its URL has not been discovered yet.
+/// Resolve the target, print its URL, then try the default browser — a
+/// headless box just gets the URL; bails only on unknown/undiscovered target.
 pub async fn run(target: String) -> Result<()> {
     let state = StateDir::new()?;
     let registry = Registry::load(&state)?;
@@ -27,9 +21,8 @@ pub async fn run(target: String) -> Result<()> {
         bail!("service '{}' has no public URL yet", service.name);
     };
 
-    // `public_url` normally comes from `extract_url`, but it is stored in the
-    // user-editable registry.json — re-check its shape before handing it to the
-    // browser launcher so a tampered field can't point xdg-open elsewhere.
+    // public_url lives in user-editable registry.json — re-check its shape
+    // so a tampered field can't point the browser launcher elsewhere.
     if !cloudflared::is_tunnel_url(url) {
         bail!(
             "service '{}' has a malformed public URL (expected https://*.trycloudflare.com)",
@@ -37,8 +30,7 @@ pub async fn run(target: String) -> Result<()> {
         );
     }
 
-    // Print the URL unconditionally so it is available even when no browser
-    // can be launched.
+    // Printed unconditionally — usable even with no browser.
     println!("{url}");
 
     match open::that(url) {

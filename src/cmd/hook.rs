@@ -1,19 +1,10 @@
-//! The HOOK command.
-//!
-//! `ft hook` runs an ft-owned webhook receiver/inspector origin (see
-//! `hook_server`) behind a cloudflared Quick Tunnel and registers the result
-//! like any other service. The background flow shares START/PROXY's
-//! reserve-entry → spawn-worker → poll-for-URL scaffolding (see
-//! `cmd/start.rs`); the worker binds the origin itself on `127.0.0.1:<port>`
-//! (fail-fast on a bind error), so success is "URL published" — no separate
-//! origin probe.
-//!
-//! Unlike RUN there is no child command, and unlike PROXY the port is ft's
-//! own (it must be FREE, not already listening), exactly like the static
-//! server. The foreground flow keeps its own body (the origin is the hook
-//! server, not a static dir or a command child) but shares the reservation,
-//! guard, and announce helpers from `cmd/start.rs`; keep its teardown order in
-//! sync with `run_foreground_inner` there.
+//! The HOOK command: an ft-owned webhook receiver/inspector origin (see
+//! `hook_server`) behind a Quick Tunnel. The background flow shares START's
+//! reserve → spawn-worker → poll-for-URL scaffolding; the worker binds the
+//! origin itself, so success is "URL published". The port is ft's own — it
+//! must be FREE (unlike PROXY's listening upstream). The foreground flow
+//! keeps its own body but shares start's reservation/guard/announce helpers;
+//! keep its teardown order in sync with `run_foreground_inner`.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -25,24 +16,20 @@ use tokio::sync::Mutex;
 use super::start;
 use crate::cloudflared;
 use crate::error::Result;
-use crate::hook_server::{self, HookLog};
 use crate::model::ServiceKind;
 use crate::port;
+use crate::server::hook_server::{self, HookLog};
 use crate::spawn;
 use crate::state::StateDir;
 
-/// Entry point for the HOOK command.
 pub async fn run(
     port: Option<u16>,
     name: Option<String>,
     foreground: bool,
     keep: Option<u16>,
 ) -> Result<()> {
-    // The hook origin is ft's own server, so the port must be FREE — the
-    // inverse of PROXY's pre-flight, same reasoning: a friendly up-front
-    // failure beats a tunnel fronting nothing (or a worker that dies on its
-    // bind check seconds later). Resolved BEFORE any state is touched so a
-    // rejection leaves zero state.
+    // The hook origin is ft's own server, so the port must be FREE — fail up
+    // front; resolved before any state so a rejection leaves zero state.
     let port = match port {
         Some(p) => {
             ensure!(
@@ -80,9 +67,7 @@ fn open_hook_log(
     Ok(Arc::new(std::sync::Mutex::new(log)))
 }
 
-/// Background flow: reserve the entry, spawn the detached HOOK worker (which
-/// binds the origin itself), then poll for the tunnel URL (failing fast if
-/// the worker dies first) — the shared START/PROXY scaffolding.
+/// Background flow: the shared START scaffolding (the worker binds the origin).
 async fn run_background(port: u16, name: Option<String>, keep: u16) -> Result<()> {
     let state = StateDir::new()?;
 
@@ -125,13 +110,10 @@ enum ReaderExit {
     Signal,
 }
 
-/// Foreground flow: run the hook origin and tunnel in this process and block
-/// until cloudflared exits, Ctrl-C is received, or (Unix) SIGTERM arrives.
-/// Mirrors `cmd/start.rs::run_foreground_inner`'s teardown order; hook
-/// differences: the kind is always Hook, the origin is the hook server, and
-/// there is no command child.
+/// Foreground flow: hook origin + tunnel in THIS process until cloudflared
+/// exits, Ctrl-C, or SIGTERM; mirrors start's teardown order.
 async fn run_foreground(port: u16, name: Option<String>, keep: u16) -> Result<()> {
-    use crate::static_server;
+    use crate::server::static_server;
 
     let state = StateDir::new()?;
     state.ensure()?;
@@ -162,17 +144,14 @@ async fn run_foreground(port: u16, name: Option<String>, keep: u16) -> Result<()
             .with_context(|| format!("opening tunnel log {}", tunnel_log.display()))?,
     ));
 
-    // Install the SIGTERM handler (Unix) BEFORE spawning the server +
-    // cloudflared: if it fails, the `?` returns with only the
-    // (guard-protected) entry to clean up — no orphaned server task or
-    // cloudflared child is left behind.
+    // Install the SIGTERM handler BEFORE spawning server + cloudflared: on
+    // failure the `?` leaves only the guard-protected entry, no orphans.
     #[cfg(unix)]
     let mut sig_term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("installing SIGTERM handler")?;
 
-    // The origin: ft's own hook server in THIS process. `serve` binds
-    // 127.0.0.1:<port> (pre-flighted for freeness above) and installs its own
-    // Ctrl-C drain; the JoinHandle is kept so the drain can be bounded below.
+    // ft's own hook server in THIS process; `serve` installs its own Ctrl-C
+    // drain, bounded below.
     let hook_log = open_hook_log(&state, &name, keep)?;
     let router = hook_server::router(hook_log);
     let mut server_handle = tokio::spawn(async move {
@@ -221,10 +200,8 @@ async fn run_foreground(port: u16, name: Option<String>, keep: u16) -> Result<()
         )));
     }
 
-    // Keep the foreground alive until cloudflared exits, Ctrl-C is received,
-    // or (Unix) SIGTERM arrives. Racing child.wait() ensures that if
-    // cloudflared dies before the URL is found (or any time later) we tear
-    // down instead of hanging forever.
+    // Race child.wait() against Ctrl-C/SIGTERM so a cloudflared that dies
+    // tears down instead of hanging.
     #[cfg(unix)]
     let exit_reason = tokio::select! {
         status = child.wait() => {
@@ -268,9 +245,8 @@ async fn run_foreground(port: u16, name: Option<String>, keep: u16) -> Result<()
         task.abort();
     }
 
-    // `serve`'s own Ctrl-C handler has already begun draining on Ctrl-C;
-    // bound it so a stuck request can't hang the command, falling back to
-    // abort.
+    // `serve`'s Ctrl-C drain is under way; bound it so a stuck request can't
+    // hang the command, falling back to abort.
     match tokio::time::timeout(start::SERVER_SHUTDOWN_TIMEOUT, &mut server_handle).await {
         Ok(_) => {}
         Err(_) => {
@@ -282,7 +258,5 @@ async fn run_foreground(port: u16, name: Option<String>, keep: u16) -> Result<()
         }
     }
 
-    // The `_entry` guard removes our registry entry on return (every exit
-    // path).
     Ok(())
 }

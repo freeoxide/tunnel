@@ -1,9 +1,5 @@
-//! Locations of the on-disk state directory and derived paths.
-//!
-//! Resolves to `$XDG_STATE_HOME/freeoxide/tunnel`, defaulting to
-//! `~/.local/state/freeoxide/tunnel`. We build the `freeoxide/tunnel` suffix
-//! ourselves because `directories` v6 ignores `organization` on Linux (only the
-//! `application` segment is used), so `ProjectDirs` cannot produce this path.
+//! State dir + derived paths (`$XDG_STATE_HOME/freeoxide/tunnel`). The suffix
+//! is hand-built: `directories` v6 ignores `organization` on Linux.
 
 use crate::error::Result;
 use anyhow::Context;
@@ -23,9 +19,8 @@ impl StateDir {
         Ok(Self { root })
     }
 
-    /// Construct a `StateDir` rooted directly at `root` (deriving registry/lock/
-    /// services paths from it). Used by tests to point at a temp directory
-    /// without mutating `XDG_STATE_HOME` (an `unsafe` operation in edition 2024).
+    /// Root directly at `root` — used by tests to point at a tempdir without
+    /// mutating XDG_STATE_HOME (unsafe in edition 2024).
     #[cfg(test)]
     pub(crate) fn new_at(root: PathBuf) -> Self {
         Self { root }
@@ -66,10 +61,8 @@ impl StateDir {
         self.service_dir(name).join("tunnel.log")
     }
 
-    /// Create the root and services directory tree if missing, owner-only
-    /// (0700): the registry and the service logs (request URIs, local paths)
-    /// must not be readable by other users. Pre-existing directories are
-    /// re-chmodded so a tree created by an older build is sealed.
+    /// Create the tree, owner-only (0700) — registry/logs must not be
+    /// others-readable; pre-existing dirs are re-sealed.
     pub fn ensure(&self) -> Result<()> {
         // Plain recursive create on Windows: the profile-dir ACL suffices.
         crate::fsutil::ensure_private_dir(self.services_dir())
@@ -95,9 +88,8 @@ impl StateDir {
     }
 }
 
-/// Resolve the XDG state base directory (`$XDG_STATE_HOME`, else `~/.local/state`).
-/// A relative `XDG_STATE_HOME` is made absolute against the current directory so
-/// the registry/log tree always lives at a stable absolute location.
+/// The XDG state base (`$XDG_STATE_HOME`, else `~/.local/state`); a relative
+/// value is made absolute so the tree lives at a stable location.
 fn state_base() -> Result<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_STATE_HOME").filter(|s| !s.is_empty()) {
         let p = PathBuf::from(xdg);
@@ -113,10 +105,8 @@ fn state_base() -> Result<PathBuf> {
     Ok(home.join(".local").join("state"))
 }
 
-/// Reduce a name to a single safe path segment via [`dash_sanitize`]: chars
-/// outside `[A-Za-z0-9_-]` become `-`, so separators and `.`/`..` can never
-/// form a traversal segment. Leading/trailing dashes are NOT trimmed (would
-/// collide `"-a"` with `"a"`); an all-dashes result falls back to `"service"`.
+/// One safe path segment via [`dash_sanitize`]: outside `[A-Za-z0-9_-]`
+/// becomes `-` (no traversal possible); all-dashes -> `"service"`.
 fn safe_component(name: &str) -> String {
     let s = crate::name::dash_sanitize(name);
     // All-dashes (which also covers the empty string — `all` is vacuously

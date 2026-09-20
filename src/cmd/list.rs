@@ -5,10 +5,8 @@ use crate::model::Registry;
 use crate::output;
 use crate::state::StateDir;
 
-/// Print every service in the registry as a table.
-///
-/// Status is computed per service (probing the worker pid), and an empty
-/// registry prints `(no services)`.
+/// Print the registry as a table (empty -> `(no services)`); status is
+/// computed per service by probing the worker pid.
 pub async fn run() -> Result<()> {
     let state = StateDir::new()?;
     let registry = Registry::load(&state)?;

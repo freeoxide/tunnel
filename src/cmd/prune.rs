@@ -1,25 +1,16 @@
-//! The `prune` command: reconcile the registry with reality.
-//!
-//! After a reboot, an OOM, or a crash, the registry may list services whose
-//! worker no longer exists. `ft prune` removes those stale entries and
-//! best-effort reaps any `cloudflared` child whose worker is gone (it normally
-//! dies via `PR_SET_PDEATHSIG`, which does not survive a host reboot).
-//!
-//! Entries still starting (`worker_pid == 0` inside `model::START_GRACE`) are
-//! left alone — reaping mid-window would orphan the just-spawned worker; once
-//! the grace expires the reservation is pruned like any other stale entry.
+//! The `prune` command: reconcile the registry with reality — after a
+//! reboot/OOM/crash, remove entries whose worker no longer exists and
+//! best-effort reap an orphaned `cloudflared` (PDEATHSIG does not survive a
+//! host reboot). Fresh pid-0 reservations inside START_GRACE are left alone
+//! (reaping mid-window would orphan the just-spawned worker).
 
 use crate::error::Result;
 use crate::model::Registry;
 use crate::proc;
 use crate::state::StateDir;
 
-/// Result of a single reconciliation pass over the registry.
-///
-/// Pure with respect to signalling: [`classify`] decides what *should* happen,
-/// and [`run`] performs the side effects (orphan reaping). Splitting the
-/// decision from the action lets the staleness rules be tested without sending
-/// signals to real processes.
+/// One reconciliation pass: [`classify`] decides (pure), [`run`] performs the
+/// signalling — the rules stay testable without real signals.
 struct Reconciliation {
     /// Human-friendly names of the stale services, in removal order.
     stale_names: Vec<String>,
@@ -28,14 +19,10 @@ struct Reconciliation {
     orphans_to_reap: Vec<u32>,
 }
 
-/// Decide the fate of every service in `reg` in a single pass.
-///
-/// Stale = recorded worker that is no longer alive: background workers via
-/// the cmdline-aware `pid_alive` (PID-reuse safe), foreground via a cmdline
-/// identity probe against `--foreground` (their `ft` cmdline lacks the
-/// `run-worker` token). A pid-0 reservation is kept while its
-/// [`crate::model::START_GRACE`] window is open, stale once it expires. The
-/// kept set is written back onto `reg.services`; the stale set is dropped.
+/// Decide every service's fate in one pass. Stale = recorded worker no longer
+/// alive: background via cmdline-aware `pid_alive` (PID-reuse safe),
+/// foreground via `pid_matches(.., "--foreground")`; a pid-0 reservation is
+/// kept while START_GRACE is open. Kept set written back; stale dropped.
 fn classify(reg: &mut Registry) -> Reconciliation {
     let mut keep = Vec::new();
     let mut stale_names = Vec::new();
@@ -49,15 +36,12 @@ fn classify(reg: &mut Registry) -> Reconciliation {
             }
         } else {
             // Reserved but never recorded: kept inside the start grace
-            // (reaping mid-window would orphan the just-spawned worker, M1),
-            // pruned once the grace expires.
+            // (reaping mid-window would orphan the worker), pruned after.
             !s.start_in_progress()
         };
         if is_stale {
-            // Best-effort reap of an orphaned cloudflared, gated on a cmdline
-            // identity check so a recycled PID is never signalled. The
-            // terminate_orphan() call itself happens in run(), keeping this
-            // pure.
+            // Best-effort reap of an orphaned cloudflared, gated on cmdline
+            // identity so a recycled PID is never signalled (the call is in run()).
             if let Some(tpid) = s.tunnel_pid
                 && proc::pid_matches(tpid, "cloudflared")
             {
@@ -102,12 +86,8 @@ pub async fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests for the staleness decision logic.
-    //!
-    //! [`classify`] is pure with respect to signalling, so the per-service
-    //! rules (pid-0 reservation keep/prune by grace, background/cmdline-aware
-    //! stale, foreground identity-checked stale, orphan reap list) can be
-    //! asserted directly against a seeded registry without sending signals.
+    //! [`classify`] is pure w.r.t. signalling — the rules are asserted against
+    //! a seeded registry without sending signals.
 
     use super::*;
     use crate::model::Service;
@@ -133,34 +113,29 @@ mod tests {
         }
     }
 
-    /// A worker pid that is "ours" on this test process: the current pid's
-    /// cmdline does not contain `run-worker`, so `pid_alive` reads false for it
-    /// (i.e. it is treated as a stale/reused background worker). That is the
-    /// exact behaviour under test for the background arm.
+    /// A pid "ours" for the test: our cmdline lacks `run-worker`, so
+    /// `pid_alive` reads false for it — exactly the background arm's case.
     fn live_self_pid() -> u32 {
         std::process::id()
     }
 
     #[test]
     fn starting_entry_worker_pid_zero_is_kept() {
-        // A fresh pid-0 reservation (created_at = now) is inside the grace
-        // window: the parent may be mid reserve→spawn→record, so the entry
-        // must survive a prune.
+        // A fresh pid-0 reservation is inside the grace window: the parent
+        // may be mid reserve→spawn→record — the entry must survive.
         let mut reg = Registry::default();
         reg.services.push(dummy_service(1, "starting"));
         let rec = classify(&mut reg);
         assert!(rec.stale_names.is_empty());
         assert!(rec.orphans_to_reap.is_empty());
-        // classify writes the kept set back onto reg.services.
         assert_eq!(reg.services.len(), 1);
         assert_eq!(reg.services[0].name, "starting");
     }
 
     #[test]
     fn abandoned_reservation_past_grace_is_pruned() {
-        // A pid-0 entry whose START_GRACE has expired is an abandoned
-        // reservation (the parent died mid-start, so the pid will never
-        // land) — prune it, or it would sit in `ft ls` as "starting" forever.
+        // Past the grace the pid will never land (parent died mid-start) —
+        // prune, or it sits in `ft ls` as "starting" forever.
         let mut reg = Registry::default();
         let mut s = dummy_service(1, "leftover");
         s.created_at = crate::model::now_utc()
@@ -202,12 +177,8 @@ mod tests {
 
     #[test]
     fn foreground_self_pid_without_flag_is_stale() {
-        // Our own process's cmdline contains `--foreground`? No — the test
-        // binary's cmdline is `ft-<hash>` (deps), so it does NOT contain the
-        // flag. That means pid_matches(self, "--foreground") is false here,
-        // making the foreground entry read as stale. We assert THAT behaviour
-        // (a foreign pid at a foreground slot is pruned), and separately rely
-        // on the live-self background test above for the keep side.
+        // The test binary's cmdline lacks `--foreground`, so the identity
+        // probe reads false — a foreign pid at a foreground slot is pruned.
         let mut reg = Registry::default();
         let mut s = dummy_service(1, "fg");
         s.foreground = true;
@@ -233,9 +204,7 @@ mod tests {
         let mut reg = Registry::default();
         // keep: starting (pid 0)
         reg.services.push(dummy_service(1, "starting"));
-        // keep: background entry whose worker_pid==0 path is the only keep
-        // (any non-zero pid we don't own reads stale). Add a genuine keep by
-        // reusing pid 0 semantics via a second starting entry.
+        // keep: a second starting entry (any non-zero pid we don't own reads stale).
         let mut s2 = dummy_service(2, "starting-2");
         s2.worker_pid = 0;
         reg.services.push(s2);

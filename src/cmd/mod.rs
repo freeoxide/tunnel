@@ -1,9 +1,5 @@
-//! Command dispatch for `ft`.
-//!
-//! This module is the single entry point used by `main`: [`run`] consumes the
-//! parsed [`Cli`] and routes it to the matching command implementation. When no
-//! subcommand is present, the implicit START command runs against the positional
-//! `dir` (`ft <dir>`), matching the contract documented on [`crate::cli::Cli`].
+//! Command dispatch for `ft`: [`run`] routes the parsed [`Cli`] to its
+//! handler; no subcommand = the implicit START against the positional `dir`.
 
 pub mod detail;
 pub mod doctor;
@@ -29,21 +25,18 @@ use crate::cli::{Cli, Command};
 /// Poll cadence while a parent waits for a worker to publish the public URL.
 /// Shared by the START/PROXY/RUN/HOOK background flows.
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(250);
-/// Upper bound on how long a parent waits for the tunnel URL. Dev servers
-/// can be slow to boot, so this is generous (30 s).
+/// Upper bound on how long a parent waits for the tunnel URL — generous
+/// (30 s) because dev servers boot slowly.
 pub(crate) const POLL_TIMEOUT: Duration = Duration::from_secs(30);
-/// Origin-probe connect timeout, shared by doctor's blocking probe and run's
-/// async twin. A loopback connect resolves instantly; nothing is ever read.
+/// Origin-probe connect timeout (doctor's blocking probe, run's async twin);
+/// loopback resolves instantly, nothing is ever read.
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Dispatch the parsed CLI to the matching command.
-///
-/// A `Some(command)` is matched to its handler; `None` falls through to the
-/// implicit START command with the positional directory (defaulting to `.`).
+/// Dispatch the parsed CLI; `None` falls through to the implicit START (dir
+/// defaults to `.`).
 pub async fn run(cli: Cli) -> Result<()> {
-    // Short-lived printing commands only. Serving paths (the implicit START,
-    // proxy/run/hook/drop, run-worker) must NEVER do this: a SigDfl server
-    // dies on the first client disconnect.
+    // Short-lived printing commands only — serving paths must NEVER do this
+    // (see reset_sigpipe).
     if matches!(
         cli.command,
         Some(
@@ -104,9 +97,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         }) => crate::worker::run(id, name, dir, port, command, keep, max_size).await,
         None => {
             let dir: PathBuf = cli.dir.unwrap_or_else(|| PathBuf::from("."));
-            // The static-origin flags only exist on the implicit START (the
-            // CLI structurally has no such flag on any subcommand), so the
-            // never-on-proxy exclusion holds by construction.
+            // The static-origin flags exist only on the implicit START, so
+            // the never-on-proxy exclusion holds by construction.
             let static_flags = crate::model::StaticFlags {
                 spa: cli.spa,
                 cors: cli.cors,
