@@ -110,10 +110,11 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
-/// `cloudflared` presence. Raw `which::which` — `ensure_installed` bails
-/// with the full install message; a miss is a warn, never a failure.
+/// `cloudflared` presence. Raw PATH probe via `toride_runner::discovery` —
+/// `ensure_installed` bails with the full install message; a miss is a warn,
+/// never a failure.
 fn cloudflared_check() -> Check {
-    match which::which("cloudflared") {
+    match toride_runner::discovery::find_binary("cloudflared") {
         Ok(path) => Check {
             name: "cloudflared".to_string(),
             status: CheckStatus::Ok,

@@ -26,7 +26,7 @@ Install cloudflared, then try again:
 
 /// Resolve cloudflared on PATH or bail with the friendly install message.
 pub fn ensure_installed() -> Result<PathBuf> {
-    match which::which("cloudflared") {
+    match toride_runner::discovery::find_binary("cloudflared") {
         Ok(path) => Ok(path),
         Err(_) => bail!(MISSING_MESSAGE),
     }

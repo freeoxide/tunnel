@@ -55,10 +55,13 @@ percent-encoding = "2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 tokio = { version = "1.52.3", features = ["full"] }
+# toride crates are consumed pinned by git rev (not published to crates.io);
+# default-features off keeps the dep surface at `discovery` (which + thiserror
+# + tracing, all already in the tree).
+toride-runner = { git = "https://github.com/freeoxide/toride", rev = "186b84e32cb154bb0feeee2b459cee8940c3b305", default-features = false }
 tower-http = { version = "0.7.0", features = ["fs", "trace", "timeout", "limit", "set-header"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-which = "8.0.4"
 
 # nix is used on all Unix targets (setsid detach, kill(-pgid) teardown, signal
 # handling) but is unavailable on Windows, so it is target-gated.
