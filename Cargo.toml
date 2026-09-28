@@ -57,8 +57,11 @@ serde_json = "1.0.150"
 tokio = { version = "1.52.3", features = ["full"] }
 # toride crates are consumed pinned by git rev (not published to crates.io);
 # default-features off keeps the dep surface at `discovery` (which + thiserror
-# + tracing, all already in the tree).
-toride-runner = { git = "https://github.com/freeoxide/toride", rev = "186b84e32cb154bb0feeee2b459cee8940c3b305", default-features = false }
+# + tracing, all already in the tree). The `version` field is cargo-deny's
+# wildcard-bans remedy — a git dep without one reads as `*`; it changes no
+# resolution (the rev pins the source) and must stay in sync with toride's
+# own crate version.
+toride-runner = { version = "0.1.0", git = "https://github.com/freeoxide/toride", rev = "186b84e32cb154bb0feeee2b459cee8940c3b305", default-features = false }
 tower-http = { version = "0.7.0", features = ["fs", "trace", "timeout", "limit", "set-header"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
