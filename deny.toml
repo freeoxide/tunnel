@@ -32,7 +32,11 @@ multiple-versions = "warn"
 wildcards = "deny"
 
 [sources]
-# Only crates.io; no git/path deps sneaking in.
+# crates.io, plus exactly one rev-pinned git source: the toride workspace
+# (freeoxide/toride), consumed for shared process/fs infrastructure. Every
+# toride dependency in Cargo.toml must pin a `rev` — a moving branch ref is
+# a supply-chain hole the rev pin exists to close.
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = ["https://github.com/freeoxide/toride"]

@@ -343,11 +343,11 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "toride-runner",
  "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",
- "which",
  "windows-sys 0.59.0",
 ]
 
@@ -1133,6 +1133,16 @@ dependencies = [
  "futures-sink",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "toride-runner"
+version = "0.1.0"
+source = "git+https://github.com/freeoxide/toride?rev=186b84e32cb154bb0feeee2b459cee8940c3b305#186b84e32cb154bb0feeee2b459cee8940c3b305"
+dependencies = [
+ "thiserror",
+ "tracing",
+ "which",
 ]
 
 [[package]]
