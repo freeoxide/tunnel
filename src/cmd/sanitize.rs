@@ -172,30 +172,17 @@ async fn origin_dead_after_double_probe(port: u16) -> bool {
     !origin_alive_async(port).await
 }
 
-/// Remove every dangling service (stale + zombie-upstream); see the module
-/// docs for the probe/re-verify/signal safety contract. Exits 0 whenever it ran.
-pub async fn run() -> Result<()> {
-    let state = StateDir::new()?;
-
-    // --- snapshot + probe: strictly BEFORE the registry lock -----------------
-    // A dead double-probe can take ~1.75 s; never hold the lock that long.
-    let snapshot = Registry::load(&state)?;
-
-    if snapshot.services.is_empty() {
-        // Fresh machine: return before `Registry::update` — its lock-file
-        // creation would fail on a not-yet-existing state dir; stay a no-op.
-        output::print_sanitized(&[], &[]);
-        return Ok(());
-    }
-
-    // Worker liveness is a fast /proc read; the double-probe is the slow
-    // part, so the probes are spawned per service and awaited together — N
-    // dead origins pay ONE REPROBE_DELAY gap, not N of them. The gap itself
-    // is deliberate (a restarting dev server drops its port briefly): it is
-    // overlapped, never shortened.
-    let mut liveness = Vec::with_capacity(snapshot.services.len());
-    let mut probes = Vec::with_capacity(snapshot.services.len());
-    for svc in &snapshot.services {
+/// Judge every snapshot entry — worker liveness (a fast /proc read), the
+/// origin double-probes, and [`plan`] — returning removal candidates plus
+/// the skipped-foreground names. The probes are spawned per service and
+/// awaited together: N dead origins pay ONE [`REPROBE_DELAY`] gap, not N;
+/// the gap itself is the deliberate mid-restart tolerance — overlapped,
+/// never shortened. A wall-clock test pins this exact loop: re-serializing
+/// it must fail CI, not just the wall-clock harness.
+async fn judge(services: &[Service]) -> (Vec<Judgment>, Vec<String>) {
+    let mut liveness = Vec::with_capacity(services.len());
+    let mut probes = Vec::with_capacity(services.len());
+    for svc in services {
         let alive = worker_alive(svc);
         // Probe the origin only when Running: a Starting worker's port may
         // not be bound yet; a dead worker already explains a dead port.
@@ -207,7 +194,7 @@ pub async fn run() -> Result<()> {
 
     let mut candidates = Vec::new();
     let mut skipped_foreground = Vec::new();
-    for ((svc, alive), probe) in snapshot.services.iter().zip(liveness).zip(probes) {
+    for ((svc, alive), probe) in services.iter().zip(liveness).zip(probes) {
         // A probe task fails only by panicking; reading that as not-dead
         // keeps a failed probe from ever removing an entry.
         let port_dead = match probe {
@@ -226,6 +213,26 @@ pub async fn run() -> Result<()> {
             }
         }
     }
+    (candidates, skipped_foreground)
+}
+
+/// Remove every dangling service (stale + zombie-upstream); see the module
+/// docs for the probe/re-verify/signal safety contract. Exits 0 whenever it ran.
+pub async fn run() -> Result<()> {
+    let state = StateDir::new()?;
+
+    // --- snapshot + probe: strictly BEFORE the registry lock -----------------
+    // A dead double-probe can take ~1.75 s; never hold the lock that long.
+    let snapshot = Registry::load(&state)?;
+
+    if snapshot.services.is_empty() {
+        // Fresh machine: return before `Registry::update` — its lock-file
+        // creation would fail on a not-yet-existing state dir; stay a no-op.
+        output::print_sanitized(&[], &[]);
+        return Ok(());
+    }
+
+    let (candidates, skipped_foreground) = judge(&snapshot.services).await;
 
     // --- locked removal, re-verified against the freshly loaded registry -----
     let removed = Registry::update(&state, |reg| apply(reg, &candidates))?;
@@ -278,6 +285,8 @@ mod tests {
     //! over a seeded registry — asserted without sockets or signals.
     //! [`worker_alive`] probes real /proc state: the test binary's own pid
     //! is alive but lacks both needles — the recycled-pid scenario.
+    //! [`judge`]'s probe overlap is pinned by a real wall-clock bound driven
+    //! through the same helper `run` calls (decoy workers; unix only).
 
     use super::*;
     use chrono::TimeDelta;
@@ -498,6 +507,90 @@ mod tests {
         assert!(
             elapsed < REPROBE_DELAY * 2,
             "concurrent double-probes must overlap their gaps, took {elapsed:?}"
+        );
+    }
+
+    // --- the judge loop's concurrency ------------------------------------------
+
+    /// Spawn a decoy live worker: `sh` leading its own process group, argv
+    /// carrying the `run-worker` needle `pid_alive` probes for (the trailing
+    /// arg is $0, so it stays in argv; the body is a loop — a tail-exec'd
+    /// final command would replace argv). The wall-clock harness
+    /// (benches/sanitize_median.py) seeds the same shape via a double fork.
+    #[cfg(unix)]
+    fn spawn_decoy_worker() -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        let child = std::process::Command::new("sh")
+            .args(["-c", "while :; do sleep 30; done", "run-worker"])
+            .process_group(0)
+            .spawn()
+            .expect("spawn decoy sh");
+        // Fork returns before exec completes: spin until the needle is
+        // probe-visible, or worker_alive would flake on a blank cmdline.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !proc::pid_alive(child.id()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "decoy never became probe-ready"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        child
+    }
+
+    /// Reap the decoy's whole group (the endless loop's current `sleep` is a
+    /// grandchild); the negative pid addresses the pgid.
+    #[cfg(unix)]
+    fn kill_decoy(child: &mut std::process::Child) {
+        let pgid = nix::unistd::Pid::from_raw(-(child.id() as i32));
+        let _ = nix::sys::signal::kill(pgid, nix::sys::signal::Signal::SIGKILL);
+        let _ = child.wait();
+    }
+
+    /// THE loop-shape gate: judging two dead-upstream services through the
+    /// same [`judge`] `run` calls must cost ONE 750 ms gap, not two. The
+    /// futures-level test above cannot catch a re-serialized caller; this
+    /// one does (a serialized loop takes >= 2 gaps and fails the upper
+    /// bound, a shortened gap the lower). Unix-only: the decoy needs `sh`
+    /// and a /proc-style cmdline probe.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn judge_pays_one_reprobe_gap_across_services() {
+        let mut decoys = Vec::new();
+        let services = (0..2)
+            .map(|i| {
+                let child = spawn_decoy_worker();
+                let mut svc = service(ServiceKind::Proxy, false);
+                svc.name = format!("zombie-{i}");
+                svc.worker_pid = child.id();
+                svc.port = dead_loopback_port();
+                decoys.push(child);
+                svc
+            })
+            .collect::<Vec<_>>();
+
+        let start = std::time::Instant::now();
+        let (candidates, skipped) = judge(&services).await;
+        let elapsed = start.elapsed();
+
+        for child in &mut decoys {
+            kill_decoy(child);
+        }
+
+        assert!(
+            candidates.len() == 2 && skipped.is_empty(),
+            "both decoy-backed services must reach RemoveZombie (got {} candidates, \
+             skipped {skipped:?})",
+            candidates.len()
+        );
+        assert!(
+            elapsed >= REPROBE_DELAY,
+            "the gap is the deliberate mid-restart tolerance, never to be shortened: \
+             {elapsed:?}"
+        );
+        assert!(
+            elapsed < REPROBE_DELAY * 2,
+            "judge must overlap the services' gaps, took {elapsed:?}"
         );
     }
 
