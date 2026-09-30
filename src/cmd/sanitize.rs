@@ -13,7 +13,7 @@
 
 use std::time::Duration;
 
-use crate::cmd::doctor::origin_alive;
+use crate::cmd::doctor::origin_alive_async;
 use crate::error::Result;
 use crate::model::{Registry, Service, ServiceKind};
 use crate::output;
@@ -162,14 +162,14 @@ fn apply<'a>(reg: &mut Registry, candidates: &'a [Judgment]) -> Vec<(Service, &'
     removed
 }
 
-/// [`origin_alive`] once, and only if that failed again after
+/// [`origin_alive_async`] once, and only if that failed again after
 /// [`REPROBE_DELAY`] — a restarting dev server drops the port briefly.
 async fn origin_dead_after_double_probe(port: u16) -> bool {
-    if origin_alive(port) {
+    if origin_alive_async(port).await {
         return false;
     }
     tokio::time::sleep(REPROBE_DELAY).await;
-    !origin_alive(port)
+    !origin_alive_async(port).await
 }
 
 /// Remove every dangling service (stale + zombie-upstream); see the module
@@ -188,18 +188,31 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
 
-    let mut candidates = Vec::new();
-    let mut skipped_foreground = Vec::new();
+    // Worker liveness is a fast /proc read; the double-probe is the slow
+    // part, so the probes are spawned per service and awaited together — N
+    // dead origins pay ONE REPROBE_DELAY gap, not N of them. The gap itself
+    // is deliberate (a restarting dev server drops its port briefly): it is
+    // overlapped, never shortened.
+    let mut liveness = Vec::with_capacity(snapshot.services.len());
+    let mut probes = Vec::with_capacity(snapshot.services.len());
     for svc in &snapshot.services {
         let alive = worker_alive(svc);
         // Probe the origin only when Running: a Starting worker's port may
         // not be bound yet; a dead worker already explains a dead port.
-        let port_dead = if let Some(true) = alive
-            && svc.public_url.is_some()
-        {
-            Some(origin_dead_after_double_probe(svc.port).await)
-        } else {
-            None
+        let probe = (alive == Some(true) && svc.public_url.is_some())
+            .then(|| tokio::spawn(origin_dead_after_double_probe(svc.port)));
+        liveness.push(alive);
+        probes.push(probe);
+    }
+
+    let mut candidates = Vec::new();
+    let mut skipped_foreground = Vec::new();
+    for ((svc, alive), probe) in snapshot.services.iter().zip(liveness).zip(probes) {
+        // A probe task fails only by panicking; reading that as not-dead
+        // keeps a failed probe from ever removing an entry.
+        let port_dead = match probe {
+            Some(handle) => Some(handle.await.unwrap_or(false)),
+            None => None,
         };
         let action = plan(svc, alive, port_dead);
         match action {
@@ -448,6 +461,43 @@ mod tests {
         assert_eq!(
             stale_reason(&reserved),
             "worker pid was never recorded — the start reservation was abandoned"
+        );
+    }
+
+    // --- the double-probe (origin_dead_after_double_probe) ---------------------
+
+    /// Bind an ephemeral loopback listener, then drop it: a port that refuses
+    /// connections at once (the accepted-risk dead-port pattern).
+    fn dead_loopback_port() -> u16 {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("bind loopback listener");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+        port
+    }
+
+    #[tokio::test]
+    async fn double_probes_overlap_their_reprobe_delay() {
+        // Two dead ports judged concurrently must pay ONE 750 ms gap, not two
+        // (the serial loop this replaces cost one gap per service), and never
+        // LESS than the gap — it is the deliberate mid-restart tolerance.
+        // Loopback refuses instantly, so the bounds leave the window pure
+        // REPROBE_DELAY plus scheduler noise.
+        let port = dead_loopback_port();
+        let start = std::time::Instant::now();
+        let (first, second) = tokio::join!(
+            origin_dead_after_double_probe(port),
+            origin_dead_after_double_probe(port)
+        );
+        let elapsed = start.elapsed();
+        assert!(first && second, "a dead port must read dead on both probes");
+        assert!(
+            elapsed >= REPROBE_DELAY,
+            "the reprobe gap is deliberate and must not be shortened: {elapsed:?}"
+        );
+        assert!(
+            elapsed < REPROBE_DELAY * 2,
+            "concurrent double-probes must overlap their gaps, took {elapsed:?}"
         );
     }
 

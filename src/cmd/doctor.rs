@@ -7,9 +7,11 @@
 //! (no cmdline needle exists for an operator command — identity is
 //! best-effort, so the wording never attributes the pid or port outright).
 //! Strictly diagnostic: `Registry::load` only (creates nothing), no signals,
-//! no spawns; remediation is a printed `hint:`, never executed; exits 0
-//! unless the state dir is unresolvable. [`origin_alive`] is shared with
-//! `cmd/sanitize.rs` and `cmd/proxy.rs`.
+//! no child processes; remediation is a printed `hint:`, never executed;
+//! exits 0 unless the state dir is unresolvable. [`origin_alive`] (blocking,
+//! `cmd/proxy.rs`'s pre-flight) and its async twin [`origin_alive_async`]
+//! (the concurrent probe paths here and in `cmd/sanitize.rs`) are the one
+//! shared port probe.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -80,17 +82,24 @@ pub async fn run() -> Result<()> {
     // falls back to empty); an unloadable one IS the finding.
     match Registry::load(&state) {
         Ok(reg) => {
-            for svc in &reg.services {
-                let status = svc.status();
-                // Probe the origin only when the worker is alive: a dead
-                // worker already explains any dead port.
-                let worker_alive = match status {
-                    ServiceStatus::Running => true,
-                    ServiceStatus::Starting => svc.worker_pid != 0,
-                    ServiceStatus::Stale => false,
+            // The per-service probes are network-bound (a PROBE_TIMEOUT window
+            // each); spawned and awaited together so N services pay one window,
+            // not N serialized ones. The checks are built afterwards, in
+            // registry order, so the printed report is unchanged.
+            let probes: Vec<_> = reg
+                .services
+                .iter()
+                .cloned()
+                .map(|svc| tokio::spawn(probe_service(svc)))
+                .collect();
+            for (svc, probe) in reg.services.iter().zip(probes) {
+                let (status, origin, command) = match probe.await {
+                    Ok(triple) => triple,
+                    // Only a panicking probe task lands here; doctor stays
+                    // read-only and exits 0, so degrade to the probe-skipped
+                    // report instead of failing the command.
+                    Err(_) => (svc.status(), None, None),
                 };
-                let origin = worker_alive.then(|| origin_alive(svc.port));
-                let command = command_probe(svc);
                 checks.extend(service_checks(svc, status, origin, command));
             }
         }
@@ -108,6 +117,25 @@ pub async fn run() -> Result<()> {
 
     output::print_doctor(&checks);
     Ok(())
+}
+
+/// The per-service probes, run concurrently by [`run`]: the origin check
+/// (only when the worker is alive — a dead worker already explains any dead
+/// port) plus the Run command-child probe. Status rides along: it is a fast
+/// /proc read and spares the caller a second pass.
+async fn probe_service(svc: Service) -> (ServiceStatus, Option<bool>, Option<CommandProbe>) {
+    let status = svc.status();
+    let worker_alive = match status {
+        ServiceStatus::Running => true,
+        ServiceStatus::Starting => svc.worker_pid != 0,
+        ServiceStatus::Stale => false,
+    };
+    let origin = if worker_alive {
+        Some(origin_alive_async(svc.port).await)
+    } else {
+        None
+    };
+    (status, origin, command_probe(&svc).await)
 }
 
 /// `cloudflared` presence. Raw PATH probe via `toride_runner::discovery` —
@@ -136,10 +164,23 @@ fn cloudflared_check() -> Check {
 }
 
 /// True when something accepts connections on `127.0.0.1:port` — shared
-/// `pub(crate)` so one probe copy exists; blocking connect is fine here.
+/// `pub(crate)` so one probe copy exists. Blocking is fine for its remaining
+/// caller: `cmd/proxy.rs` makes a single pre-flight probe.
 pub(crate) fn origin_alive(port: u16) -> bool {
     let addr = SocketAddr::new(IpAddr::from(Ipv4Addr::LOCALHOST), port);
     std::net::TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok()
+}
+
+/// Async twin of [`origin_alive`] for the concurrent probe paths — doctor's
+/// per-service loop and sanitize's double-probe issue many connects inside
+/// the runtime, where blocking ones would stall its workers; same
+/// `PROBE_TIMEOUT` bound, loopback-only by build.
+pub(crate) async fn origin_alive_async(port: u16) -> bool {
+    let addr = SocketAddr::new(IpAddr::from(Ipv4Addr::LOCALHOST), port);
+    matches!(
+        tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(addr)).await,
+        Ok(Ok(_))
+    )
 }
 
 /// Liveness probes for a `Run` service's recorded command child, fed into
@@ -158,15 +199,16 @@ struct CommandProbe {
 
 /// Probe a `Run` service's recorded command child, if any. Pid 0 is refused
 /// like unrecorded: probing it reads the CALLER's own group as "alive".
-fn command_probe(svc: &Service) -> Option<CommandProbe> {
+async fn command_probe(svc: &Service) -> Option<CommandProbe> {
     if svc.kind != ServiceKind::Run {
         return None;
     }
     let pid = svc.command_pid.filter(|p| *p != 0)?;
+    let port_alive = origin_alive_async(svc.port).await;
     Some(CommandProbe {
         pid,
         alive: proc::process_exists(pid),
-        port_alive: origin_alive(svc.port),
+        port_alive,
     })
 }
 
@@ -461,6 +503,30 @@ mod tests {
             !origin_alive(port),
             "a closed port must read as dead (the 502 finding's trigger)"
         );
+    }
+
+    #[tokio::test]
+    async fn origin_alive_async_accepts_a_live_listener() {
+        // Parity with the blocking twin the concurrent paths replaced.
+        let listener =
+            std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback listener");
+        let port = listener.local_addr().expect("local addr").port();
+        assert!(
+            origin_alive_async(port).await,
+            "a live listener reads alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn origin_alive_async_rejects_a_dead_port() {
+        let port = {
+            let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .expect("bind loopback listener");
+            let p = listener.local_addr().expect("local addr").port();
+            drop(listener);
+            p
+        };
+        assert!(!origin_alive_async(port).await, "a closed port reads dead");
     }
 
     #[test]
@@ -896,32 +962,32 @@ mod tests {
 
     // --- command_probe: the Run-only probe policy -----------------------------
 
-    #[test]
-    fn command_probe_skips_non_run_kinds_unrecorded_and_zero_pids() {
+    #[tokio::test]
+    async fn command_probe_skips_non_run_kinds_unrecorded_and_zero_pids() {
         // A command_pid on a Proxy is hand-edited nonsense; pid 0 would probe
         // the CALLER's own group. All arms return before any syscall.
         let mut proxy = service(ServiceKind::Proxy);
         proxy.command_pid = Some(4242);
         assert!(
-            command_probe(&proxy).is_none(),
+            command_probe(&proxy).await.is_none(),
             "a proxy has no command child to probe"
         );
         let mut unrecorded = service(ServiceKind::Run);
         unrecorded.command_pid = None;
         assert!(
-            command_probe(&unrecorded).is_none(),
+            command_probe(&unrecorded).await.is_none(),
             "no recorded pid, nothing to probe"
         );
         let mut zero = service(ServiceKind::Run);
         zero.command_pid = Some(0);
         assert!(
-            command_probe(&zero).is_none(),
+            command_probe(&zero).await.is_none(),
             "pid 0 must be refused, not probed against the caller's group"
         );
     }
 
-    #[test]
-    fn command_probe_reads_real_liveness_and_port_state() {
+    #[tokio::test]
+    async fn command_probe_reads_real_liveness_and_port_state() {
         // Real probes with controlled answers: the test's own pid + a bound
         // listener; port_alive is probed even for a dead pid.
         let listener =
@@ -931,7 +997,9 @@ mod tests {
         svc.port = port;
         svc.local_url = format!("http://127.0.0.1:{port}");
         svc.command_pid = Some(std::process::id());
-        let probe = command_probe(&svc).expect("a recorded run pid must probe");
+        let probe = command_probe(&svc)
+            .await
+            .expect("a recorded run pid must probe");
         assert!(probe.alive, "the test's own pid must read alive");
         assert!(
             probe.port_alive,
@@ -940,7 +1008,9 @@ mod tests {
         assert_eq!(probe.pid, std::process::id());
 
         svc.command_pid = Some(4_000_000);
-        let probe = command_probe(&svc).expect("a recorded run pid must probe");
+        let probe = command_probe(&svc)
+            .await
+            .expect("a recorded run pid must probe");
         assert!(!probe.alive, "4_000_000 is outside any real pid namespace");
         assert!(
             probe.port_alive,
