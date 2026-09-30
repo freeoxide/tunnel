@@ -120,8 +120,9 @@ async fn serve_or_list(State(root): State<PathBuf>, request: Request, next: Next
 }
 
 /// Blocking half of [`serve_or_list`]: render the listing, or `None` to fall
-/// through to `ServeDir`.
-fn render_listing(candidate: &Path, root: &Path) -> Option<String> {
+/// through to `ServeDir`. `pub(crate)` so the benches can drive it directly —
+/// same-crate visibility only, no behavior change.
+pub(crate) fn render_listing(candidate: &Path, root: &Path) -> Option<String> {
     // Canonicalize fails on missing paths — those belong to ServeDir's 404.
     let resolved = std::fs::canonicalize(candidate).ok()?;
     if !resolved.starts_with(root) || !resolved.is_dir() {

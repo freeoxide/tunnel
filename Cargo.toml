@@ -19,6 +19,49 @@ categories = ["command-line-utilities", "development-tools"]
 name = "ft"
 path = "src/main.rs"
 
+# Criterion-driven benches (benches/*.rs). `harness = false` hands main to
+# criterion's own runner; the bench ids the perf campaign parses (e.g.
+# `listing/render_1000_plain`) are contractual, so keep them stable.
+[[bench]]
+name = "listing"
+harness = false
+
+[[bench]]
+name = "drop_listing"
+harness = false
+
+[[bench]]
+name = "guard"
+harness = false
+
+[[bench]]
+name = "hook_store"
+harness = false
+
+[[bench]]
+name = "registry_cycle"
+harness = false
+
+# Codegen stability for benchmarking: with default codegen-units the
+# partitioner can split a hot loop differently between two builds of the SAME
+# code, letting codegen variance masquerade as an algorithmic change. Thin LTO
+# + one codegen unit removes that axis. Inherits the rest of `release`.
+[profile.bench]
+lto = "thin"
+codegen-units = 1
+
+# Release carries the same codegen pins so `cargo build --release` (the
+# shipped binary, and the CLI wall-clock harness) measures the same code shape
+# the benches do; `strip = "symbols"` trims the binary (hygiene finding
+# hyg-2). Deliberately NO `panic` setting — the foreground flows rely on
+# unwinding to run EntryGuard's Drop cleanup (cmd/start.rs) — and no
+# target-cpu pinning anywhere: baseline machines must not inherit the build
+# host's ISA.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
 # cargo-binstall asset layout. The resulting archives are
 # `freeoxide-tunnel-<target>.tgz` on Unix and `freeoxide-tunnel-<target>.zip` on
 # Windows, each holding `ft` (or `ft.exe`) at the archive root.
@@ -109,3 +152,8 @@ tower = { version = "0.5", features = ["util"] }
 # Read response bodies in tests.
 http-body-util = "0.1"
 http = "1"
+# Microbenchmark harness for the perf campaign's benches/. Pinned EXACTLY:
+# the campaign's saved baselines must not silently compare across criterion
+# versions. (0.8.2's `html_reports` feature gates no extra dependencies, so
+# it resolves from the offline cache.)
+criterion = { version = "=0.8.2", features = ["html_reports"] }

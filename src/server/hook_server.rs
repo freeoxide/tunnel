@@ -236,7 +236,9 @@ impl HookLog {
 
     /// Insert + persist: atomic tmp+rename with private perms (the store
     /// carries request paths and bodies — the logs' 0600 class).
-    fn record(&mut self, req: RecordedRequest) -> std::io::Result<()> {
+    /// `pub(crate)` so the benches can drive the record->persist path
+    /// directly; same-crate visibility only, no behavior change.
+    pub(crate) fn record(&mut self, req: RecordedRequest) -> std::io::Result<()> {
         self.requests.insert(0, req);
         self.requests.truncate(self.keep);
         self.persist()

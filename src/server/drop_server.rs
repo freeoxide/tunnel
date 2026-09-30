@@ -620,7 +620,9 @@ async fn listing(store: Arc<DropStore>, is_head: bool) -> Response {
 }
 
 /// Blocking half of [`listing`]; hides what the GET side would refuse.
-fn render_listing(store: &DropStore) -> String {
+/// `pub(crate)` so the benches can drive it directly — same-crate visibility
+/// only, no behavior change.
+pub(crate) fn render_listing(store: &DropStore) -> String {
     let mut entries: Vec<(String, bool, u64)> = Vec::new(); // (name, is_dir, size)
     if let Ok(read) = std::fs::read_dir(&store.root) {
         for entry in read.flatten() {
