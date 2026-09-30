@@ -106,17 +106,21 @@ async fn serve_or_list(State(root): State<PathBuf>, request: Request, next: Next
         Err(_) => return next.run(request).await,
     };
     let candidate = candidate_path(&root, &decoded);
-    let confined = request.extensions().get::<Confined>().cloned();
+    // A plain file confine already verified is ServeDir's to serve — the
+    // whole second resolution is the waste this guard exists to skip. A
+    // directory still re-resolves (see [`Confined`]).
+    let plain_file = request
+        .extensions()
+        .get::<Confined>()
+        .is_some_and(|c| !c.is_dir);
 
-    let listing = tokio::task::spawn_blocking(move || match &confined {
-        // A plain file is ServeDir's to serve — no read_dir needed.
-        Some(c) if !c.is_dir => None,
-        Some(c) => render_listing_resolved(&c.resolved, &candidate, &root),
-        // No stash (confine absent, or its task died): resolve here.
-        None => render_listing(&candidate, &root),
-    })
-    .await
-    .unwrap_or(None);
+    let listing = if plain_file {
+        None
+    } else {
+        tokio::task::spawn_blocking(move || render_listing(&candidate, &root))
+            .await
+            .unwrap_or(None)
+    };
     match listing {
         Some(html) => {
             let len = html.len();
@@ -143,17 +147,10 @@ pub(crate) fn render_listing(candidate: &Path, root: &Path) -> Option<String> {
     if !resolved.starts_with(root) || !resolved.is_dir() {
         return None;
     }
-    render_listing_resolved(&resolved, candidate, root)
-}
-
-/// [`render_listing`] over a target [`confine`] already canonicalized and
-/// confined for this request (see [`Confined`]); still defers to `ServeDir`
-/// when an index file exists.
-fn render_listing_resolved(resolved: &Path, candidate: &Path, root: &Path) -> Option<String> {
     if resolved.join("index.html").exists() {
         return None;
     }
-    let entries = visible_entries(resolved, root)?;
+    let entries = visible_entries(&resolved, root)?;
     Some(listing_html(&entries, candidate, root))
 }
 
@@ -387,40 +384,38 @@ pub(crate) async fn confine(
     let confined = tokio::task::spawn_blocking(move || confine_blocking(&candidate, &root))
         .await
         .unwrap_or(None);
-    let Some(confined) = confined else {
+    let Some(is_dir) = confined else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    // Hand the verified target to serve_or_list, which would otherwise
-    // re-resolve this exact path a second spawn_blocking later.
-    request.extensions_mut().insert(confined);
+    // Only the KIND is handed on (see [`Confined`]).
+    request.extensions_mut().insert(Confined { is_dir });
     next.run(request).await
 }
 
 /// Blocking half of [`confine`] — also confines a directory's `index.html`
-/// (it may itself be an escaping symlink). `None` refuses.
-fn confine_blocking(candidate: &Path, root: &Path) -> Option<Confined> {
+/// (it may itself be an escaping symlink). `None` refuses; `Some(is_dir)` is
+/// the confined target's kind.
+fn confine_blocking(candidate: &Path, root: &Path) -> Option<bool> {
     let resolved = std::fs::canonicalize(candidate).ok()?;
     if !resolved.starts_with(root) {
         return None;
     }
-    let confined = Confined {
-        is_dir: resolved.is_dir(),
-        resolved,
-    };
-    if confined.is_dir && escapes_root(&confined.resolved.join("index.html"), root) {
+    let is_dir = resolved.is_dir();
+    if is_dir && escapes_root(&resolved.join("index.html"), root) {
         return None;
     }
-    Some(confined)
+    Some(is_dir)
 }
 
-/// What [`confine`] verified for this one request: the canonicalised,
-/// still-confined target and its kind. [`serve_or_list`] consumes it instead
-/// of re-resolving the identical path. Single-request handoff only — a
-/// verdict memoized across requests would widen the documented TOCTOU window
-/// into a persistent bypass.
+/// The one fact [`serve_or_list`] may take from [`confine`]: that the
+/// verified target was a plain file (its whole second resolution is then
+/// skippable). The resolved path itself is deliberately NOT handed on — a
+/// listing read_dir'ing confine's snapshot would list outside-root names for
+/// a directory swapped to an escaping symlink inside the window, where
+/// re-resolving refuses; the listing re-resolves instead. Single-request
+/// handoff only.
 #[derive(Clone)]
 struct Confined {
-    resolved: PathBuf,
     is_dir: bool,
 }
 
@@ -627,20 +622,17 @@ mod confinement_tests {
     }
 
     #[test]
-    fn confine_blocking_stashes_the_resolved_target_and_kind() {
+    fn confine_blocking_reports_the_target_kind() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(dir.path().join("d")).expect("mkdir");
         std::fs::write(dir.path().join("d").join("f.txt"), "x").expect("write");
         let root = std::fs::canonicalize(dir.path()).expect("canonicalize");
 
-        let d = super::confine_blocking(&root.join("d"), &root).expect("dir confined");
-        assert_eq!(d.resolved, root.join("d"));
-        assert!(d.is_dir);
-
-        let f = super::confine_blocking(&root.join("d").join("f.txt"), &root)
-            .expect("plain file confined");
-        assert_eq!(f.resolved, root.join("d").join("f.txt"));
-        assert!(!f.is_dir);
+        assert_eq!(super::confine_blocking(&root.join("d"), &root), Some(true));
+        assert_eq!(
+            super::confine_blocking(&root.join("d").join("f.txt"), &root),
+            Some(false)
+        );
 
         assert!(super::confine_blocking(&root.join("missing"), &root).is_none());
         assert!(super::confine_blocking(Path::new("/etc"), &root).is_none());
@@ -1292,6 +1284,60 @@ mod listing_tests {
         assert!(
             !html.contains("dangling"),
             "a broken symlink must not be listed: {html}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn render_listing_refuses_a_directory_swapped_to_an_escaping_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        std::fs::create_dir(dir.path().join("sub")).expect("mkdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonicalize");
+        // The in-flight swap: a confined directory becomes an escape.
+        std::fs::remove_dir(root.join("sub")).expect("remove dir");
+        symlink(outside.path(), root.join("sub")).expect("symlink");
+        assert_eq!(render_listing(&root.join("sub"), &root), None);
+    }
+
+    /// Pin for the confine→listing handoff: only the KIND may be handed on.
+    /// A `Confined` stashed before an in-flight swap must never let the
+    /// listing read a snapshot path — a directory turned escaping symlink
+    /// between the two guards refuses, exactly like the re-resolve always
+    /// did.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stale_confined_kind_never_lists_a_swapped_directory() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        std::fs::write(outside.path().join("leak.txt"), "OUT").expect("write");
+        std::fs::create_dir(dir.path().join("sub")).expect("mkdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonicalize");
+        std::fs::remove_dir(root.join("sub")).expect("remove dir");
+        symlink(outside.path(), root.join("sub")).expect("symlink");
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/sub/")
+            .extension(super::Confined { is_dir: true })
+            .body(Body::empty())
+            .expect("build request");
+        let app = Router::new()
+            .fallback_service(ServeDir::new(root.clone()))
+            .layer(from_fn_with_state(root, serve_or_list));
+        let resp = app.oneshot(request).await.expect("oneshot");
+        let status = resp.status();
+        let body = body_of(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "the swap must not be answered with a listing"
+        );
+        assert!(
+            !body.contains("leak.txt"),
+            "no outside-root names may be listed: {body}"
         );
     }
 }
