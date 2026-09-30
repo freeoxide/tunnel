@@ -10,8 +10,9 @@
 //! no child processes; remediation is a printed `hint:`, never executed;
 //! exits 0 unless the state dir is unresolvable. [`origin_alive`] (blocking,
 //! `cmd/proxy.rs`'s pre-flight) and its async twin [`origin_alive_async`]
-//! (the concurrent probe paths here and in `cmd/sanitize.rs`) are the one
-//! shared port probe.
+//! (the concurrent probe paths here and in `cmd/sanitize.rs`) are this
+//! module's shared probes; `cmd/run.rs` keeps a private byte-identical async
+//! twin (`origin_ready`) — unifying the copies is a run.rs edit.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -97,7 +98,11 @@ pub async fn run() -> Result<()> {
                     Ok(triple) => triple,
                     // Only a panicking probe task lands here; doctor stays
                     // read-only and exits 0, so degrade to the probe-skipped
-                    // report instead of failing the command.
+                    // report instead of failing the command. Origin and
+                    // command drop TOGETHER: the Run dead-origin wording
+                    // reads a lone `None` command as "no pid recorded", so
+                    // ever re-probing just one of the two here would misword
+                    // a service whose pid IS recorded.
                     Err(_) => (svc.status(), None, None),
                 };
                 checks.extend(service_checks(svc, status, origin, command));
