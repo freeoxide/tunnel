@@ -216,9 +216,12 @@ impl HookLog {
     /// Load the store at `path`, or start empty when it does not exist. A
     /// corrupt (or past-the-ceiling) store degrades to empty: corruption
     /// implies disk trouble, and bricking the service is worse than
-    /// restarting the log — webhook senders re-deliver. Any OTHER read
-    /// error fails the load: the store may be intact behind it, and an
-    /// empty fallback would let the next append's rename destroy it.
+    /// restarting the log — webhook senders re-deliver. The exception is a
+    /// TORN append window ([`repair_torn_window`]): the in-place protocol
+    /// can only damage an edge, so the intact records are recovered instead
+    /// of wiped. Any OTHER read error fails the load: the store may be
+    /// intact behind it, and an empty fallback would let the next append's
+    /// rename destroy it.
     /// The loaded store is re-truncated to `keep` — a lowered keep never
     /// wipes the log.
     pub fn load(path: PathBuf, keep: usize) -> std::io::Result<Self> {
@@ -257,10 +260,21 @@ impl HookLog {
                                 window = Window::scan(&bytes, &parsed, keep);
                                 parsed
                             }
-                            Err(e) => {
-                                tracing::warn!(%e, path = %path.display(), "hook request store is corrupt; starting a new one");
-                                Vec::new()
-                            }
+                            Err(e) => match repair_torn_window(&bytes) {
+                                Some(recovered) => {
+                                    tracing::warn!(
+                                        %e,
+                                        path = %path.display(),
+                                        recovered = recovered.len(),
+                                        "hook request store is torn; recovering the intact records"
+                                    );
+                                    recovered
+                                }
+                                None => {
+                                    tracing::warn!(%e, path = %path.display(), "hook request store is corrupt; starting a new one");
+                                    Vec::new()
+                                }
+                            },
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -325,21 +339,32 @@ impl HookLog {
         }
         let evict = self.requests.len() > self.keep;
         let mut window = self.window.take().expect("fits implies a window");
-        let result = (|| {
-            let mut file = OpenOptions::new().write(true).open(&self.path)?;
-            append_at(&mut file, &mut window, &bytes)?;
-            if evict {
-                let oldest = self.requests.pop_back().expect("evict implies an oldest");
-                let oldest_bytes = serde_json::to_vec(&oldest).map_err(ser_io)?;
-                evict_at(
-                    &mut file,
-                    &mut window,
-                    &oldest_bytes,
-                    !self.requests.is_empty(),
-                )?;
+        let result = match OpenOptions::new().write(true).open(&self.path) {
+            Ok(mut file) => (|| {
+                append_at(&mut file, &mut window, &bytes)?;
+                if evict {
+                    let oldest = self.requests.pop_back().expect("evict implies an oldest");
+                    let oldest_bytes = serde_json::to_vec(&oldest).map_err(ser_io)?;
+                    evict_at(
+                        &mut file,
+                        &mut window,
+                        &oldest_bytes,
+                        !self.requests.is_empty(),
+                    )?;
+                }
+                Ok(())
+            })(),
+            // The store vanished under a live window (external deletion):
+            // recreate it in THIS delivery, like the old whole-file persist
+            // did — the retry contract is for real disk trouble, not this.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                while self.requests.len() > self.keep {
+                    self.requests.pop_back();
+                }
+                return self.reserve();
             }
-            Ok(())
-        })();
+            Err(e) => Err(e),
+        };
         match result {
             Ok(()) => self.window = Some(window),
             // In-place edits may have torn the framing mid-write; force a
@@ -461,6 +486,121 @@ impl Window {
 /// reports `io::Result` — fold the message in.
 fn ser_io(e: serde_json::Error) -> std::io::Error {
     std::io::Error::other(format!("serializing a recorded request: {e}"))
+}
+
+/// Recover the intact records from a torn append window. The in-place
+/// protocol can only damage an EDGE of the array — a partial new record at
+/// the right (append torn mid-write) or the remnant of a half-whitened
+/// oldest at the left (evict torn mid-write) — so recovery keeps every
+/// complete, well-formed record and drops leading junk plus an incomplete
+/// trailing value. Damage between two good records (or complete-but-invalid
+/// trailing bytes) is foreign corruption: None, and the caller wipes as
+/// before. Without this, a crash between a torn write and the next
+/// successful record cost the WHOLE retained history — a loss path the old
+/// atomic tmp+rename persist excluded.
+fn repair_torn_window(bytes: &[u8]) -> Option<Vec<RecordedRequest>> {
+    if bytes.first() != Some(&b'[') || bytes.last() != Some(&b']') {
+        return None;
+    }
+    let interior = &bytes[1..bytes.len() - 1];
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut i = 0;
+    while i < interior.len() {
+        while i < interior.len() && interior[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= interior.len() {
+            break;
+        }
+        if interior[i] == b',' {
+            // A separator at value position is edge damage too (a torn
+            // evict that whitened the record but not its comma, or a torn
+            // append that wrote only the comma).
+            i += 1;
+            continue;
+        }
+        match scan_value(interior, i) {
+            Some(end) => {
+                ranges.push(i..end);
+                i = end;
+            }
+            // An incomplete value is the torn new record; it simply yields
+            // no range.
+            None => break,
+        }
+    }
+    let mut records = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        match serde_json::from_slice::<RecordedRequest>(&interior[range]) {
+            Ok(record) => records.push(record),
+            // A torn evict leaves the remnant of ONE half-whitened record
+            // at the head; anything invalid AFTER a good record is foreign
+            // corruption, not a tear.
+            Err(_) if records.is_empty() => continue,
+            Err(_) => return None,
+        }
+    }
+    Some(records)
+}
+
+/// Scan one comma-separated JSON value starting at `start` (a non-ws,
+/// non-comma byte); the exclusive end offset, or None when the value does
+/// not complete before the buffer ends (a torn write). Mismatched garbage
+/// brackets can "complete" early — harmless: the range then fails
+/// deserialization and is treated as damage.
+fn scan_value(bytes: &[u8], start: usize) -> Option<usize> {
+    let end = bytes.len();
+    match bytes[start] {
+        b'"' => {
+            let mut i = start + 1;
+            while i < end {
+                match bytes[i] {
+                    b'\\' => i += 2,
+                    b'"' => return Some(i + 1),
+                    _ => i += 1,
+                }
+            }
+            None
+        }
+        b'{' | b'[' => {
+            let mut depth = 0usize;
+            let mut in_string = false;
+            let mut i = start;
+            while i < end {
+                let b = bytes[i];
+                if in_string {
+                    if b == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b == b'"' {
+                        in_string = false;
+                    }
+                } else {
+                    match b {
+                        b'"' => in_string = true,
+                        b'{' | b'[' => depth += 1,
+                        b'}' | b']' => {
+                            depth = depth.checked_sub(1)?;
+                            if depth == 0 {
+                                return Some(i + 1);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                i += 1;
+            }
+            None
+        }
+        _ => {
+            let mut i = start;
+            while i < end && !(bytes[i] == b',' || bytes[i].is_ascii_whitespace()) {
+                i += 1;
+            }
+            Some(i)
+        }
+    }
 }
 
 /// Positional write: seek+write_all stands in for pwrite (portable), and no
@@ -1157,6 +1297,121 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&path).expect("read the store"))
                 .expect("the store file stays a JSON array");
         assert_eq!(on_disk.len(), 3);
+    }
+
+    /// A crash mid-append leaves a partial record at the right edge: the
+    /// intact records must come back instead of the whole store wiping.
+    #[test]
+    fn a_torn_append_keeps_the_intact_records_on_reload() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("requests.json");
+        let rec1 = RecordedRequest::capture(1, recv_stamp(), &parts("POST", "/one", &[]), b"one");
+        let rec2 = RecordedRequest::capture(2, recv_stamp(), &parts("POST", "/two", &[]), b"two");
+        let mut torn = Vec::new();
+        torn.push(b'[');
+        torn.extend(serde_json::to_vec(&rec1).expect("serialize"));
+        torn.push(b',');
+        torn.extend(serde_json::to_vec(&rec2).expect("serialize"));
+        torn.push(b',');
+        torn.extend(br#"{"seq":3,"path":"/thre"#); // the torn new record
+        torn.extend_from_slice(b"      ");
+        torn.push(b']');
+        std::fs::write(&path, &torn).expect("plant torn store");
+
+        let mut log = HookLog::load(path.clone(), 5).expect("reload");
+        let snap = log.snapshot();
+        assert_eq!(snap.len(), 2, "the intact records survive the torn edge");
+        assert_eq!(snap[0].path, "/two", "newest first as always");
+        // The recovered store keeps recording; the next record rewrites it
+        // into the canonical framing.
+        let head = parts("POST", "/after", &[]);
+        log.record(RecordedRequest::capture(3, recv_stamp(), &head, b"x"))
+            .expect("record");
+        let mut reloaded = HookLog::load(path, 5).expect("reload after recovery");
+        let paths: Vec<String> = reloaded.snapshot().into_iter().map(|r| r.path).collect();
+        assert_eq!(paths, vec!["/after", "/two", "/one"]);
+    }
+
+    /// A crash mid-evict leaves the remnant of the half-whitened oldest at
+    /// the left edge — or just its separator comma, when the whitening
+    /// consumed the record bytes but not the comma: the records behind it
+    /// must come back.
+    #[test]
+    fn a_torn_evict_keeps_the_records_behind_it_on_reload() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("requests.json");
+        let rec1 = RecordedRequest::capture(1, recv_stamp(), &parts("POST", "/old", &[]), b"");
+        let rec2 = RecordedRequest::capture(2, recv_stamp(), &parts("POST", "/new", &[]), b"");
+        let ser1 = serde_json::to_vec(&rec1).expect("serialize");
+        let mut torn = Vec::new();
+        torn.push(b'[');
+        torn.extend_from_slice(b"   ");
+        torn.extend_from_slice(&ser1[ser1.len() / 2..]);
+        torn.push(b',');
+        torn.extend(serde_json::to_vec(&rec2).expect("serialize"));
+        torn.extend_from_slice(b"    ");
+        torn.push(b']');
+        std::fs::write(&path, &torn).expect("plant torn store");
+
+        let mut log = HookLog::load(path.clone(), 5).expect("reload");
+        let snap = log.snapshot();
+        assert_eq!(snap.len(), 1, "the records behind the torn edge survive");
+        assert_eq!(snap[0].path, "/new");
+
+        let mut torn = Vec::new();
+        torn.push(b'[');
+        torn.extend_from_slice(b" , ");
+        torn.extend(serde_json::to_vec(&rec2).expect("serialize"));
+        torn.extend_from_slice(b"  ");
+        torn.push(b']');
+        std::fs::write(&path, &torn).expect("plant separator-only torn store");
+        let mut log = HookLog::load(path, 5).expect("reload");
+        assert_eq!(log.snapshot().len(), 1);
+        assert_eq!(log.snapshot()[0].path, "/new");
+    }
+
+    /// Damage BETWEEN two good records is not a tear shape: foreign
+    /// corruption keeps the wipe semantics.
+    #[test]
+    fn foreign_damage_between_good_records_still_wipes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("requests.json");
+        let rec1 = RecordedRequest::capture(1, recv_stamp(), &parts("POST", "/one", &[]), b"");
+        let rec2 = RecordedRequest::capture(2, recv_stamp(), &parts("POST", "/two", &[]), b"");
+        let mut damaged = Vec::new();
+        damaged.push(b'[');
+        damaged.extend(serde_json::to_vec(&rec1).expect("serialize"));
+        damaged.push(b',');
+        damaged.extend_from_slice(b"42");
+        damaged.push(b',');
+        damaged.extend(serde_json::to_vec(&rec2).expect("serialize"));
+        damaged.push(b']');
+        std::fs::write(&path, &damaged).expect("plant damaged store");
+
+        let log = HookLog::load(path, 5).expect("reload");
+        assert_eq!(log.len(), 0, "interior damage must wipe, not half-recover");
+    }
+
+    /// External deletion mid-run: the old whole-file persist recreated the
+    /// store in the same delivery; the append window must too, not 500
+    /// once and wait for the sender's retry.
+    #[test]
+    fn record_recreates_an_externally_deleted_store_in_the_same_delivery() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("requests.json");
+        let mut log = HookLog::load(path.clone(), 5).expect("load");
+        let head = parts("POST", "/first", &[]);
+        log.record(RecordedRequest::capture(1, recv_stamp(), &head, b"one"))
+            .expect("record");
+        std::fs::remove_file(&path).expect("delete the store under a live window");
+
+        let head = parts("POST", "/second", &[]);
+        log.record(RecordedRequest::capture(2, recv_stamp(), &head, b"two"))
+            .expect("record must recreate the store, not 500 once");
+        assert!(path.exists(), "the store is back in THIS delivery");
+        let mut reloaded = HookLog::load(path, 5).expect("reload");
+        let paths: Vec<String> = reloaded.snapshot().into_iter().map(|r| r.path).collect();
+        assert_eq!(paths, vec!["/second", "/first"]);
     }
 
     // --- the full Router, driven like the static server's HTTP tests --------
