@@ -5,14 +5,17 @@
 //! records newest-first; the inspection endpoints themselves are never
 //! recorded. Header capture is an ALLOWLIST so credential-bearing headers
 //! can never reach the store or the public inspection view.
+//!
+//! The store file is a JSON array maintained as an append window so a
+//! record costs O(record), not O(retained bytes) (see [`HookLog::record`]).
 
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::collections::VecDeque;
+use std::fs::{File, OpenOptions};
+use std::io::{Read as _, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use axum::Json;
 use axum::Router;
 use axum::extract::{Request, State};
 use axum::http::request::Parts;
@@ -85,9 +88,12 @@ pub struct RecordedRequest {
 }
 
 impl RecordedRequest {
-    /// Build a record from a request head + body; pure, so the capture rules
-    /// are unit-testable.
-    fn capture(seq: u64, parts: &Parts, body: &[u8]) -> Self {
+    /// Build a record from a request head + body + a caller-stamped receive
+    /// time; pure, so the capture rules are unit-testable. The stamp is the
+    /// CALLER's business so it can be taken before the store's lock wait —
+    /// a queued request must report when it arrived, not when it was
+    /// admitted.
+    fn capture(seq: u64, received_at: DateTime<Utc>, parts: &Parts, body: &[u8]) -> Self {
         let headers = parts
             .headers
             .iter()
@@ -106,7 +112,7 @@ impl RecordedRequest {
         let capped = &body[..body.len().min(MAX_REQUEST_BODY)];
         Self {
             seq,
-            received_at: crate::model::now_utc(),
+            received_at,
             method: parts.method.as_str().to_owned(),
             path: parts.uri.path().to_owned(),
             query: parts.uri.query().map(str::to_owned),
@@ -118,15 +124,40 @@ impl RecordedRequest {
     }
 }
 
-/// Newest-first Vec mirrored to `requests.json` (0600, atomic tmp+rename) on
-/// every append.
+/// Newest-first deque mirrored to `requests.json` (0600): front-push and
+/// back-pop keep both the append and the eviction O(1) in memory.
 #[derive(Debug)]
 pub struct HookLog {
     path: PathBuf,
     keep: usize,
     next_seq: u64,
-    /// Newest-first — by construction on append, by seq-sort on load.
-    requests: Vec<RecordedRequest>,
+    /// Newest-first (front = newest) — by construction on append, by
+    /// seq-sort on load.
+    requests: VecDeque<RecordedRequest>,
+    /// Immutable view snapshot, rebuilt lazily: a record invalidates it and
+    /// the next view pays one O(keep) rebuild that every later view shares,
+    /// so the write path never copies the store for the inspection routes.
+    snapshot: Option<Arc<Vec<RecordedRequest>>>,
+    /// Append-window cursors for the file on disk; `None` whenever the
+    /// framing cannot be trusted (fresh load of foreign bytes, any io
+    /// error), forcing the next record through a full atomic rewrite.
+    window: Option<Window>,
+}
+
+/// Where the live records sit in `requests.json`. The file is
+/// `[` + evicted-whitespace + records oldest-first `,`-separated +
+/// tail-whitespace + `]`: appending the newest record writes only its own
+/// bytes into the tail pad, evicting the oldest whitens only its own bytes
+/// at the head — the retained bytes in between never move, so a record
+/// costs O(record) of fs work instead of a whole-file rewrite.
+#[derive(Debug)]
+struct Window {
+    /// Offset of the first live record (1 + evicted bytes).
+    live_start: u64,
+    /// Offset one past the last live record (start of the tail pad).
+    live_end: u64,
+    /// Total file length; the byte at `file_len - 1` is `]`.
+    file_len: u64,
 }
 
 /// Worst-case JSON expansion of one body byte (control bytes escape to a
@@ -148,25 +179,35 @@ const HYPER_HEAD_BUDGET: usize = 417_792;
 /// legitimate stores on reload and wipe them.
 const STORE_RECORD_OVERHEAD: usize = HYPER_HEAD_BUDGET * 2 + 2 * 1024;
 
+/// Tail-pad floor reserved by a full rewrite. The pad is what makes the
+/// per-record appends possible; half the live bytes (floored here) keeps a
+/// rewrite amortized over proportionally many records at any store shape.
+const MIN_TAIL_PAD: usize = 64 * 1024;
+
 /// Upper bound on a store this server could have written at `keep` records;
-/// saturating, u64 for [`read_store_blob`]'s `File::take`.
+/// saturating, u64 for [`read_store_blob`]'s `File::take`. Live bytes only —
+/// the journal's pad slack is added once, in [`absolute_read_bound`].
 fn store_read_bound(keep: usize) -> u64 {
     let per_record = (MAX_REQUEST_BODY * JSON_ESCAPE_FACTOR + STORE_RECORD_OVERHEAD) as u64;
     (keep as u64).saturating_mul(per_record)
 }
 
 /// [`store_read_bound`] at [`MAX_KEEP`], independent of the loading keep — a
-/// store written at ANY supported keep fits; load() truncates after.
+/// store written at ANY supported keep fits; load() truncates after — plus
+/// the journal's own slack: a file is live bytes + pad (≤ live/2, floored at
+/// [`MIN_TAIL_PAD`]) + the two framing bytes, all of it legitimate.
 fn absolute_read_bound() -> u64 {
-    store_read_bound(MAX_KEEP)
+    let live = store_read_bound(MAX_KEEP);
+    live + live / 2 + MIN_TAIL_PAD as u64 + 2
 }
 
 /// Read at most `bound + 1` bytes (the +1 tells at-the-bound from past-it);
 /// bounding the READ, not just the parse, so no stray huge file is slurped.
-fn read_store_blob(path: &Path, bound: u64) -> std::io::Result<Vec<u8>> {
-    use std::io::Read as _;
-    let file = std::fs::File::open(path)?;
-    let mut bytes = Vec::new();
+/// `len_hint` (the stat that gated the read) reserves the Vec's capacity
+/// up front instead of growing it geometrically.
+fn read_store_blob(path: &Path, bound: u64, len_hint: u64) -> std::io::Result<Vec<u8>> {
+    let file = File::open(path)?;
+    let mut bytes = Vec::with_capacity(len_hint.min(bound.saturating_add(1)) as usize);
     file.take(bound.saturating_add(1)).read_to_end(&mut bytes)?;
     Ok(bytes)
 }
@@ -174,10 +215,10 @@ fn read_store_blob(path: &Path, bound: u64) -> std::io::Result<Vec<u8>> {
 impl HookLog {
     /// Load the store at `path`, or start empty when it does not exist. A
     /// corrupt (or past-the-ceiling) store degrades to empty: corruption
-    /// implies disk trouble (the write is atomic), and bricking the service
-    /// is worse than restarting the log — webhook senders re-deliver. Any
-    /// OTHER read error fails the load: the store may be intact behind it,
-    /// and an empty fallback would let the next append's rename destroy it.
+    /// implies disk trouble, and bricking the service is worse than
+    /// restarting the log — webhook senders re-deliver. Any OTHER read
+    /// error fails the load: the store may be intact behind it, and an
+    /// empty fallback would let the next append's rename destroy it.
     /// The loaded store is re-truncated to `keep` — a lowered keep never
     /// wipes the log.
     pub fn load(path: PathBuf, keep: usize) -> std::io::Result<Self> {
@@ -185,39 +226,53 @@ impl HookLog {
         // retention can't write past the ceiling.
         let keep = keep.min(MAX_KEEP);
         let ceiling = absolute_read_bound();
-        // Past the ceiling by metadata: refuse without reading a giant.
-        let mut requests = if std::fs::metadata(&path).is_ok_and(|m| m.len() > ceiling) {
-            tracing::warn!(
-                path = %path.display(),
-                "hook request store is larger than the absolute read bound; starting a new one"
-            );
-            Vec::new()
-        } else {
-            match read_store_blob(&path, ceiling) {
-                // Grew between stat and read: same corrupt-store recovery.
-                Ok(bytes) if bytes.len() as u64 > ceiling => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        "hook request store is larger than the absolute read bound; starting a new one"
-                    );
-                    Vec::new()
-                }
-                // Fatter than the loading keep allows but under the ceiling:
-                // legitimate (written under a higher keep) — truncate below.
-                Ok(bytes) if !bytes.iter().all(u8::is_ascii_whitespace) => {
-                    match serde_json::from_slice::<Vec<RecordedRequest>>(&bytes) {
-                        Ok(parsed) => parsed,
-                        Err(e) => {
-                            tracing::warn!(%e, path = %path.display(), "hook request store is corrupt; starting a new one");
-                            Vec::new()
+        // One stat feeds both the oversized refusal and the read's capacity
+        // hint — no second metadata() pass.
+        let mut window = None;
+        let mut requests = match std::fs::metadata(&path) {
+            // Past the ceiling by metadata: refuse without reading a giant.
+            Ok(m) if m.len() > ceiling => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "hook request store is larger than the absolute read bound; starting a new one"
+                );
+                Vec::new()
+            }
+            meta => {
+                let len_hint = meta.as_ref().map(std::fs::Metadata::len).unwrap_or(0);
+                match read_store_blob(&path, ceiling, len_hint) {
+                    // Grew between stat and read: same corrupt-store recovery.
+                    Ok(bytes) if bytes.len() as u64 > ceiling => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            "hook request store is larger than the absolute read bound; starting a new one"
+                        );
+                        Vec::new()
+                    }
+                    // Fatter than the loading keep allows but under the ceiling:
+                    // legitimate (written under a higher keep) — truncate below.
+                    Ok(bytes) if !bytes.iter().all(u8::is_ascii_whitespace) => {
+                        match serde_json::from_slice::<Vec<RecordedRequest>>(&bytes) {
+                            Ok(parsed) => {
+                                window = Window::scan(&bytes, &parsed, keep);
+                                parsed
+                            }
+                            Err(e) => {
+                                tracing::warn!(%e, path = %path.display(), "hook request store is corrupt; starting a new one");
+                                Vec::new()
+                            }
                         }
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                    Ok(_) => Vec::new(),
+                    Err(e) => return Err(e),
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-                Ok(_) => Vec::new(),
-                Err(e) => return Err(e),
             }
         };
+        // The file is oldest-first, so reverse first: the stable sort then
+        // keeps the LAST-recorded of equal (saturated) seqs in front, the
+        // same tie-break the record path's deque order gives.
+        requests.reverse();
         requests.sort_by_key(|r| std::cmp::Reverse(r.seq));
         requests.truncate(keep);
         // Saturate: `+ 1` at a hand-edited u64::MAX would panic in debug and
@@ -230,18 +285,68 @@ impl HookLog {
             path,
             keep,
             next_seq,
-            requests,
+            requests: requests.into(),
+            snapshot: None,
+            window,
         })
     }
 
-    /// Insert + persist: atomic tmp+rename with private perms (the store
-    /// carries request paths and bodies — the logs' 0600 class).
+    /// Insert + persist. Steady state is O(record): the new record is
+    /// serialized once and written into the file's tail pad, the evicted
+    /// oldest is whitened in place — the retained bytes in between never
+    /// move. Only when the pad runs out (or after a load of untrusted
+    /// framing, or an io error) does [`HookLog::reserve`] rewrite the whole
+    /// file atomically, amortized over half-the-live-bytes of pad.
+    ///
+    /// No fsync, by contract: exactly like the old whole-file persist,
+    /// durability ends at the page cache — the drop store's fsync
+    /// asymmetry is documented behavior, not a bug to fix here; any future
+    /// fsync must ride a group commit, never land per record.
+    ///
     /// `pub(crate)` so the benches can drive the record->persist path
     /// directly; same-crate visibility only, no behavior change.
     pub(crate) fn record(&mut self, req: RecordedRequest) -> std::io::Result<()> {
-        self.requests.insert(0, req);
-        self.requests.truncate(self.keep);
-        self.persist()
+        self.snapshot = None;
+        self.requests.push_front(req);
+        let bytes =
+            serde_json::to_vec(self.requests.front().expect("just pushed")).map_err(ser_io)?;
+        let fits = self.window.as_ref().is_some_and(|w| {
+            // Strictly greater: the extra byte is the separator comma; an
+            // empty live region skips it, so this over-requires by one.
+            w.file_len - 1 - w.live_end > bytes.len() as u64
+        });
+        if !fits {
+            // Evict in memory first so the rewrite carries exactly the
+            // retained set.
+            while self.requests.len() > self.keep {
+                self.requests.pop_back();
+            }
+            return self.reserve();
+        }
+        let evict = self.requests.len() > self.keep;
+        let mut window = self.window.take().expect("fits implies a window");
+        let result = (|| {
+            let mut file = OpenOptions::new().write(true).open(&self.path)?;
+            append_at(&mut file, &mut window, &bytes)?;
+            if evict {
+                let oldest = self.requests.pop_back().expect("evict implies an oldest");
+                let oldest_bytes = serde_json::to_vec(&oldest).map_err(ser_io)?;
+                evict_at(
+                    &mut file,
+                    &mut window,
+                    &oldest_bytes,
+                    !self.requests.is_empty(),
+                )?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => self.window = Some(window),
+            // In-place edits may have torn the framing mid-write; force a
+            // full rewrite on the next record.
+            Err(_) => self.window = None,
+        }
+        result
     }
 
     /// Saturates like load (see the comment there); at saturation duplicate
@@ -252,9 +357,21 @@ impl HookLog {
         seq
     }
 
-    /// Point-in-time copy, bounded by `keep` × the body cap.
-    fn snapshot(&self) -> Vec<RecordedRequest> {
-        self.requests.clone()
+    /// Shared immutable snapshot for the inspection views: the Arc hand-off
+    /// is a clone, not a store copy under the lock, and consecutive views
+    /// share one rebuild until the next record invalidates it.
+    fn snapshot_arc(&mut self) -> Arc<Vec<RecordedRequest>> {
+        Arc::clone(
+            self.snapshot
+                .get_or_insert_with(|| Arc::new(self.requests.iter().cloned().collect())),
+        )
+    }
+
+    /// Point-in-time copy, bounded by `keep` × the body cap (tests; the
+    /// views take the shared [`HookLog::snapshot_arc`]).
+    #[cfg(test)]
+    fn snapshot(&mut self) -> Vec<RecordedRequest> {
+        self.requests.iter().cloned().collect()
     }
 
     #[cfg(test)]
@@ -262,9 +379,25 @@ impl HookLog {
         self.requests.len()
     }
 
-    fn persist(&self) -> std::io::Result<()> {
-        let data = serde_json::to_vec(&self.requests)
-            .map_err(|e| std::io::Error::other(format!("serializing the request store: {e}")))?;
+    /// The only O(retained) write, paid on a load of untrusted framing,
+    /// after io errors, and when the tail pad runs out. Atomic tmp+rename
+    /// with private perms (the store carries request paths and bodies — the
+    /// logs' 0600 class): a crash leaves either the old or the new file,
+    /// never a torn one.
+    fn reserve(&mut self) -> std::io::Result<()> {
+        let mut data = Vec::with_capacity(self.requests.len() * 256 + MIN_TAIL_PAD + 2);
+        data.push(b'[');
+        for record in self.requests.iter().rev() {
+            if data.len() > 1 {
+                data.push(b',');
+            }
+            let bytes = serde_json::to_vec(record).map_err(ser_io)?;
+            data.extend_from_slice(&bytes);
+        }
+        let live_end = data.len() as u64;
+        let pad = (live_end / 2).max(MIN_TAIL_PAD as u64);
+        data.resize(data.len() + pad as usize, b' ');
+        data.push(b']');
         let tmp = self.path.with_extension("json.tmp");
         {
             let mut opts = OpenOptions::new();
@@ -273,8 +406,97 @@ impl HookLog {
             let mut file = opts.open(&tmp)?;
             file.write_all(&data)?;
         }
-        std::fs::rename(&tmp, &self.path)
+        std::fs::rename(&tmp, &self.path)?;
+        self.window = Some(Window {
+            live_start: 1,
+            live_end,
+            file_len: data.len() as u64,
+        });
+        Ok(())
     }
+}
+
+impl Window {
+    /// Trust the on-disk framing only when the file is byte-for-byte
+    /// something this store writes: bracket-framed with no whitespace
+    /// outside the brackets, records already in canonical oldest-first
+    /// order (non-decreasing seq — the in-place evict whitens the LEFT
+    /// end), nothing about to be truncated (the live region must equal the
+    /// retained set), and every record re-serializing to its exact on-disk
+    /// length (serde is deterministic for these values, but a format
+    /// change across binary versions must force a rewrite, not corrupt
+    /// the file). Anything else — hand-edited, legacy newest-first —
+    /// returns None and the next record rewrites the file atomically.
+    fn scan(bytes: &[u8], parsed: &[RecordedRequest], keep: usize) -> Option<Self> {
+        if parsed.len() > keep
+            || parsed.windows(2).any(|pair| pair[0].seq > pair[1].seq)
+            || bytes.first() != Some(&b'[')
+            || bytes.last() != Some(&b']')
+        {
+            return None;
+        }
+        let interior = &bytes[1..bytes.len() - 1];
+        let live_start = interior
+            .iter()
+            .position(|b| !b.is_ascii_whitespace())
+            .map_or(1, |i| 1 + i as u64);
+        let live_end = interior
+            .iter()
+            .rposition(|b| !b.is_ascii_whitespace())
+            .map_or(live_start, |i| 2 + i as u64);
+        let mut cursor = live_start;
+        for (i, record) in parsed.iter().enumerate() {
+            let ser = serde_json::to_vec(record).ok()?;
+            cursor += ser.len() as u64 + u64::from(i > 0);
+        }
+        (cursor == live_end).then_some(Self {
+            live_start,
+            live_end,
+            file_len: bytes.len() as u64,
+        })
+    }
+}
+
+/// serde failures are not io, but every caller of them is doing fs work and
+/// reports `io::Result` — fold the message in.
+fn ser_io(e: serde_json::Error) -> std::io::Error {
+    std::io::Error::other(format!("serializing a recorded request: {e}"))
+}
+
+/// Positional write: seek+write_all stands in for pwrite (portable), and no
+/// reader exists outside the store's mutex, so the seek is race-free.
+fn write_at(file: &mut File, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(bytes)
+}
+
+/// Write the newest record into the tail pad; the retained bytes are
+/// untouched. `window` must describe the live region exactly (see
+/// [`Window::scan`]).
+fn append_at(file: &mut File, window: &mut Window, bytes: &[u8]) -> std::io::Result<()> {
+    let mut framed = Vec::with_capacity(bytes.len() + 1);
+    if window.live_start != window.live_end {
+        framed.push(b',');
+    }
+    framed.extend_from_slice(bytes);
+    write_at(file, window.live_end, &framed)?;
+    window.live_end += framed.len() as u64;
+    Ok(())
+}
+
+/// Whiten the evicted oldest record (and its trailing separator) at the
+/// head of the live region: the file keeps its length, the array just
+/// loses its last element.
+fn evict_at(
+    file: &mut File,
+    window: &mut Window,
+    oldest: &[u8],
+    more_remain: bool,
+) -> std::io::Result<()> {
+    let len = oldest.len() + usize::from(more_remain);
+    write_at(file, window.live_start, &vec![b' '; len])?;
+    window.live_start += len as u64;
+    Ok(())
 }
 
 /// Recover from poisoning: in-memory state stays valid across a panic
@@ -321,11 +543,15 @@ async fn record(State(log): State<Arc<Mutex<HookLog>>>, request: Request) -> Res
                 .into_response();
         }
     };
+    // Stamped before the blocking hop and the store's lock wait: a request
+    // queued behind another delivery reports when it ARRIVED, not when it
+    // was admitted.
+    let received_at = crate::model::now_utc();
     // Blocking fs work off the async threads (request-path discipline).
     let persisted = tokio::task::spawn_blocking(move || {
         let mut log = lock(&log);
         let seq = log.next_seq();
-        let record = RecordedRequest::capture(seq, &parts, &bytes);
+        let record = RecordedRequest::capture(seq, received_at, &parts, &bytes);
         log.record(record)
     })
     .await;
@@ -351,17 +577,22 @@ async fn record(State(log): State<Arc<Mutex<HookLog>>>, request: Request) -> Res
 }
 
 /// Snapshot off the async thread: the record path holds this lock across
-/// persist's write, so an async-side lock() could park a tokio worker.
-async fn snapshot_offline(log: &Arc<Mutex<HookLog>>) -> Vec<RecordedRequest> {
+/// the store write, so an async-side lock() could park a tokio worker. The
+/// Arc hand-off makes the lock hold a clone, not a store copy.
+async fn snapshot_offline(log: &Arc<Mutex<HookLog>>) -> Arc<Vec<RecordedRequest>> {
     let log = Arc::clone(log);
-    tokio::task::spawn_blocking(move || lock(&log).snapshot())
+    tokio::task::spawn_blocking(move || lock(&log).snapshot_arc())
         .await
         .unwrap_or_default()
 }
 
 async fn inspect_html(State(log): State<Arc<Mutex<HookLog>>>) -> Html<String> {
     let requests = snapshot_offline(&log).await;
-    Html(render_inspection(&requests))
+    // Rendering walks every retained record — off the async runtime thread.
+    let html = tokio::task::spawn_blocking(move || render_inspection(&requests))
+        .await
+        .unwrap_or_default();
+    Html(html)
 }
 
 /// Every request-derived string passes through [`escape_html`] — webhook
@@ -403,8 +634,39 @@ fn render_inspection(requests: &[RecordedRequest]) -> String {
     html_page(&escape_html(&title), &body)
 }
 
-async fn inspect_json(State(log): State<Arc<Mutex<HookLog>>>) -> Json<Vec<RecordedRequest>> {
-    Json(snapshot_offline(&log).await)
+/// Same payload `Json<Vec<RecordedRequest>>` served, but serialized off the
+/// async runtime thread (it is O(retained bytes)) straight from the shared
+/// snapshot — no second deep copy under the lock.
+async fn inspect_json(State(log): State<Arc<Mutex<HookLog>>>) -> Response {
+    let requests = snapshot_offline(&log).await;
+    let body =
+        tokio::task::spawn_blocking(move || serde_json::to_vec(&*requests).map_err(ser_io)).await;
+    match body {
+        Ok(Ok(bytes)) => (
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )],
+            bytes,
+        )
+            .into_response(),
+        Ok(Err(e)) => {
+            tracing::error!(%e, "failed to serialize the inspection view");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to serialize the inspection view\n",
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(%e, "inspection view task panicked");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to render the inspection view\n",
+            )
+                .into_response()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -433,6 +695,12 @@ mod tests {
 
     /// Build a `Parts` head for [`RecordedRequest::capture`] without a full
     /// request round-trip.
+    /// A receive stamp for [`RecordedRequest::capture`]; no pinned rule
+    /// asserts on the value, only on where it is taken (see `record`).
+    fn recv_stamp() -> DateTime<Utc> {
+        crate::model::now_utc()
+    }
+
     fn parts(method: &str, uri: &str, headers: &[(&str, &str)]) -> Parts {
         let mut builder = Request::builder().method(method).uri(uri);
         for (name, value) in headers {
@@ -452,7 +720,7 @@ mod tests {
                 ("user-agent", "GitHub-Hookshot/abc"),
             ],
         );
-        let r = RecordedRequest::capture(7, &head, b"{\"a\":1}");
+        let r = RecordedRequest::capture(7, recv_stamp(), &head, b"{\"a\":1}");
         assert_eq!(r.seq, 7);
         assert_eq!(r.method, "POST");
         assert_eq!(r.path, "/hooks/github");
@@ -483,7 +751,7 @@ mod tests {
                 ("content-type", "text/plain"),
             ],
         );
-        let r = RecordedRequest::capture(1, &head, b"");
+        let r = RecordedRequest::capture(1, recv_stamp(), &head, b"");
         assert_eq!(
             r.headers,
             vec![("content-type".to_string(), "text/plain".to_string())],
@@ -498,7 +766,7 @@ mod tests {
         // over HTTP.
         let big = vec![b'x'; MAX_REQUEST_BODY + 1234];
         let head = parts("POST", "/x", &[]);
-        let r = RecordedRequest::capture(1, &head, &big);
+        let r = RecordedRequest::capture(1, recv_stamp(), &head, &big);
         assert_eq!(r.body_len, MAX_REQUEST_BODY + 1234);
         assert_eq!(r.body.len(), MAX_REQUEST_BODY);
         assert!(r.truncated);
@@ -508,12 +776,60 @@ mod tests {
     fn capture_preserves_non_utf8_bodies_lossily() {
         let head = parts("POST", "/x", &[]);
         let binary = [0xff, 0xfe, b'a', b'b'];
-        let r = RecordedRequest::capture(1, &head, &binary);
+        let r = RecordedRequest::capture(1, recv_stamp(), &head, &binary);
         assert_eq!(r.body_len, 4);
         assert!(
             r.body.contains('\u{FFFD}'),
             "lossy decode expected: {:?}",
             r.body
+        );
+    }
+
+    /// transfer-A11 pin: [`HYPER_HEAD_BUDGET`] must recompute hyper's own
+    /// whole-wire head budget — hyper-1.10.1 `src/proto/h1/io.rs:22-24`
+    /// (`DEFAULT_MAX_BUFFER_SIZE = 8192 + 4096 * 100`) built from
+    /// `src/proto/h1/role.rs:31` (`DEFAULT_MAX_HEADERS = 100`). If hyper
+    /// grows a default and this drifts low, load() classes legitimate
+    /// stores as oversized and the next append wipes the whole history.
+    #[test]
+    fn hyper_head_budget_is_pinned_to_hyper_1_10_wire_defaults() {
+        let recomputed = 8 * 1024 + 4 * 1024 * 100;
+        assert_eq!(
+            HYPER_HEAD_BUDGET, recomputed,
+            "HYPER_HEAD_BUDGET must equal hyper's DEFAULT_MAX_BUFFER_SIZE"
+        );
+        assert_eq!(
+            STORE_RECORD_OVERHEAD,
+            HYPER_HEAD_BUDGET * 2 + 2 * 1024,
+            "the per-record allowance must inherit the head pin"
+        );
+        let worst_case_file = store_read_bound(MAX_KEEP) * 3 / 2 + MIN_TAIL_PAD as u64 + 2;
+        assert!(
+            absolute_read_bound() >= worst_case_file,
+            "the read bound must cover the padded journal a full store produces"
+        );
+    }
+
+    /// The read bound refuses nothing AT the bound: a fixture of exactly
+    /// `bound` bytes reads in full, while the +1 slack is what surfaces a
+    /// past-the-bound fixture as longer than the bound (the load gate's
+    /// only discriminator between at-it and past-it).
+    #[test]
+    fn read_store_blob_reads_a_fixture_exactly_at_the_bound_in_full() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bound: u64 = 1024;
+        let at_path = tmp.path().join("at.json");
+        std::fs::write(&at_path, vec![b' '; bound as usize]).expect("at-bound fixture");
+        let at =
+            read_store_blob(&at_path, bound, bound).expect("an at-bound fixture must read in full");
+        assert_eq!(at.len() as u64, bound, "the bound itself is not a refusal");
+        let past_path = tmp.path().join("past.json");
+        std::fs::write(&past_path, vec![b' '; bound as usize + 1]).expect("past-bound fixture");
+        let past = read_store_blob(&past_path, bound, bound + 1).expect("read");
+        assert_eq!(
+            past.len() as u64,
+            bound + 1,
+            "the +1 slack must surface a past-bound fixture as over the bound"
         );
     }
 
@@ -524,14 +840,14 @@ mod tests {
         let mut log = HookLog::load(path.clone(), 3).expect("load");
         for seq in 1..=5u64 {
             let head = parts("GET", &format!("/{seq}"), &[]);
-            let record = RecordedRequest::capture(seq, &head, b"");
+            let record = RecordedRequest::capture(seq, recv_stamp(), &head, b"");
             log.record(record).expect("record");
         }
         assert_eq!(log.len(), 3);
         let snap = log.snapshot();
         let seqs: Vec<u64> = snap.iter().map(|r| r.seq).collect();
         assert_eq!(seqs, vec![5, 4, 3], "newest first, oldest evicted");
-        let reloaded = HookLog::load(path, 3).expect("reload");
+        let mut reloaded = HookLog::load(path, 3).expect("reload");
         assert_eq!(reloaded.snapshot(), snap);
     }
 
@@ -542,7 +858,7 @@ mod tests {
         {
             let mut log = HookLog::load(path.clone(), 10).expect("load");
             let head = parts("POST", "/first", &[]);
-            log.record(RecordedRequest::capture(1, &head, b"one"))
+            log.record(RecordedRequest::capture(1, recv_stamp(), &head, b"one"))
                 .expect("record");
         }
         let mut log = HookLog::load(path, 10).expect("reload");
@@ -550,7 +866,7 @@ mod tests {
         assert_eq!(log.snapshot()[0].path, "/first");
         let seq = log.next_seq();
         let head = parts("POST", "/second", &[]);
-        log.record(RecordedRequest::capture(seq, &head, b"two"))
+        log.record(RecordedRequest::capture(seq, recv_stamp(), &head, b"two"))
             .expect("record");
         let snap = log.snapshot();
         assert_eq!(snap.len(), 2);
@@ -565,8 +881,13 @@ mod tests {
         {
             let mut log = HookLog::load(path.clone(), 5).expect("seed load");
             let head = parts("POST", "/seed", &[]);
-            log.record(RecordedRequest::capture(u64::MAX, &head, b"seed"))
-                .expect("seed record");
+            log.record(RecordedRequest::capture(
+                u64::MAX,
+                recv_stamp(),
+                &head,
+                b"seed",
+            ))
+            .expect("seed record");
         }
         let mut log = HookLog::load(path.clone(), 5).expect("reload at MAX seq");
         assert_eq!(
@@ -581,10 +902,10 @@ mod tests {
             "next_seq saturates at u64::MAX instead of overflowing"
         );
         let head = parts("POST", "/after", &[]);
-        log.record(RecordedRequest::capture(seq, &head, b"after"))
+        log.record(RecordedRequest::capture(seq, recv_stamp(), &head, b"after"))
             .expect("record at MAX seq");
         assert_eq!(log.len(), 2);
-        let reloaded = HookLog::load(path, 5).expect("reload after the append");
+        let mut reloaded = HookLog::load(path, 5).expect("reload after the append");
         let paths: Vec<String> = reloaded.snapshot().into_iter().map(|r| r.path).collect();
         assert_eq!(paths, vec!["/after", "/seed"]);
     }
@@ -613,7 +934,7 @@ mod tests {
             for seq in 1..=5u64 {
                 let head = parts("POST", &format!("/{seq}"), &[]);
                 let body = vec![0u8; MAX_REQUEST_BODY];
-                log.record(RecordedRequest::capture(seq, &head, &body))
+                log.record(RecordedRequest::capture(seq, recv_stamp(), &head, &body))
                     .expect("record");
             }
         }
@@ -626,7 +947,7 @@ mod tests {
             persisted_len <= absolute_read_bound(),
             "the fixture must sit inside the absolute ceiling"
         );
-        let reloaded = HookLog::load(path, 1).expect("reload with a lowered keep");
+        let mut reloaded = HookLog::load(path, 1).expect("reload with a lowered keep");
         let snap = reloaded.snapshot();
         assert_eq!(snap.len(), 1, "load-and-truncate, not wipe");
         assert_eq!(snap[0].seq, 5, "the NEWEST record survives the truncation");
@@ -645,10 +966,10 @@ mod tests {
         );
         for seq in 1..=3u64 {
             let head = parts("POST", &format!("/{seq}"), &[]);
-            log.record(RecordedRequest::capture(seq, &head, b"x"))
+            log.record(RecordedRequest::capture(seq, recv_stamp(), &head, b"x"))
                 .expect("record");
         }
-        let reloaded = HookLog::load(path, over_max).expect("reload");
+        let mut reloaded = HookLog::load(path, over_max).expect("reload");
         assert_eq!(reloaded.keep, MAX_KEEP, "the clamp holds across reloads");
         assert_eq!(reloaded.snapshot().len(), 3, "records survive the reload");
     }
@@ -661,7 +982,7 @@ mod tests {
             let mut log = HookLog::load(path.clone(), 1).expect("load");
             let head = parts("POST", "/nul", &[]);
             let body = vec![0u8; MAX_REQUEST_BODY];
-            log.record(RecordedRequest::capture(1, &head, &body))
+            log.record(RecordedRequest::capture(1, recv_stamp(), &head, &body))
                 .expect("record");
         }
         let persisted_len = std::fs::metadata(&path).expect("store exists").len();
@@ -673,7 +994,7 @@ mod tests {
             persisted_len <= store_read_bound(1),
             "the fixture must sit inside the escape-aware bound"
         );
-        let reloaded = HookLog::load(path, 1).expect("reload");
+        let mut reloaded = HookLog::load(path, 1).expect("reload");
         let snap = reloaded.snapshot();
         assert_eq!(snap.len(), 1, "a legitimate store must survive reload");
         assert_eq!(snap[0].body.len(), MAX_REQUEST_BODY);
@@ -692,7 +1013,7 @@ mod tests {
         {
             let mut log = HookLog::load(path.clone(), 1).expect("load");
             let body = vec![0u8; MAX_REQUEST_BODY];
-            log.record(RecordedRequest::capture(1, &head, &body))
+            log.record(RecordedRequest::capture(1, recv_stamp(), &head, &body))
                 .expect("record");
         }
         let persisted_len = std::fs::metadata(&path).expect("store exists").len();
@@ -705,7 +1026,7 @@ mod tests {
             persisted_len <= store_read_bound(1),
             "the fixture must sit inside the head-budget-aware bound"
         );
-        let reloaded = HookLog::load(path, 1).expect("reload");
+        let mut reloaded = HookLog::load(path, 1).expect("reload");
         let snap = reloaded.snapshot();
         assert_eq!(snap.len(), 1, "a legitimate store must survive reload");
         assert_eq!(snap[0].body.len(), MAX_REQUEST_BODY);
@@ -771,7 +1092,7 @@ mod tests {
 
         let mut log = HookLog::load(path.clone(), 5).expect("load");
         let head = parts("GET", "/x", &[]);
-        log.record(RecordedRequest::capture(1, &head, b""))
+        log.record(RecordedRequest::capture(1, recv_stamp(), &head, b""))
             .expect("record");
 
         let mode = std::fs::metadata(&path)
@@ -779,6 +1100,63 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600, "store must be owner-only");
+    }
+
+    /// A run long enough to cross the tail-pad exhaustion (several full
+    /// rewrites): the append-window cursors must still describe the file
+    /// exactly, or in-place appends/evicts would silently corrupt it.
+    #[test]
+    fn many_records_keep_the_window_truthful_across_rewrites() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("requests.json");
+        let mut log = HookLog::load(path.clone(), 7).expect("load");
+        for seq in 1..=2_000u64 {
+            let head = parts("POST", &format!("/{seq}"), &[]);
+            log.record(RecordedRequest::capture(seq, recv_stamp(), &head, b"pay"))
+                .expect("record");
+        }
+        assert_eq!(log.len(), 7);
+        let snap = log.snapshot();
+        let seqs: Vec<u64> = snap.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, vec![2_000, 1_999, 1_998, 1_997, 1_996, 1_995, 1_994]);
+        let mut reloaded = HookLog::load(path, 7).expect("reload after the long run");
+        assert_eq!(reloaded.snapshot(), snap, "the window must land intact");
+    }
+
+    /// A legacy (or hand-edited) newest-first array is not this store's
+    /// canonical oldest-first framing: it must still load, and the next
+    /// record must rewrite it into the canonical layout instead of
+    /// appending into cursors that do not describe it.
+    #[test]
+    fn a_legacy_newest_first_store_loads_and_is_normalized_on_the_next_record() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("requests.json");
+        let legacy = vec![
+            RecordedRequest::capture(2, recv_stamp(), &parts("POST", "/new", &[]), b""),
+            RecordedRequest::capture(1, recv_stamp(), &parts("POST", "/old", &[]), b""),
+        ];
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&legacy).expect("serialize legacy"),
+        )
+        .expect("plant legacy store");
+
+        let mut log = HookLog::load(path.clone(), 5).expect("load");
+        let seqs: Vec<u64> = log.snapshot().iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, vec![2, 1], "legacy records load newest-first");
+
+        let head = parts("POST", "/after", &[]);
+        log.record(RecordedRequest::capture(3, recv_stamp(), &head, b"x"))
+            .expect("record");
+        let mut reloaded = HookLog::load(path.clone(), 5).expect("reload");
+        let paths: Vec<String> = reloaded.snapshot().into_iter().map(|r| r.path).collect();
+        assert_eq!(paths, vec!["/after", "/new", "/old"]);
+        // The normalized file is a plain JSON array — the format any
+        // external reader (and the bench) expects.
+        let on_disk: Vec<RecordedRequest> =
+            serde_json::from_slice(&std::fs::read(&path).expect("read the store"))
+                .expect("the store file stays a JSON array");
+        assert_eq!(on_disk.len(), 3);
     }
 
     // --- the full Router, driven like the static server's HTTP tests --------

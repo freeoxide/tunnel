@@ -53,18 +53,29 @@ pub async fn run(
 }
 
 /// Open (and create the parent dir for) a hook service's request store.
-fn open_hook_log(
+/// The load reads and parses the whole store — blocking fs, moved off the
+/// async threads.
+async fn open_hook_log(
     state: &StateDir,
     name: &str,
     keep: u16,
 ) -> Result<Arc<std::sync::Mutex<HookLog>>> {
-    state.ensure_service_dir(name)?;
-    let path = state.service_dir(name).join(hook_server::REQUESTS_FILENAME);
-    // load fails fast on a non-NotFound read error (the store may be intact
-    // behind it) — surface the disk problem at startup, never rename over it.
-    let log = HookLog::load(path.clone(), usize::from(keep))
-        .with_context(|| format!("opening hook request store {}", path.display()))?;
-    Ok(Arc::new(std::sync::Mutex::new(log)))
+    let state = state.clone();
+    let name = name.to_string();
+    tokio::task::spawn_blocking(move || {
+        state.ensure_service_dir(&name)?;
+        let path = state
+            .service_dir(&name)
+            .join(hook_server::REQUESTS_FILENAME);
+        // load fails fast on a non-NotFound read error (the store may be
+        // intact behind it) — surface the disk problem at startup, never
+        // rename over it.
+        let log = HookLog::load(path.clone(), usize::from(keep))
+            .with_context(|| format!("opening hook request store {}", path.display()))?;
+        Ok(Arc::new(std::sync::Mutex::new(log)))
+    })
+    .await
+    .context("joining the hook request store load task")?
 }
 
 /// Background flow: the shared START scaffolding (the worker binds the origin).
@@ -152,7 +163,7 @@ async fn run_foreground(port: u16, name: Option<String>, keep: u16) -> Result<()
 
     // ft's own hook server in THIS process; `serve` installs its own Ctrl-C
     // drain, bounded below.
-    let hook_log = open_hook_log(&state, &name, keep)?;
+    let hook_log = open_hook_log(&state, &name, keep).await?;
     let router = hook_server::router(hook_log);
     let mut server_handle = tokio::spawn(async move {
         if let Err(e) = static_server::serve(router, port).await {

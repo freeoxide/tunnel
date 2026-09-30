@@ -195,7 +195,7 @@ pub async fn run(
         }
         ServiceKind::Hook => {
             let keep = usize::from(keep.unwrap_or(hook_server::DEFAULT_KEEP));
-            let hook_log = match open_request_store(&state, &name, keep) {
+            let hook_log = match open_request_store(&state, &name, keep).await {
                 Ok(log) => log,
                 Err(e) => {
                     let _ = Registry::update(&state, |reg| {
@@ -502,18 +502,27 @@ async fn bind_loopback_fail_fast(
 }
 
 /// Fails at startup: a store that cannot live on disk would 500 every
-/// webhook once the tunnel is up.
-fn open_request_store(
+/// webhook once the tunnel is up. The load reads and parses the whole
+/// store — blocking fs, moved off the async threads.
+async fn open_request_store(
     state: &StateDir,
     name: &str,
     keep: usize,
 ) -> Result<Arc<std::sync::Mutex<HookLog>>> {
-    state.ensure_service_dir(name)?;
-    let path = state.service_dir(name).join(hook_server::REQUESTS_FILENAME);
-    // load()'s Err is fatal here — never rename over an intact store.
-    let log = HookLog::load(path.clone(), keep)
-        .with_context(|| format!("opening hook request store {}", path.display()))?;
-    Ok(Arc::new(std::sync::Mutex::new(log)))
+    let state = state.clone();
+    let name = name.to_string();
+    tokio::task::spawn_blocking(move || {
+        state.ensure_service_dir(&name)?;
+        let path = state
+            .service_dir(&name)
+            .join(hook_server::REQUESTS_FILENAME);
+        // load()'s Err is fatal here — never rename over an intact store.
+        let log = HookLog::load(path.clone(), keep)
+            .with_context(|| format!("opening hook request store {}", path.display()))?;
+        Ok(Arc::new(std::sync::Mutex::new(log)))
+    })
+    .await
+    .context("joining the hook request store load task")?
 }
 
 /// Missing or unreadable token is fatal: without it the origin cannot
