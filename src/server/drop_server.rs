@@ -24,7 +24,10 @@ use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
 
-use crate::server::static_server::{confine, encode_href, escape_html, html_page};
+use crate::server::static_server::{
+    bearer_token, confine, escape_html, html_page, push_encoded_href, push_escaped_html,
+    query_param, tokens_match,
+};
 
 /// Hard upper bound on any single request: bounds stalled public clients and
 /// the worker's graceful drain alike.
@@ -106,22 +109,6 @@ fn fill_random(buf: &mut [u8]) -> std::io::Result<()> {
             "no OS random source on this platform",
         ))
     }
-}
-
-/// Byte-in-sync twin of `static_server::tokens_match` (rationale there) —
-/// keep the two in sync. An empty expected token matches nothing.
-fn tokens_match(provided: &str, expected: &str) -> bool {
-    if expected.is_empty() {
-        return false;
-    }
-    let (a, b) = (provided.as_bytes(), expected.as_bytes());
-    let mut diff = a.len() ^ b.len();
-    for i in 0..a.len().max(b.len()) {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        diff |= usize::from(x ^ y);
-    }
-    diff == 0
 }
 
 /// The token's durable home (0600, in the service's state dir). The trailing
@@ -345,28 +332,6 @@ pub(crate) fn router(store: Arc<DropStore>) -> Router {
         ))
 }
 
-/// Byte-in-sync twin of `static_server::query_param` (a literal `+` stays a
-/// plus); keep the two in sync.
-fn query_param(query: &str, key: &str) -> Option<String> {
-    query.split('&').find_map(|pair| {
-        let (k, v) = pair.split_once('=')?;
-        if k != key {
-            return None;
-        }
-        percent_decode(v.as_bytes())
-            .decode_utf8()
-            .ok()
-            .map(|d| d.into_owned())
-    })
-}
-
-/// Byte-in-sync twin of `static_server::bearer_token` (RFC 7235:
-/// case-insensitive scheme); keep the two in sync.
-fn bearer_token(value: &str) -> Option<&str> {
-    let (scheme, credentials) = value.split_once(' ')?;
-    scheme.eq_ignore_ascii_case("bearer").then_some(credentials)
-}
-
 /// GET/HEAD pass (reads are public); every other method must present the
 /// token BEFORE its body is read (no bytes in from the unauthenticated).
 async fn require_token(
@@ -389,7 +354,7 @@ async fn require_token(
             .uri()
             .query()
             .and_then(|q| query_param(q, "token"))
-            .is_some_and(|t| tokens_match(&t, &store.token)),
+            .is_some_and(|t| tokens_match(t.as_ref(), &store.token)),
     };
     if !ok {
         return (
@@ -431,8 +396,9 @@ fn upload_name(request: &Request) -> Result<String, (StatusCode, String)> {
         .query()
         .and_then(|q| query_param(q, "filename"));
     if is_root_path(path) {
-        return in_query
-            .ok_or_else(|| bad("no filename given: POST /<name> or POST /?filename=<name>"));
+        let name = in_query
+            .ok_or_else(|| bad("no filename given: POST /<name> or POST /?filename=<name>"))?;
+        return Ok(name.into_owned());
     }
     if in_query.is_some() {
         return Err(bad(
@@ -623,18 +589,36 @@ async fn listing(store: Arc<DropStore>, is_head: bool) -> Response {
 /// `pub(crate)` so the benches can drive it directly — same-crate visibility
 /// only, no behavior change.
 pub(crate) fn render_listing(store: &DropStore) -> String {
+    listing_html(&visible_entries(&store.root))
+}
+
+/// The twin of `static_server::visible_entries`, plus each file's size —
+/// lstat of the entry itself, so an inner symlink shows its own length.
+fn visible_entries(root: &Path) -> Vec<(String, bool, u64)> {
     let mut entries: Vec<(String, bool, u64)> = Vec::new(); // (name, is_dir, size)
-    if let Ok(read) = std::fs::read_dir(&store.root) {
+    if let Ok(read) = std::fs::read_dir(root) {
         for entry in read.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.starts_with('.') {
                 continue;
             }
-            let resolved = match std::fs::canonicalize(entry.path()) {
-                Ok(target) if target.starts_with(&store.root) => target,
-                _ => continue,
+            // d_type came with the readdir; a rare error (or a DT_UNKNOWN
+            // platform) falls back to lstat before classifying.
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => match std::fs::symlink_metadata(entry.path()) {
+                    Ok(m) => m.file_type(),
+                    Err(_) => continue,
+                },
             };
-            let is_dir = resolved.is_dir();
+            let is_dir = if file_type.is_symlink() {
+                match std::fs::canonicalize(entry.path()) {
+                    Ok(target) if target.starts_with(root) => target.is_dir(),
+                    _ => continue,
+                }
+            } else {
+                file_type.is_dir()
+            };
             let size = if is_dir {
                 0
             } else {
@@ -644,7 +628,10 @@ pub(crate) fn render_listing(store: &DropStore) -> String {
         }
     }
     entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    entries
+}
 
+fn listing_html(entries: &[(String, bool, u64)]) -> String {
     let mut body = String::from(
         "<p>Upload (token required for POST/PUT; GET is public): \
          <code>curl -H \"Authorization: Bearer &lt;token&gt;\" --data-binary @file.txt \
@@ -652,22 +639,33 @@ pub(crate) fn render_listing(store: &DropStore) -> String {
          <code>ft detail</code>. Raw bodies only; multipart is stored as opaque bytes.</p>\n\
          <ul>\n",
     );
+    body.reserve(
+        entries
+            .iter()
+            .map(|(name, _, _)| name.len() * 6 + 112)
+            .sum(),
+    );
     if entries.is_empty() {
         body.push_str("<li>(nothing uploaded yet)</li>\n");
     }
-    for (name, is_dir, size) in &entries {
-        let kind = if *is_dir { "dir" } else { "file" };
-        let slash = if *is_dir { "/" } else { "" };
-        let href = encode_href(name);
-        let label = escape_html(name);
-        let size_note = if *is_dir {
-            String::new()
-        } else {
-            format!(" <small>{size} B</small>")
-        };
-        body.push_str(&format!(
-            "<li><a class=\"{kind}\" href=\"/{href}{slash}\">{label}{slash}</a>{size_note}</li>\n"
-        ));
+    for (name, is_dir, size) in entries {
+        body.push_str("<li><a class=\"");
+        body.push_str(if *is_dir { "dir" } else { "file" });
+        body.push_str("\" href=\"/");
+        push_encoded_href(&mut body, name);
+        if *is_dir {
+            body.push('/');
+        }
+        body.push_str("\">");
+        push_escaped_html(&mut body, name);
+        if *is_dir {
+            body.push('/');
+        }
+        body.push_str("</a>");
+        if !is_dir {
+            let _ = write!(body, " <small>{size} B</small>");
+        }
+        body.push_str("</li>\n");
     }
     body.push_str("</ul>\n<hr>\n");
     html_page(&escape_html("Drop bucket — uploaded files"), &body)
@@ -1589,5 +1587,129 @@ mod tests {
         let _ = shutdown_tx.send(());
         let res = server.await.expect("join serve task");
         assert!(res.is_ok(), "serve_on drained without error: {res:?}");
+    }
+
+    /// transfer-A13 corpus: this module's helpers ARE `static_server`'s
+    /// (shared), and the cross-module assertion keeps it that way — a local
+    /// twin reintroduced here would resolve `super::` to itself and drift.
+    #[test]
+    fn token_helpers_match_the_static_origin_on_a_corpus() {
+        use crate::server::static_server as origin;
+
+        let pairs = [
+            ("sekrit", "sekrit", true),
+            ("sekriT", "sekrit", false),
+            ("sekri", "sekrit", false),
+            ("sekritlonger", "sekrit", false),
+            ("", "sekrit", false),
+            ("sekrit", "", false),
+            ("", "", false),
+        ];
+        for (provided, expected, want) in pairs {
+            assert_eq!(
+                tokens_match(provided, expected),
+                want,
+                "{provided:?} vs {expected:?}"
+            );
+            assert_eq!(
+                origin::tokens_match(provided, expected),
+                tokens_match(provided, expected),
+                "both origins must agree on {provided:?} vs {expected:?}"
+            );
+        }
+
+        let queries = [
+            ("token=a+b", "token", Some("a+b")), // a literal `+` stays a plus
+            ("token=a%2Bb", "token", Some("a+b")), // %2B decodes to the plus
+            ("token=a%20b", "token", Some("a b")),
+            ("filename=x&token=t", "token", Some("t")),
+            ("token", "token", None),
+            ("other=1", "token", None),
+            ("token=%FF", "token", None),
+        ];
+        for (query, key, want) in queries {
+            assert_eq!(
+                query_param(query, key).as_deref(),
+                want,
+                "{query:?} for {key:?}"
+            );
+            assert_eq!(
+                origin::query_param(query, key).as_deref(),
+                query_param(query, key).as_deref(),
+                "both origins must agree on {query:?}"
+            );
+        }
+
+        let headers = [
+            ("bearer sekrit", Some("sekrit")),
+            ("BEARER sekrit", Some("sekrit")),
+            ("BeArEr sekrit", Some("sekrit")),
+            ("basic sekrit", None),
+            ("bearersekrit", None),
+        ];
+        for (value, want) in headers {
+            assert_eq!(bearer_token(value), want, "{value:?}");
+            assert_eq!(
+                origin::bearer_token(value),
+                bearer_token(value),
+                "both origins must agree on {value:?}"
+            );
+        }
+    }
+}
+
+/// d_type-classified drop listings must byte-match the
+/// canonicalize-everything classification they replaced, on the same random
+/// trees as the static listing's proptest.
+#[cfg(all(test, unix))]
+mod listing_parity_proptests {
+    use super::*;
+    use crate::server::static_server::parity_fixtures;
+    use proptest::prelude::*;
+
+    /// The OLD classification, kept verbatim as the oracle.
+    fn canonicalize_classified(root: &Path) -> Vec<(String, bool, u64)> {
+        let mut entries: Vec<(String, bool, u64)> = Vec::new();
+        for entry in std::fs::read_dir(root).expect("read_dir").flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            let resolved = match std::fs::canonicalize(entry.path()) {
+                Ok(target) if target.starts_with(root) => target,
+                _ => continue,
+            };
+            let is_dir = resolved.is_dir();
+            let size = if is_dir {
+                0
+            } else {
+                entry.metadata().map(|m| m.len()).unwrap_or(0)
+            };
+            entries.push((name, is_dir, size));
+        }
+        entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        entries
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        #[test]
+        fn dtype_drop_listing_matches_canonicalize_listing(
+            seeds in parity_fixtures::seeds(),
+        ) {
+            let planted = parity_fixtures::plant(&seeds);
+            let store = DropStore::open(
+                &planted.root,
+                "tok-parity".to_string(),
+                1 << 20,
+                1 << 30,
+            )
+            .expect("open store");
+            prop_assert_eq!(
+                render_listing(&store),
+                listing_html(&canonicalize_classified(&planted.root))
+            );
+        }
     }
 }
