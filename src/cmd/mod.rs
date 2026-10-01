@@ -28,8 +28,6 @@ pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Upper bound on how long a parent waits for the tunnel URL — generous
 /// (30 s) because dev servers boot slowly.
 pub(crate) const POLL_TIMEOUT: Duration = Duration::from_secs(30);
-/// Origin-probe connect timeout (doctor's blocking probe, run's async twin);
-/// loopback resolves instantly, nothing is ever read.
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Dispatch the parsed CLI; `None` falls through to the implicit START (dir

@@ -13,7 +13,7 @@
 
 use std::time::Duration;
 
-use crate::cmd::doctor::origin_alive;
+use crate::cmd::doctor::origin_alive_async;
 use crate::error::Result;
 use crate::model::{Registry, Service, ServiceKind};
 use crate::output;
@@ -162,44 +162,31 @@ fn apply<'a>(reg: &mut Registry, candidates: &'a [Judgment]) -> Vec<(Service, &'
     removed
 }
 
-/// [`origin_alive`] once, and only if that failed again after
-/// [`REPROBE_DELAY`] — a restarting dev server drops the port briefly.
 async fn origin_dead_after_double_probe(port: u16) -> bool {
-    if origin_alive(port) {
+    if origin_alive_async(port).await {
         return false;
     }
     tokio::time::sleep(REPROBE_DELAY).await;
-    !origin_alive(port)
+    !origin_alive_async(port).await
 }
 
-/// Remove every dangling service (stale + zombie-upstream); see the module
-/// docs for the probe/re-verify/signal safety contract. Exits 0 whenever it ran.
-pub async fn run() -> Result<()> {
-    let state = StateDir::new()?;
-
-    // --- snapshot + probe: strictly BEFORE the registry lock -----------------
-    // A dead double-probe can take ~1.75 s; never hold the lock that long.
-    let snapshot = Registry::load(&state)?;
-
-    if snapshot.services.is_empty() {
-        // Fresh machine: return before `Registry::update` — its lock-file
-        // creation would fail on a not-yet-existing state dir; stay a no-op.
-        output::print_sanitized(&[], &[]);
-        return Ok(());
+async fn judge(services: &[Service]) -> (Vec<Judgment>, Vec<String>) {
+    let mut liveness = Vec::with_capacity(services.len());
+    let mut probes = Vec::with_capacity(services.len());
+    for svc in services {
+        let alive = worker_alive(svc);
+        let probe = (alive == Some(true) && svc.public_url.is_some())
+            .then(|| tokio::spawn(origin_dead_after_double_probe(svc.port)));
+        liveness.push(alive);
+        probes.push(probe);
     }
 
     let mut candidates = Vec::new();
     let mut skipped_foreground = Vec::new();
-    for svc in &snapshot.services {
-        let alive = worker_alive(svc);
-        // Probe the origin only when Running: a Starting worker's port may
-        // not be bound yet; a dead worker already explains a dead port.
-        let port_dead = if let Some(true) = alive
-            && svc.public_url.is_some()
-        {
-            Some(origin_dead_after_double_probe(svc.port).await)
-        } else {
-            None
+    for ((svc, alive), probe) in services.iter().zip(liveness).zip(probes) {
+        let port_dead = match probe {
+            Some(handle) => Some(handle.await.unwrap_or(false)),
+            None => None,
         };
         let action = plan(svc, alive, port_dead);
         match action {
@@ -213,6 +200,22 @@ pub async fn run() -> Result<()> {
             }
         }
     }
+    (candidates, skipped_foreground)
+}
+
+/// Remove every dangling service (stale + zombie-upstream); see the module
+/// docs for the probe/re-verify/signal safety contract. Exits 0 whenever it ran.
+pub async fn run() -> Result<()> {
+    let state = StateDir::new()?;
+
+    let snapshot = Registry::load(&state)?;
+
+    if snapshot.services.is_empty() {
+        output::print_sanitized(&[], &[]);
+        return Ok(());
+    }
+
+    let (candidates, skipped_foreground) = judge(&snapshot.services).await;
 
     // --- locked removal, re-verified against the freshly loaded registry -----
     let removed = Registry::update(&state, |reg| apply(reg, &candidates))?;
@@ -448,6 +451,101 @@ mod tests {
         assert_eq!(
             stale_reason(&reserved),
             "worker pid was never recorded — the start reservation was abandoned"
+        );
+    }
+
+    fn dead_loopback_port() -> u16 {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("bind loopback listener");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+        port
+    }
+
+    #[tokio::test]
+    async fn double_probes_overlap_their_reprobe_delay() {
+        let port = dead_loopback_port();
+        let start = std::time::Instant::now();
+        let (first, second) = tokio::join!(
+            origin_dead_after_double_probe(port),
+            origin_dead_after_double_probe(port)
+        );
+        let elapsed = start.elapsed();
+        assert!(first && second, "a dead port must read dead on both probes");
+        assert!(
+            elapsed >= REPROBE_DELAY,
+            "the reprobe gap is deliberate and must not be shortened: {elapsed:?}"
+        );
+        assert!(
+            elapsed < REPROBE_DELAY * 2,
+            "concurrent double-probes must overlap their gaps, took {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn spawn_decoy_worker() -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        let child = std::process::Command::new("sh")
+            .args(["-c", "while :; do sleep 30; done", "run-worker"])
+            .process_group(0)
+            .spawn()
+            .expect("spawn decoy sh");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !proc::pid_alive(child.id()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "decoy never became probe-ready"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        child
+    }
+
+    #[cfg(unix)]
+    fn kill_decoy(child: &mut std::process::Child) {
+        let pgid = nix::unistd::Pid::from_raw(-(child.id() as i32));
+        let _ = nix::sys::signal::kill(pgid, nix::sys::signal::Signal::SIGKILL);
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn judge_pays_one_reprobe_gap_across_services() {
+        let mut decoys = Vec::new();
+        let services = (0..5)
+            .map(|i| {
+                let child = spawn_decoy_worker();
+                let mut svc = service(ServiceKind::Proxy, false);
+                svc.name = format!("zombie-{i}");
+                svc.worker_pid = child.id();
+                svc.port = dead_loopback_port();
+                decoys.push(child);
+                svc
+            })
+            .collect::<Vec<_>>();
+
+        let start = std::time::Instant::now();
+        let (candidates, skipped) = judge(&services).await;
+        let elapsed = start.elapsed();
+
+        for child in &mut decoys {
+            kill_decoy(child);
+        }
+
+        assert!(
+            candidates.len() == 5 && skipped.is_empty(),
+            "all decoy-backed services must reach RemoveZombie (got {} candidates, \
+             skipped {skipped:?})",
+            candidates.len()
+        );
+        assert!(
+            elapsed >= REPROBE_DELAY,
+            "the gap is the deliberate mid-restart tolerance, never to be shortened: \
+             {elapsed:?}"
+        );
+        assert!(
+            elapsed < REPROBE_DELAY * 2,
+            "judge must overlap the services' gaps, took {elapsed:?}"
         );
     }
 

@@ -6,13 +6,13 @@
 //! recorded. Header capture is an ALLOWLIST so credential-bearing headers
 //! can never reach the store or the public inspection view.
 
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::collections::VecDeque;
+use std::fs::{File, OpenOptions};
+use std::io::{Read as _, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use axum::Json;
 use axum::Router;
 use axum::extract::{Request, State};
 use axum::http::request::Parts;
@@ -85,9 +85,7 @@ pub struct RecordedRequest {
 }
 
 impl RecordedRequest {
-    /// Build a record from a request head + body; pure, so the capture rules
-    /// are unit-testable.
-    fn capture(seq: u64, parts: &Parts, body: &[u8]) -> Self {
+    fn capture(seq: u64, received_at: DateTime<Utc>, parts: &Parts, body: &[u8]) -> Self {
         let headers = parts
             .headers
             .iter()
@@ -106,7 +104,7 @@ impl RecordedRequest {
         let capped = &body[..body.len().min(MAX_REQUEST_BODY)];
         Self {
             seq,
-            received_at: crate::model::now_utc(),
+            received_at,
             method: parts.method.as_str().to_owned(),
             path: parts.uri.path().to_owned(),
             query: parts.uri.query().map(str::to_owned),
@@ -118,15 +116,22 @@ impl RecordedRequest {
     }
 }
 
-/// Newest-first Vec mirrored to `requests.json` (0600, atomic tmp+rename) on
-/// every append.
+/// Newest-first recorded-request store mirrored to `requests.json` (0600).
 #[derive(Debug)]
 pub struct HookLog {
     path: PathBuf,
     keep: usize,
     next_seq: u64,
-    /// Newest-first — by construction on append, by seq-sort on load.
-    requests: Vec<RecordedRequest>,
+    requests: VecDeque<RecordedRequest>,
+    snapshot: Option<Arc<Vec<RecordedRequest>>>,
+    window: Option<Window>,
+}
+
+#[derive(Debug)]
+struct Window {
+    live_start: u64,
+    live_end: u64,
+    file_len: u64,
 }
 
 /// Worst-case JSON expansion of one body byte (control bytes escape to a
@@ -148,6 +153,8 @@ const HYPER_HEAD_BUDGET: usize = 417_792;
 /// legitimate stores on reload and wipe them.
 const STORE_RECORD_OVERHEAD: usize = HYPER_HEAD_BUDGET * 2 + 2 * 1024;
 
+const MIN_TAIL_PAD: usize = 64 * 1024;
+
 /// Upper bound on a store this server could have written at `keep` records;
 /// saturating, u64 for [`read_store_blob`]'s `File::take`.
 fn store_read_bound(keep: usize) -> u64 {
@@ -155,69 +162,82 @@ fn store_read_bound(keep: usize) -> u64 {
     (keep as u64).saturating_mul(per_record)
 }
 
-/// [`store_read_bound`] at [`MAX_KEEP`], independent of the loading keep — a
-/// store written at ANY supported keep fits; load() truncates after.
 fn absolute_read_bound() -> u64 {
-    store_read_bound(MAX_KEEP)
+    let live = store_read_bound(MAX_KEEP);
+    live + live / 2 + MIN_TAIL_PAD as u64 + 2
 }
 
 /// Read at most `bound + 1` bytes (the +1 tells at-the-bound from past-it);
 /// bounding the READ, not just the parse, so no stray huge file is slurped.
-fn read_store_blob(path: &Path, bound: u64) -> std::io::Result<Vec<u8>> {
-    use std::io::Read as _;
-    let file = std::fs::File::open(path)?;
-    let mut bytes = Vec::new();
+fn read_store_blob(path: &Path, bound: u64, len_hint: u64) -> std::io::Result<Vec<u8>> {
+    let file = File::open(path)?;
+    let mut bytes = Vec::with_capacity(len_hint.min(bound.saturating_add(1)) as usize);
     file.take(bound.saturating_add(1)).read_to_end(&mut bytes)?;
     Ok(bytes)
 }
 
 impl HookLog {
-    /// Load the store at `path`, or start empty when it does not exist. A
-    /// corrupt (or past-the-ceiling) store degrades to empty: corruption
-    /// implies disk trouble (the write is atomic), and bricking the service
-    /// is worse than restarting the log — webhook senders re-deliver. Any
-    /// OTHER read error fails the load: the store may be intact behind it,
-    /// and an empty fallback would let the next append's rename destroy it.
-    /// The loaded store is re-truncated to `keep` — a lowered keep never
-    /// wipes the log.
+    /// Load the store at `path`, or start empty when absent. A corrupt or
+    /// past-the-ceiling store degrades to empty — except a torn window,
+    /// whose intact records recover. Other errors fail. Truncates to `keep`.
     pub fn load(path: PathBuf, keep: usize) -> std::io::Result<Self> {
         // keep arrives unvalidated on the hidden run-worker path; clamp so
         // retention can't write past the ceiling.
         let keep = keep.min(MAX_KEEP);
         let ceiling = absolute_read_bound();
-        // Past the ceiling by metadata: refuse without reading a giant.
-        let mut requests = if std::fs::metadata(&path).is_ok_and(|m| m.len() > ceiling) {
-            tracing::warn!(
-                path = %path.display(),
-                "hook request store is larger than the absolute read bound; starting a new one"
-            );
-            Vec::new()
-        } else {
-            match read_store_blob(&path, ceiling) {
-                // Grew between stat and read: same corrupt-store recovery.
-                Ok(bytes) if bytes.len() as u64 > ceiling => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        "hook request store is larger than the absolute read bound; starting a new one"
-                    );
-                    Vec::new()
-                }
-                // Fatter than the loading keep allows but under the ceiling:
-                // legitimate (written under a higher keep) — truncate below.
-                Ok(bytes) if !bytes.iter().all(u8::is_ascii_whitespace) => {
-                    match serde_json::from_slice::<Vec<RecordedRequest>>(&bytes) {
-                        Ok(parsed) => parsed,
-                        Err(e) => {
-                            tracing::warn!(%e, path = %path.display(), "hook request store is corrupt; starting a new one");
-                            Vec::new()
+        let mut window = None;
+        let mut requests = match std::fs::metadata(&path) {
+            // Past the ceiling by metadata: refuse without reading a giant.
+            Ok(m) if m.len() > ceiling => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "hook request store is larger than the absolute read bound; starting a new one"
+                );
+                Vec::new()
+            }
+            meta => {
+                let len_hint = meta.as_ref().map(std::fs::Metadata::len).unwrap_or(0);
+                match read_store_blob(&path, ceiling, len_hint) {
+                    // Grew between stat and read: same corrupt-store recovery.
+                    Ok(bytes) if bytes.len() as u64 > ceiling => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            "hook request store is larger than the absolute read bound; starting a new one"
+                        );
+                        Vec::new()
+                    }
+                    // Fatter than the loading keep allows but under the ceiling:
+                    // legitimate (written under a higher keep) — truncate below.
+                    Ok(bytes) if !bytes.iter().all(u8::is_ascii_whitespace) => {
+                        match serde_json::from_slice::<Vec<RecordedRequest>>(&bytes) {
+                            Ok(parsed) => {
+                                window = Window::scan(&bytes, &parsed, keep);
+                                parsed
+                            }
+                            Err(e) => match repair_torn_window(&bytes) {
+                                Some(recovered) => {
+                                    tracing::warn!(
+                                        %e,
+                                        path = %path.display(),
+                                        recovered = recovered.len(),
+                                        "hook request store is torn; recovering the intact records"
+                                    );
+                                    recovered
+                                }
+                                None => {
+                                    tracing::warn!(%e, path = %path.display(), "hook request store is corrupt; starting a new one");
+                                    Vec::new()
+                                }
+                            },
                         }
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                    Ok(_) => Vec::new(),
+                    Err(e) => return Err(e),
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-                Ok(_) => Vec::new(),
-                Err(e) => return Err(e),
             }
         };
+        requests.reverse();
         requests.sort_by_key(|r| std::cmp::Reverse(r.seq));
         requests.truncate(keep);
         // Saturate: `+ 1` at a hand-edited u64::MAX would panic in debug and
@@ -230,16 +250,75 @@ impl HookLog {
             path,
             keep,
             next_seq,
-            requests,
+            requests: requests.into(),
+            snapshot: None,
+            window,
         })
     }
 
-    /// Insert + persist: atomic tmp+rename with private perms (the store
-    /// carries request paths and bodies — the logs' 0600 class).
-    fn record(&mut self, req: RecordedRequest) -> std::io::Result<()> {
-        self.requests.insert(0, req);
-        self.requests.truncate(self.keep);
-        self.persist()
+    pub(crate) fn record(&mut self, req: RecordedRequest) -> std::io::Result<()> {
+        self.snapshot = None;
+        self.requests.push_front(req);
+        let bytes =
+            serde_json::to_vec(self.requests.front().expect("just pushed")).map_err(ser_io)?;
+        let fits = self.window.as_ref().is_some_and(|w| {
+            // Gates on bytes.len(), but a non-empty live region's framed
+            // write is comma+record (bytes.len()+1): exact fit leaves no pad before `]`.
+            w.file_len - 1 - w.live_end > bytes.len() as u64
+        });
+        if !fits {
+            while self.requests.len() > self.keep {
+                self.requests.pop_back();
+            }
+            return self.reserve();
+        }
+        let evict = self.requests.len() > self.keep;
+        let mut window = self.window.take().expect("fits implies a window");
+        let result = match OpenOptions::new().write(true).open(&self.path) {
+            Ok(mut file) => (|| {
+                append_at(&mut file, &mut window, &bytes)?;
+                if evict {
+                    let oldest = self.requests.pop_back().expect("evict implies an oldest");
+                    let oldest_bytes = serde_json::to_vec(&oldest).map_err(ser_io)?;
+                    evict_at(
+                        &mut file,
+                        &mut window,
+                        &oldest_bytes,
+                        !self.requests.is_empty(),
+                    )?;
+                }
+                Ok(())
+            })(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                while self.requests.len() > self.keep {
+                    self.requests.pop_back();
+                }
+                return self.reserve();
+            }
+            Err(e) => {
+                while self.requests.len() > self.keep {
+                    self.requests.pop_back();
+                }
+                self.window = None;
+                return Err(e);
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.window = Some(window);
+                Ok(())
+            }
+            Err(e) => {
+                self.window = None;
+                while self.requests.len() > self.keep {
+                    self.requests.pop_back();
+                }
+                match self.reserve() {
+                    Ok(()) => Ok(()),
+                    Err(_) => Err(e),
+                }
+            }
+        }
     }
 
     /// Saturates like load (see the comment there); at saturation duplicate
@@ -250,9 +329,17 @@ impl HookLog {
         seq
     }
 
+    fn snapshot_arc(&mut self) -> Arc<Vec<RecordedRequest>> {
+        Arc::clone(
+            self.snapshot
+                .get_or_insert_with(|| Arc::new(self.requests.iter().cloned().collect())),
+        )
+    }
+
     /// Point-in-time copy, bounded by `keep` × the body cap.
-    fn snapshot(&self) -> Vec<RecordedRequest> {
-        self.requests.clone()
+    #[cfg(test)]
+    fn snapshot(&mut self) -> Vec<RecordedRequest> {
+        self.requests.iter().cloned().collect()
     }
 
     #[cfg(test)]
@@ -260,9 +347,20 @@ impl HookLog {
         self.requests.len()
     }
 
-    fn persist(&self) -> std::io::Result<()> {
-        let data = serde_json::to_vec(&self.requests)
-            .map_err(|e| std::io::Error::other(format!("serializing the request store: {e}")))?;
+    fn reserve(&mut self) -> std::io::Result<()> {
+        let mut data = Vec::with_capacity(self.requests.len() * 256 + MIN_TAIL_PAD + 2);
+        data.push(b'[');
+        for record in self.requests.iter().rev() {
+            if data.len() > 1 {
+                data.push(b',');
+            }
+            let bytes = serde_json::to_vec(record).map_err(ser_io)?;
+            data.extend_from_slice(&bytes);
+        }
+        let live_end = data.len() as u64;
+        let pad = (live_end / 2).max(MIN_TAIL_PAD as u64);
+        data.resize(data.len() + pad as usize, b' ');
+        data.push(b']');
         let tmp = self.path.with_extension("json.tmp");
         {
             let mut opts = OpenOptions::new();
@@ -271,8 +369,238 @@ impl HookLog {
             let mut file = opts.open(&tmp)?;
             file.write_all(&data)?;
         }
-        std::fs::rename(&tmp, &self.path)
+        std::fs::rename(&tmp, &self.path)?;
+        self.window = Some(Window {
+            live_start: 1,
+            live_end,
+            file_len: data.len() as u64,
+        });
+        Ok(())
     }
+}
+
+impl Window {
+    fn scan(bytes: &[u8], parsed: &[RecordedRequest], keep: usize) -> Option<Self> {
+        if parsed.len() > keep
+            || parsed.windows(2).any(|pair| pair[0].seq > pair[1].seq)
+            || bytes.first() != Some(&b'[')
+            || bytes.last() != Some(&b']')
+        {
+            return None;
+        }
+        let interior = &bytes[1..bytes.len() - 1];
+        let live_start = interior
+            .iter()
+            .position(|b| !b.is_ascii_whitespace())
+            .map_or(1, |i| 1 + i as u64);
+        let live_end = interior
+            .iter()
+            .rposition(|b| !b.is_ascii_whitespace())
+            .map_or(live_start, |i| 2 + i as u64);
+        let mut cursor = live_start;
+        for (i, record) in parsed.iter().enumerate() {
+            let ser = serde_json::to_vec(record).ok()?;
+            cursor += ser.len() as u64 + u64::from(i > 0);
+        }
+        (cursor == live_end).then_some(Self {
+            live_start,
+            live_end,
+            file_len: bytes.len() as u64,
+        })
+    }
+}
+
+fn ser_io(e: serde_json::Error) -> std::io::Error {
+    std::io::Error::other(format!("serializing a recorded request: {e}"))
+}
+
+fn repair_torn_window(bytes: &[u8]) -> Option<Vec<RecordedRequest>> {
+    if bytes.first() != Some(&b'[') || bytes.last() != Some(&b']') {
+        return None;
+    }
+    if !bytes[bytes.len() - 2].is_ascii_whitespace() {
+        return None;
+    }
+    let interior = &bytes[1..bytes.len() - 1];
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut stray_comma: Option<usize> = None;
+    let mut misfits: Vec<usize> = Vec::new();
+    let mut expect_separator = false;
+    let mut i = 0;
+    while i < interior.len() {
+        while i < interior.len() && interior[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= interior.len() {
+            break;
+        }
+        match (interior[i], expect_separator) {
+            (b',', _) => {
+                if expect_separator {
+                    expect_separator = false;
+                } else if stray_comma.replace(i).is_some() {
+                    return None;
+                }
+                i += 1;
+            }
+            _ => {
+                if expect_separator {
+                    misfits.push(i);
+                }
+                match scan_value(interior, i) {
+                    Some(end) => {
+                        ranges.push(i..end);
+                        i = end;
+                        expect_separator = true;
+                    }
+                    None if interior[i] == b'{' => i = interior.len(),
+                    None => return None,
+                }
+            }
+        }
+    }
+    let mut records = Vec::with_capacity(ranges.len());
+    let mut first_good = interior.len();
+    for range in &ranges {
+        match serde_json::from_slice::<RecordedRequest>(&interior[range.clone()]) {
+            Ok(record) => {
+                if records.is_empty() {
+                    first_good = range.start;
+                }
+                records.push(record);
+            }
+            Err(_) if records.is_empty() => continue,
+            Err(_) => return None,
+        }
+    }
+    if stray_comma.is_some_and(|pos| pos >= first_good) {
+        return None;
+    }
+    if misfits.iter().any(|&pos| pos >= first_good) {
+        return None;
+    }
+    let head = interior[..first_good].trim_ascii();
+    let Some(remnant) = head.strip_suffix(b",") else {
+        return (head.is_empty()).then_some(records);
+    };
+    (remnant.is_empty()
+        || (RECORD_TAILS.iter().any(|t| remnant.ends_with(t))
+            || RECORD_TAIL_FIELDS.iter().any(|f| f.ends_with(remnant)))
+            && [false, true]
+                .iter()
+                .any(|&phase| bracket_balance(remnant, phase) <= -1))
+    .then_some(records)
+}
+
+const RECORD_TAILS: [&[u8]; 2] = [b",\"truncated\":true}", b",\"truncated\":false}"];
+const RECORD_TAIL_FIELDS: [&[u8]; 2] = [b"\"truncated\":true}", b"\"truncated\":false}"];
+
+fn bracket_balance(bytes: &[u8], start_in_string: bool) -> i32 {
+    let mut balance = 0i32;
+    let mut in_string = start_in_string;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if b == b'\\' {
+                i += 1;
+            } else if b == b'"' {
+                in_string = false;
+            }
+        } else {
+            match b {
+                b'"' => in_string = true,
+                b'{' | b'[' => balance += 1,
+                b'}' | b']' => balance -= 1,
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    balance
+}
+
+fn scan_value(bytes: &[u8], start: usize) -> Option<usize> {
+    let end = bytes.len();
+    match bytes[start] {
+        b'"' => {
+            let mut i = start + 1;
+            while i < end {
+                match bytes[i] {
+                    b'\\' => i += 2,
+                    b'"' => return Some(i + 1),
+                    _ => i += 1,
+                }
+            }
+            None
+        }
+        b'{' | b'[' => {
+            let mut depth = 0usize;
+            let mut in_string = false;
+            let mut i = start;
+            while i < end {
+                let b = bytes[i];
+                if in_string {
+                    if b == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b == b'"' {
+                        in_string = false;
+                    }
+                } else {
+                    match b {
+                        b'"' => in_string = true,
+                        b'{' | b'[' => depth += 1,
+                        b'}' | b']' => {
+                            depth = depth.checked_sub(1)?;
+                            if depth == 0 {
+                                return Some(i + 1);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                i += 1;
+            }
+            None
+        }
+        _ => {
+            let mut i = start;
+            while i < end && !(bytes[i] == b',' || bytes[i].is_ascii_whitespace()) {
+                i += 1;
+            }
+            Some(i)
+        }
+    }
+}
+
+fn write_at(file: &mut File, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(bytes)
+}
+
+fn append_at(file: &mut File, window: &mut Window, bytes: &[u8]) -> std::io::Result<()> {
+    let mut framed = Vec::with_capacity(bytes.len() + 1);
+    if window.live_start != window.live_end {
+        framed.push(b',');
+    }
+    framed.extend_from_slice(bytes);
+    write_at(file, window.live_end, &framed)?;
+    window.live_end += framed.len() as u64;
+    Ok(())
+}
+
+fn evict_at(
+    file: &mut File,
+    window: &mut Window,
+    oldest: &[u8],
+    more_remain: bool,
+) -> std::io::Result<()> {
+    let len = oldest.len() + usize::from(more_remain);
+    write_at(file, window.live_start, &vec![b' '; len])?;
+    window.live_start += len as u64;
+    Ok(())
 }
 
 /// Recover from poisoning: in-memory state stays valid across a panic
@@ -319,11 +647,12 @@ async fn record(State(log): State<Arc<Mutex<HookLog>>>, request: Request) -> Res
                 .into_response();
         }
     };
+    let received_at = crate::model::now_utc();
     // Blocking fs work off the async threads (request-path discipline).
     let persisted = tokio::task::spawn_blocking(move || {
         let mut log = lock(&log);
         let seq = log.next_seq();
-        let record = RecordedRequest::capture(seq, &parts, &bytes);
+        let record = RecordedRequest::capture(seq, received_at, &parts, &bytes);
         log.record(record)
     })
     .await;
@@ -348,18 +677,19 @@ async fn record(State(log): State<Arc<Mutex<HookLog>>>, request: Request) -> Res
     }
 }
 
-/// Snapshot off the async thread: the record path holds this lock across
-/// persist's write, so an async-side lock() could park a tokio worker.
-async fn snapshot_offline(log: &Arc<Mutex<HookLog>>) -> Vec<RecordedRequest> {
+async fn snapshot_offline(log: &Arc<Mutex<HookLog>>) -> Arc<Vec<RecordedRequest>> {
     let log = Arc::clone(log);
-    tokio::task::spawn_blocking(move || lock(&log).snapshot())
+    tokio::task::spawn_blocking(move || lock(&log).snapshot_arc())
         .await
         .unwrap_or_default()
 }
 
 async fn inspect_html(State(log): State<Arc<Mutex<HookLog>>>) -> Html<String> {
     let requests = snapshot_offline(&log).await;
-    Html(render_inspection(&requests))
+    let html = tokio::task::spawn_blocking(move || render_inspection(&requests))
+        .await
+        .unwrap_or_default();
+    Html(html)
 }
 
 /// Every request-derived string passes through [`escape_html`] — webhook
@@ -401,8 +731,36 @@ fn render_inspection(requests: &[RecordedRequest]) -> String {
     html_page(&escape_html(&title), &body)
 }
 
-async fn inspect_json(State(log): State<Arc<Mutex<HookLog>>>) -> Json<Vec<RecordedRequest>> {
-    Json(snapshot_offline(&log).await)
+async fn inspect_json(State(log): State<Arc<Mutex<HookLog>>>) -> Response {
+    let requests = snapshot_offline(&log).await;
+    let body =
+        tokio::task::spawn_blocking(move || serde_json::to_vec(&*requests).map_err(ser_io)).await;
+    match body {
+        Ok(Ok(bytes)) => (
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )],
+            bytes,
+        )
+            .into_response(),
+        Ok(Err(e)) => {
+            tracing::error!(%e, "failed to serialize the inspection view");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to serialize the inspection view\n",
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(%e, "inspection view task panicked");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to render the inspection view\n",
+            )
+                .into_response()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -429,6 +787,10 @@ mod tests {
             .to_vec()
     }
 
+    fn recv_stamp() -> DateTime<Utc> {
+        crate::model::now_utc()
+    }
+
     /// Build a `Parts` head for [`RecordedRequest::capture`] without a full
     /// request round-trip.
     fn parts(method: &str, uri: &str, headers: &[(&str, &str)]) -> Parts {
@@ -450,7 +812,7 @@ mod tests {
                 ("user-agent", "GitHub-Hookshot/abc"),
             ],
         );
-        let r = RecordedRequest::capture(7, &head, b"{\"a\":1}");
+        let r = RecordedRequest::capture(7, recv_stamp(), &head, b"{\"a\":1}");
         assert_eq!(r.seq, 7);
         assert_eq!(r.method, "POST");
         assert_eq!(r.path, "/hooks/github");
@@ -481,7 +843,7 @@ mod tests {
                 ("content-type", "text/plain"),
             ],
         );
-        let r = RecordedRequest::capture(1, &head, b"");
+        let r = RecordedRequest::capture(1, recv_stamp(), &head, b"");
         assert_eq!(
             r.headers,
             vec![("content-type".to_string(), "text/plain".to_string())],
@@ -496,7 +858,7 @@ mod tests {
         // over HTTP.
         let big = vec![b'x'; MAX_REQUEST_BODY + 1234];
         let head = parts("POST", "/x", &[]);
-        let r = RecordedRequest::capture(1, &head, &big);
+        let r = RecordedRequest::capture(1, recv_stamp(), &head, &big);
         assert_eq!(r.body_len, MAX_REQUEST_BODY + 1234);
         assert_eq!(r.body.len(), MAX_REQUEST_BODY);
         assert!(r.truncated);
@@ -506,12 +868,53 @@ mod tests {
     fn capture_preserves_non_utf8_bodies_lossily() {
         let head = parts("POST", "/x", &[]);
         let binary = [0xff, 0xfe, b'a', b'b'];
-        let r = RecordedRequest::capture(1, &head, &binary);
+        let r = RecordedRequest::capture(1, recv_stamp(), &head, &binary);
         assert_eq!(r.body_len, 4);
         assert!(
             r.body.contains('\u{FFFD}'),
             "lossy decode expected: {:?}",
             r.body
+        );
+    }
+
+    /// [`HYPER_HEAD_BUDGET`] mirrors hyper-1.10.1's DEFAULT_MAX_BUFFER_SIZE
+    /// (src/proto/h1/io.rs: 8 KiB + 4 KiB × 100, from DEFAULT_MAX_HEADERS =
+    /// 100); drifting low makes load() wipe legitimate stores as oversized.
+    #[test]
+    fn hyper_head_budget_is_pinned_to_hyper_1_10_wire_defaults() {
+        let recomputed = 8 * 1024 + 4 * 1024 * 100;
+        assert_eq!(
+            HYPER_HEAD_BUDGET, recomputed,
+            "HYPER_HEAD_BUDGET must equal hyper's DEFAULT_MAX_BUFFER_SIZE"
+        );
+        assert_eq!(
+            STORE_RECORD_OVERHEAD,
+            HYPER_HEAD_BUDGET * 2 + 2 * 1024,
+            "the per-record allowance must inherit the head pin"
+        );
+        let worst_case_file = store_read_bound(MAX_KEEP) * 3 / 2 + MIN_TAIL_PAD as u64 + 2;
+        assert!(
+            absolute_read_bound() >= worst_case_file,
+            "the read bound must cover the padded journal a full store produces"
+        );
+    }
+
+    #[test]
+    fn read_store_blob_reads_a_fixture_exactly_at_the_bound_in_full() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bound: u64 = 1024;
+        let at_path = tmp.path().join("at.json");
+        std::fs::write(&at_path, vec![b' '; bound as usize]).expect("at-bound fixture");
+        let at =
+            read_store_blob(&at_path, bound, bound).expect("an at-bound fixture must read in full");
+        assert_eq!(at.len() as u64, bound, "the bound itself is not a refusal");
+        let past_path = tmp.path().join("past.json");
+        std::fs::write(&past_path, vec![b' '; bound as usize + 1]).expect("past-bound fixture");
+        let past = read_store_blob(&past_path, bound, bound + 1).expect("read");
+        assert_eq!(
+            past.len() as u64,
+            bound + 1,
+            "the +1 slack must surface a past-bound fixture as over the bound"
         );
     }
 
@@ -522,14 +925,14 @@ mod tests {
         let mut log = HookLog::load(path.clone(), 3).expect("load");
         for seq in 1..=5u64 {
             let head = parts("GET", &format!("/{seq}"), &[]);
-            let record = RecordedRequest::capture(seq, &head, b"");
+            let record = RecordedRequest::capture(seq, recv_stamp(), &head, b"");
             log.record(record).expect("record");
         }
         assert_eq!(log.len(), 3);
         let snap = log.snapshot();
         let seqs: Vec<u64> = snap.iter().map(|r| r.seq).collect();
         assert_eq!(seqs, vec![5, 4, 3], "newest first, oldest evicted");
-        let reloaded = HookLog::load(path, 3).expect("reload");
+        let mut reloaded = HookLog::load(path, 3).expect("reload");
         assert_eq!(reloaded.snapshot(), snap);
     }
 
@@ -540,7 +943,7 @@ mod tests {
         {
             let mut log = HookLog::load(path.clone(), 10).expect("load");
             let head = parts("POST", "/first", &[]);
-            log.record(RecordedRequest::capture(1, &head, b"one"))
+            log.record(RecordedRequest::capture(1, recv_stamp(), &head, b"one"))
                 .expect("record");
         }
         let mut log = HookLog::load(path, 10).expect("reload");
@@ -548,7 +951,7 @@ mod tests {
         assert_eq!(log.snapshot()[0].path, "/first");
         let seq = log.next_seq();
         let head = parts("POST", "/second", &[]);
-        log.record(RecordedRequest::capture(seq, &head, b"two"))
+        log.record(RecordedRequest::capture(seq, recv_stamp(), &head, b"two"))
             .expect("record");
         let snap = log.snapshot();
         assert_eq!(snap.len(), 2);
@@ -563,8 +966,13 @@ mod tests {
         {
             let mut log = HookLog::load(path.clone(), 5).expect("seed load");
             let head = parts("POST", "/seed", &[]);
-            log.record(RecordedRequest::capture(u64::MAX, &head, b"seed"))
-                .expect("seed record");
+            log.record(RecordedRequest::capture(
+                u64::MAX,
+                recv_stamp(),
+                &head,
+                b"seed",
+            ))
+            .expect("seed record");
         }
         let mut log = HookLog::load(path.clone(), 5).expect("reload at MAX seq");
         assert_eq!(
@@ -579,10 +987,10 @@ mod tests {
             "next_seq saturates at u64::MAX instead of overflowing"
         );
         let head = parts("POST", "/after", &[]);
-        log.record(RecordedRequest::capture(seq, &head, b"after"))
+        log.record(RecordedRequest::capture(seq, recv_stamp(), &head, b"after"))
             .expect("record at MAX seq");
         assert_eq!(log.len(), 2);
-        let reloaded = HookLog::load(path, 5).expect("reload after the append");
+        let mut reloaded = HookLog::load(path, 5).expect("reload after the append");
         let paths: Vec<String> = reloaded.snapshot().into_iter().map(|r| r.path).collect();
         assert_eq!(paths, vec!["/after", "/seed"]);
     }
@@ -611,7 +1019,7 @@ mod tests {
             for seq in 1..=5u64 {
                 let head = parts("POST", &format!("/{seq}"), &[]);
                 let body = vec![0u8; MAX_REQUEST_BODY];
-                log.record(RecordedRequest::capture(seq, &head, &body))
+                log.record(RecordedRequest::capture(seq, recv_stamp(), &head, &body))
                     .expect("record");
             }
         }
@@ -624,7 +1032,7 @@ mod tests {
             persisted_len <= absolute_read_bound(),
             "the fixture must sit inside the absolute ceiling"
         );
-        let reloaded = HookLog::load(path, 1).expect("reload with a lowered keep");
+        let mut reloaded = HookLog::load(path, 1).expect("reload with a lowered keep");
         let snap = reloaded.snapshot();
         assert_eq!(snap.len(), 1, "load-and-truncate, not wipe");
         assert_eq!(snap[0].seq, 5, "the NEWEST record survives the truncation");
@@ -643,10 +1051,10 @@ mod tests {
         );
         for seq in 1..=3u64 {
             let head = parts("POST", &format!("/{seq}"), &[]);
-            log.record(RecordedRequest::capture(seq, &head, b"x"))
+            log.record(RecordedRequest::capture(seq, recv_stamp(), &head, b"x"))
                 .expect("record");
         }
-        let reloaded = HookLog::load(path, over_max).expect("reload");
+        let mut reloaded = HookLog::load(path, over_max).expect("reload");
         assert_eq!(reloaded.keep, MAX_KEEP, "the clamp holds across reloads");
         assert_eq!(reloaded.snapshot().len(), 3, "records survive the reload");
     }
@@ -659,7 +1067,7 @@ mod tests {
             let mut log = HookLog::load(path.clone(), 1).expect("load");
             let head = parts("POST", "/nul", &[]);
             let body = vec![0u8; MAX_REQUEST_BODY];
-            log.record(RecordedRequest::capture(1, &head, &body))
+            log.record(RecordedRequest::capture(1, recv_stamp(), &head, &body))
                 .expect("record");
         }
         let persisted_len = std::fs::metadata(&path).expect("store exists").len();
@@ -671,7 +1079,7 @@ mod tests {
             persisted_len <= store_read_bound(1),
             "the fixture must sit inside the escape-aware bound"
         );
-        let reloaded = HookLog::load(path, 1).expect("reload");
+        let mut reloaded = HookLog::load(path, 1).expect("reload");
         let snap = reloaded.snapshot();
         assert_eq!(snap.len(), 1, "a legitimate store must survive reload");
         assert_eq!(snap[0].body.len(), MAX_REQUEST_BODY);
@@ -690,7 +1098,7 @@ mod tests {
         {
             let mut log = HookLog::load(path.clone(), 1).expect("load");
             let body = vec![0u8; MAX_REQUEST_BODY];
-            log.record(RecordedRequest::capture(1, &head, &body))
+            log.record(RecordedRequest::capture(1, recv_stamp(), &head, &body))
                 .expect("record");
         }
         let persisted_len = std::fs::metadata(&path).expect("store exists").len();
@@ -703,7 +1111,7 @@ mod tests {
             persisted_len <= store_read_bound(1),
             "the fixture must sit inside the head-budget-aware bound"
         );
-        let reloaded = HookLog::load(path, 1).expect("reload");
+        let mut reloaded = HookLog::load(path, 1).expect("reload");
         let snap = reloaded.snapshot();
         assert_eq!(snap.len(), 1, "a legitimate store must survive reload");
         assert_eq!(snap[0].body.len(), MAX_REQUEST_BODY);
@@ -769,7 +1177,7 @@ mod tests {
 
         let mut log = HookLog::load(path.clone(), 5).expect("load");
         let head = parts("GET", "/x", &[]);
-        log.record(RecordedRequest::capture(1, &head, b""))
+        log.record(RecordedRequest::capture(1, recv_stamp(), &head, b""))
             .expect("record");
 
         let mode = std::fs::metadata(&path)
@@ -777,6 +1185,385 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600, "store must be owner-only");
+    }
+
+    #[test]
+    fn many_records_keep_the_window_truthful_across_rewrites() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("requests.json");
+        let mut log = HookLog::load(path.clone(), 7).expect("load");
+        for seq in 1..=2_000u64 {
+            let head = parts("POST", &format!("/{seq}"), &[]);
+            log.record(RecordedRequest::capture(seq, recv_stamp(), &head, b"pay"))
+                .expect("record");
+        }
+        assert_eq!(log.len(), 7);
+        let snap = log.snapshot();
+        let seqs: Vec<u64> = snap.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, vec![2_000, 1_999, 1_998, 1_997, 1_996, 1_995, 1_994]);
+        let mut reloaded = HookLog::load(path, 7).expect("reload after the long run");
+        assert_eq!(reloaded.snapshot(), snap, "the window must land intact");
+    }
+
+    #[test]
+    fn a_legacy_newest_first_store_loads_and_is_normalized_on_the_next_record() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("requests.json");
+        let legacy = vec![
+            RecordedRequest::capture(2, recv_stamp(), &parts("POST", "/new", &[]), b""),
+            RecordedRequest::capture(1, recv_stamp(), &parts("POST", "/old", &[]), b""),
+        ];
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&legacy).expect("serialize legacy"),
+        )
+        .expect("plant legacy store");
+
+        let mut log = HookLog::load(path.clone(), 5).expect("load");
+        let seqs: Vec<u64> = log.snapshot().iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, vec![2, 1], "legacy records load newest-first");
+
+        let head = parts("POST", "/after", &[]);
+        log.record(RecordedRequest::capture(3, recv_stamp(), &head, b"x"))
+            .expect("record");
+        let mut reloaded = HookLog::load(path.clone(), 5).expect("reload");
+        let paths: Vec<String> = reloaded.snapshot().into_iter().map(|r| r.path).collect();
+        assert_eq!(paths, vec!["/after", "/new", "/old"]);
+        let on_disk: Vec<RecordedRequest> =
+            serde_json::from_slice(&std::fs::read(&path).expect("read the store"))
+                .expect("the store file stays a JSON array");
+        assert_eq!(on_disk.len(), 3);
+    }
+
+    #[test]
+    fn a_torn_append_keeps_the_intact_records_on_reload() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("requests.json");
+        let rec1 = RecordedRequest::capture(1, recv_stamp(), &parts("POST", "/one", &[]), b"one");
+        let rec2 = RecordedRequest::capture(2, recv_stamp(), &parts("POST", "/two", &[]), b"two");
+        let mut torn = Vec::new();
+        torn.push(b'[');
+        torn.extend(serde_json::to_vec(&rec1).expect("serialize"));
+        torn.push(b',');
+        torn.extend(serde_json::to_vec(&rec2).expect("serialize"));
+        torn.push(b',');
+        torn.extend(br#"{"seq":3,"path":"/thre"#);
+        torn.extend_from_slice(b"      ");
+        torn.push(b']');
+        std::fs::write(&path, &torn).expect("plant torn store");
+
+        let mut log = HookLog::load(path.clone(), 5).expect("reload");
+        let snap = log.snapshot();
+        assert_eq!(snap.len(), 2, "the intact records survive the torn edge");
+        assert_eq!(snap[0].path, "/two", "newest first as always");
+        let head = parts("POST", "/after", &[]);
+        log.record(RecordedRequest::capture(3, recv_stamp(), &head, b"x"))
+            .expect("record");
+        let mut reloaded = HookLog::load(path, 5).expect("reload after recovery");
+        let paths: Vec<String> = reloaded.snapshot().into_iter().map(|r| r.path).collect();
+        assert_eq!(paths, vec!["/after", "/two", "/one"]);
+    }
+
+    #[test]
+    fn a_torn_evict_keeps_the_records_behind_it_on_reload() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("requests.json");
+        let rec1 = RecordedRequest::capture(1, recv_stamp(), &parts("POST", "/old", &[]), b"");
+        let rec2 = RecordedRequest::capture(2, recv_stamp(), &parts("POST", "/new", &[]), b"");
+        let ser1 = serde_json::to_vec(&rec1).expect("serialize");
+        let mut torn = Vec::new();
+        torn.push(b'[');
+        torn.extend_from_slice(b"   ");
+        torn.extend_from_slice(&ser1[ser1.len() / 2..]);
+        torn.push(b',');
+        torn.extend(serde_json::to_vec(&rec2).expect("serialize"));
+        torn.extend_from_slice(b"    ");
+        torn.push(b']');
+        std::fs::write(&path, &torn).expect("plant torn store");
+
+        let mut log = HookLog::load(path.clone(), 5).expect("reload");
+        let snap = log.snapshot();
+        assert_eq!(snap.len(), 1, "the records behind the torn edge survive");
+        assert_eq!(snap[0].path, "/new");
+
+        let mut torn = Vec::new();
+        torn.push(b'[');
+        torn.extend_from_slice(b" , ");
+        torn.extend(serde_json::to_vec(&rec2).expect("serialize"));
+        torn.extend_from_slice(b"  ");
+        torn.push(b']');
+        std::fs::write(&path, &torn).expect("plant separator-only torn store");
+        let mut log = HookLog::load(path, 5).expect("reload");
+        assert_eq!(log.snapshot().len(), 1);
+        assert_eq!(log.snapshot()[0].path, "/new");
+    }
+
+    #[test]
+    fn foreign_damage_between_good_records_still_wipes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("requests.json");
+        let rec1 = RecordedRequest::capture(1, recv_stamp(), &parts("POST", "/one", &[]), b"");
+        let rec2 = RecordedRequest::capture(2, recv_stamp(), &parts("POST", "/two", &[]), b"");
+        let ser1 = serde_json::to_vec(&rec1).expect("serialize");
+        let ser2 = serde_json::to_vec(&rec2).expect("serialize");
+        let probes: [(&str, Vec<u8>); 6] = [
+            ("leading number", {
+                let mut f = Vec::new();
+                f.push(b'[');
+                f.extend_from_slice(b"42,");
+                f.extend_from_slice(&ser1);
+                f.push(b',');
+                f.extend_from_slice(&ser2);
+                f.push(b']');
+                f
+            }),
+            ("leading object", {
+                let mut f = Vec::new();
+                f.push(b'[');
+                f.extend_from_slice(b"{\"evil\":true},");
+                f.extend_from_slice(&ser1);
+                f.push(b']');
+                f
+            }),
+            ("separator between", {
+                let mut f = Vec::new();
+                f.push(b'[');
+                f.extend_from_slice(&ser1);
+                f.extend_from_slice(b", ,");
+                f.extend_from_slice(&ser2);
+                f.push(b']');
+                f
+            }),
+            ("junk between", {
+                let mut f = Vec::new();
+                f.push(b'[');
+                f.extend_from_slice(&ser1);
+                f.push(b',');
+                f.extend_from_slice(b"42");
+                f.push(b',');
+                f.extend_from_slice(&ser2);
+                f.push(b']');
+                f
+            }),
+            ("comma with no pad before the bracket", {
+                let mut f = Vec::new();
+                f.push(b'[');
+                f.extend_from_slice(&ser1);
+                f.push(b',');
+                f.push(b']');
+                f
+            }),
+            ("non-object torn tail", {
+                let mut f = Vec::new();
+                f.push(b'[');
+                f.extend_from_slice(&ser1);
+                f.extend_from_slice(b",\"abc   ");
+                f.push(b']');
+                f
+            }),
+        ];
+        for (label, file) in probes {
+            std::fs::write(&path, &file).expect("plant damaged store");
+            let log = HookLog::load(path.clone(), 5).expect("reload");
+            assert_eq!(
+                log.len(),
+                0,
+                "{label}: foreign damage must wipe, not recover"
+            );
+        }
+    }
+
+    #[test]
+    fn torn_edges_recover_for_brace_heavy_json_bodies() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("requests.json");
+        let body = br#"{"ok":true,"deep":{"x":1}}"#;
+        let rec1 = RecordedRequest::capture(1, recv_stamp(), &parts("POST", "/hook", &[]), body);
+        let rec2 = RecordedRequest::capture(2, recv_stamp(), &parts("POST", "/hook", &[]), body);
+        let ser1 = serde_json::to_vec(&rec1).expect("serialize");
+        let ser2 = serde_json::to_vec(&rec2).expect("serialize");
+        assert!(
+            ser1.iter().filter(|&&b| b == b'{').count() > 2,
+            "the fixture's serialization must carry body braces"
+        );
+
+        for k in [1usize, 10, 44, 88, ser1.len() / 2, ser1.len() - 24] {
+            let mut torn = Vec::new();
+            torn.push(b'[');
+            torn.extend(std::iter::repeat_n(b' ', k));
+            torn.extend_from_slice(&ser1[k..]);
+            torn.push(b',');
+            torn.extend_from_slice(&ser2);
+            torn.extend_from_slice(b"    ");
+            torn.push(b']');
+            std::fs::write(&path, &torn).expect("plant torn store");
+            let mut log = HookLog::load(path.clone(), 5).expect("reload");
+            let snap = log.snapshot();
+            assert_eq!(
+                snap.len(),
+                1,
+                "whitening offset {k} must recover the survivor"
+            );
+            assert_eq!(snap[0].path, "/hook");
+            assert_eq!(snap[0].body.as_bytes(), body);
+            let head = parts("POST", "/after", &[]);
+            log.record(RecordedRequest::capture(3, recv_stamp(), &head, b"x"))
+                .expect("record");
+            let reloaded = HookLog::load(path.clone(), 5).expect("reload");
+            assert_eq!(reloaded.len(), 2, "recovered store still records");
+        }
+
+        let mut torn = Vec::new();
+        torn.push(b'[');
+        torn.extend_from_slice(&ser1);
+        torn.push(b',');
+        torn.extend(br#"{"seq":2,"body":"{"ok""#);
+        torn.extend_from_slice(b"   ");
+        torn.push(b']');
+        std::fs::write(&path, &torn).expect("plant torn store");
+        let mut log = HookLog::load(path.clone(), 5).expect("reload");
+        assert_eq!(log.len(), 1, "the intact record survives the torn append");
+        assert_eq!(log.snapshot()[0].seq, 1);
+    }
+
+    #[test]
+    fn record_recreates_an_externally_deleted_store_in_the_same_delivery() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("requests.json");
+        let mut log = HookLog::load(path.clone(), 5).expect("load");
+        let head = parts("POST", "/first", &[]);
+        log.record(RecordedRequest::capture(1, recv_stamp(), &head, b"one"))
+            .expect("record");
+        std::fs::remove_file(&path).expect("delete the store under a live window");
+
+        let head = parts("POST", "/second", &[]);
+        log.record(RecordedRequest::capture(2, recv_stamp(), &head, b"two"))
+            .expect("record must recreate the store, not 500 once");
+        assert!(path.exists(), "the store is back in THIS delivery");
+        let mut reloaded = HookLog::load(path, 5).expect("reload");
+        let paths: Vec<String> = reloaded.snapshot().into_iter().map(|r| r.path).collect();
+        assert_eq!(paths, vec!["/second", "/first"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn record_heals_a_torn_in_place_write_in_the_same_delivery() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("requests.json");
+        let mut log = HookLog::load(path.clone(), 5).expect("load");
+        let head = parts("POST", "/first", &[]);
+        log.record(RecordedRequest::capture(1, recv_stamp(), &head, b"one"))
+            .expect("record");
+        std::fs::remove_file(&path).expect("remove the real store");
+        std::os::unix::fs::symlink("/dev/full", &path).expect("plant a failing store");
+
+        let head = parts("POST", "/second", &[]);
+        log.record(RecordedRequest::capture(2, recv_stamp(), &head, b"two"))
+            .expect("the healing rewrite must land the record");
+
+        assert!(path.is_file(), "the rewrite replaced the failing device");
+        let mut reloaded = HookLog::load(path, 5).expect("reload");
+        let paths: Vec<String> = reloaded.snapshot().into_iter().map(|r| r.path).collect();
+        assert_eq!(paths, vec!["/second", "/first"]);
+    }
+
+    #[test]
+    fn a_transient_open_failure_keeps_the_view_capped_at_keep() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("requests.json");
+        let mut log = HookLog::load(path.clone(), 2).expect("load");
+        for (seq, tag) in [(1u64, "/a"), (2, "/b")] {
+            let head = parts("POST", tag, &[]);
+            log.record(RecordedRequest::capture(seq, recv_stamp(), &head, b"x"))
+                .expect("record");
+        }
+        std::fs::remove_file(&path).expect("remove the store");
+        std::fs::create_dir(&path).expect("plant an EISDIR failure");
+        let head = parts("POST", "/c", &[]);
+        let failed = log.record(RecordedRequest::capture(3, recv_stamp(), &head, b"x"));
+        assert!(failed.is_err(), "the EISDIR delivery must fail");
+        let view = log.snapshot_arc();
+        assert_eq!(
+            view.len(),
+            2,
+            "the inspection view must stay capped at keep after a failed delivery"
+        );
+        let paths: Vec<&str> = view.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["/c", "/b"],
+            "the failed delivery still replaces the oldest record"
+        );
+
+        std::fs::remove_dir(&path).expect("clear the obstruction");
+        let head = parts("POST", "/d", &[]);
+        log.record(RecordedRequest::capture(4, recv_stamp(), &head, b"x"))
+            .expect("record");
+        assert_eq!(log.snapshot_arc().len(), 2);
+        let mut reloaded = HookLog::load(path.clone(), 2).expect("reload");
+        let paths: Vec<String> = reloaded.snapshot().into_iter().map(|r| r.path).collect();
+        assert_eq!(paths, vec!["/d", "/c"], "exactly keep records survive");
+        drop(reloaded);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+                .expect("chmod 000");
+            let head = parts("POST", "/e", &[]);
+            let failed = log.record(RecordedRequest::capture(5, recv_stamp(), &head, b"x"));
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod 600 back");
+            if failed.is_err() {
+                assert_eq!(log.snapshot_arc().len(), 2, "view still capped at keep");
+                let head = parts("POST", "/f", &[]);
+                log.record(RecordedRequest::capture(6, recv_stamp(), &head, b"x"))
+                    .expect("the post-failure delivery must succeed");
+                let mut reloaded = HookLog::load(path, 2).expect("reload");
+                let paths: Vec<String> = reloaded.snapshot().into_iter().map(|r| r.path).collect();
+                assert_eq!(
+                    paths,
+                    vec!["/f", "/e"],
+                    "exactly keep records, disk converged with memory"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn remnants_cut_inside_the_trailing_field_recover_by_suffix() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("requests.json");
+        let rec = RecordedRequest::capture(2, recv_stamp(), &parts("POST", "/new", &[]), b"");
+        let ser = serde_json::to_vec(&rec).expect("serialize");
+        for (remnant, label) in [
+            (&b":false}"[..], "cut mid-field"),
+            (&b"se}"[..], "short suffix"),
+            (&b"}"[..], "lone closing brace"),
+        ] {
+            let mut torn = Vec::new();
+            torn.push(b'[');
+            torn.extend_from_slice(b"  ");
+            torn.extend_from_slice(remnant);
+            torn.push(b',');
+            torn.extend_from_slice(&ser);
+            torn.extend_from_slice(b"   ");
+            torn.push(b']');
+            std::fs::write(&path, &torn).expect("plant torn store");
+            let mut log = HookLog::load(path.clone(), 5).expect("reload");
+            let snap = log.snapshot();
+            assert_eq!(snap.len(), 1, "{label}: a field suffix must recover");
+            assert_eq!(snap[0].path, "/new");
+        }
+        let mut torn = Vec::new();
+        torn.push(b'[');
+        torn.extend_from_slice(b"  x},");
+        torn.extend_from_slice(&ser);
+        torn.extend_from_slice(b"   ");
+        torn.push(b']');
+        std::fs::write(&path, &torn).expect("plant foreign store");
+        let log = HookLog::load(path, 5).expect("reload");
+        assert_eq!(log.len(), 0, "a non-matching tail must wipe");
     }
 
     // --- the full Router, driven like the static server's HTTP tests --------

@@ -5,8 +5,11 @@
 //! and symlink escape; the per-flag layer-order rationale lives at
 //! [`router_with`] and the guards themselves.
 
+use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -32,6 +35,7 @@ const MAX_REQUEST_BODY: usize = 1024;
 
 /// Serve `dir` at `/` under the given flags (persisted on the registry
 /// entry, so the worker re-applies them); the layer order is load-bearing.
+/// The canonicalize is a one-shot construction cost — [`confine`]'s no-blocking rule covers request paths only.
 pub fn router_with(dir: PathBuf, flags: crate::model::StaticFlags) -> Router {
     let root = std::fs::canonicalize(&dir).unwrap_or(dir);
     let crate::model::StaticFlags { spa, cors, token } = flags;
@@ -50,6 +54,7 @@ pub fn router_with(dir: PathBuf, flags: crate::model::StaticFlags) -> Router {
     // Auth before confinement: an unauthenticated 404-scanner cannot use the
     // 404/200 distinction to probe which paths exist.
     if let Some(expected) = token {
+        let expected: Arc<str> = expected.into();
         router = router.layer(from_fn_with_state(expected, require_token));
     }
     // Above the token guard so 401s carry the headers. Preflight stays
@@ -98,10 +103,18 @@ async fn serve_or_list(State(root): State<PathBuf>, request: Request, next: Next
         Err(_) => return next.run(request).await,
     };
     let candidate = candidate_path(&root, &decoded);
+    let plain_file = request
+        .extensions()
+        .get::<Confined>()
+        .is_some_and(|c| !c.is_dir);
 
-    let listing = tokio::task::spawn_blocking(move || render_listing(&candidate, &root))
-        .await
-        .unwrap_or(None);
+    let listing = if plain_file {
+        None
+    } else {
+        tokio::task::spawn_blocking(move || render_listing(&candidate, &root))
+            .await
+            .unwrap_or(None)
+    };
     match listing {
         Some(html) => {
             let len = html.len();
@@ -121,7 +134,7 @@ async fn serve_or_list(State(root): State<PathBuf>, request: Request, next: Next
 
 /// Blocking half of [`serve_or_list`]: render the listing, or `None` to fall
 /// through to `ServeDir`.
-fn render_listing(candidate: &Path, root: &Path) -> Option<String> {
+pub(crate) fn render_listing(candidate: &Path, root: &Path) -> Option<String> {
     // Canonicalize fails on missing paths — those belong to ServeDir's 404.
     let resolved = std::fs::canonicalize(candidate).ok()?;
     if !resolved.starts_with(root) || !resolved.is_dir() {
@@ -130,48 +143,78 @@ fn render_listing(candidate: &Path, root: &Path) -> Option<String> {
     if resolved.join("index.html").exists() {
         return None;
     }
+    let entries = visible_entries(&resolved, root)?;
+    Some(listing_html(&entries, candidate, root))
+}
 
+fn visible_entries(dir: &Path, root: &Path) -> Option<Vec<(String, bool)>> {
     let mut entries: Vec<(String, bool)> = Vec::new(); // (name, is_dir)
-    for entry in std::fs::read_dir(&resolved).ok()?.flatten() {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
         // Non-UTF-8 names render lossily (their hrefs 404) — tolerated here.
         let name = entry.file_name().to_string_lossy().into_owned();
-        // Hide dotfiles: confine refuses to serve them, so listing them
-        // would only advertise 404 links (and leak names such as `.env`).
         if name.starts_with('.') {
             continue;
         }
-        // Resolve once: escaping or dead links are hidden (the guard 404s
-        // them), and the target's real kind classifies the entry.
-        let target = match std::fs::canonicalize(entry.path()) {
-            Ok(target) if target.starts_with(root) => target,
-            _ => continue,
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => match std::fs::symlink_metadata(entry.path()) {
+                Ok(m) => m.file_type(),
+                Err(_) => continue,
+            },
         };
-        entries.push((name, target.is_dir()));
+        let is_dir = if file_type.is_symlink() {
+            match std::fs::canonicalize(entry.path()) {
+                Ok(target) if target.starts_with(root) => target.is_dir(),
+                _ => continue,
+            }
+        } else {
+            file_type.is_dir()
+        };
+        entries.push((name, is_dir));
     }
     entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    Some(entries)
+}
 
+fn listing_html(entries: &[(String, bool)], candidate: &Path, root: &Path) -> String {
     // The title is fs-derived — escaped like the labels.
     let title = escape_html(&format!("Index of {}", decoded_title(candidate, root)));
     // `/`-rooted hrefs resolve identically via `/dir/` and `/dir`.
     let base = href_base(candidate, root);
-    let mut body = String::from("<ul>\n");
+    let mut body = String::with_capacity(
+        entries
+            .iter()
+            .map(|(name, _)| name.len() * 6 + 96)
+            .sum::<usize>()
+            .max(64),
+    );
+    body.push_str("<ul>\n");
     if candidate != root {
         // Absolute parent href: a relative `../` misses a level when the
         // listing was reached without its trailing slash (/a/b -> /).
         let parent = href_base(candidate.parent().unwrap_or(root), root);
-        body.push_str(&format!("<li><a href=\"{parent}\">../</a></li>\n"));
+        body.push_str("<li><a href=\"");
+        body.push_str(&parent);
+        body.push_str("\">../</a></li>\n");
     }
-    for (name, is_dir) in &entries {
-        let kind = if *is_dir { "dir" } else { "file" };
-        let slash = if *is_dir { "/" } else { "" };
-        let href = encode_href(name);
-        let label = escape_html(name);
-        body.push_str(&format!(
-            "<li><a class=\"{kind}\" href=\"{base}{href}{slash}\">{label}{slash}</a></li>\n"
-        ));
+    for (name, is_dir) in entries {
+        body.push_str("<li><a class=\"");
+        body.push_str(if *is_dir { "dir" } else { "file" });
+        body.push_str("\" href=\"");
+        body.push_str(&base);
+        push_encoded_href(&mut body, name);
+        if *is_dir {
+            body.push('/');
+        }
+        body.push_str("\">");
+        push_escaped_html(&mut body, name);
+        if *is_dir {
+            body.push('/');
+        }
+        body.push_str("</a></li>\n");
     }
     body.push_str("</ul>\n<hr>\n");
-    Some(html_page(&title, &body))
+    html_page(&title, &body)
 }
 
 /// Shared scaffold for the ft-owned origins' generated pages. Inputs must be
@@ -210,9 +253,14 @@ fn href_base(candidate: &Path, root: &Path) -> String {
     base
 }
 
-/// Percent-encode a name for an href (unreserved set plus `/`); shared with
-/// `drop_server`'s listing.
+/// Percent-encode a name for an href (unreserved set plus `/`).
 pub(crate) fn encode_href(name: &str) -> String {
+    let mut out = String::new();
+    push_encoded_href(&mut out, name);
+    out
+}
+
+pub(crate) fn push_encoded_href(out: &mut String, name: &str) {
     const FRAGMENT: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
         .add(b' ')
         .add(b'"')
@@ -235,13 +283,22 @@ pub(crate) fn encode_href(name: &str) -> String {
         .add(b'|')
         .add(b':')
         .add(b'@');
-    percent_encoding::utf8_percent_encode(name, FRAGMENT).to_string()
+    let _ = write!(
+        out,
+        "{}",
+        percent_encoding::utf8_percent_encode(name, FRAGMENT)
+    );
 }
 
 /// Minimal HTML text escaping; shared with `hook_server`'s inspector — all
 /// external text passes through here before markup.
 pub(crate) fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
+    push_escaped_html(&mut out, s);
+    out
+}
+
+pub(crate) fn push_escaped_html(out: &mut String, s: &str) {
     for c in s.chars() {
         match c {
             '&' => out.push_str("&amp;"),
@@ -252,7 +309,6 @@ pub(crate) fn escape_html(s: &str) -> String {
             _ => out.push(c),
         }
     }
-    out
 }
 
 /// Any decoded segment starting with `.` — refused EARLIER than ServeDir's
@@ -282,7 +338,15 @@ fn candidate_path(root: &Path, decoded: &str) -> PathBuf {
 /// `starts_with(root)`; missing paths fail canonicalize and 404 too). A
 /// TOCTOU window remains before ServeDir's own open — closing it fully would
 /// mean replacing ServeDir.
-pub(crate) async fn confine(State(root): State<PathBuf>, request: Request, next: Next) -> Response {
+pub(crate) async fn confine(
+    State(root): State<PathBuf>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let method = request.method();
+    if method != Method::GET && method != Method::HEAD {
+        return next.run(request).await;
+    }
     let raw = request.uri().path();
     let decoded = match percent_decode(raw.as_bytes()).decode_utf8() {
         Ok(s) => s,
@@ -296,33 +360,35 @@ pub(crate) async fn confine(State(root): State<PathBuf>, request: Request, next:
     // hot path — no realpath/stat may block the runtime thread.
     let confined = tokio::task::spawn_blocking(move || confine_blocking(&candidate, &root))
         .await
-        .unwrap_or(false);
-    if !confined {
+        .unwrap_or(None);
+    let Some(is_dir) = confined else {
         return StatusCode::NOT_FOUND.into_response();
-    }
+    };
+    request.extensions_mut().insert(Confined { is_dir });
     next.run(request).await
 }
 
 /// Blocking half of [`confine`] — also confines a directory's `index.html`
 /// (it may itself be an escaping symlink).
-fn confine_blocking(candidate: &Path, root: &Path) -> bool {
-    let resolved = match std::fs::canonicalize(candidate) {
-        Ok(r) => r,
-        Err(_) => return false,
-    };
+fn confine_blocking(candidate: &Path, root: &Path) -> Option<bool> {
+    let resolved = std::fs::canonicalize(candidate).ok()?;
     if !resolved.starts_with(root) {
-        return false;
+        return None;
     }
-    if resolved.is_dir() && escapes_root(&resolved.join("index.html"), root) {
-        return false;
+    let is_dir = resolved.is_dir();
+    if is_dir && escapes_root(&resolved.join("index.html"), root) {
+        return None;
     }
-    true
+    Some(is_dir)
 }
 
-/// True if `path` exists and canonicalises to a target outside `root` —
-/// confines the directory-index file in addition to the request path.
+#[derive(Clone)]
+struct Confined {
+    is_dir: bool,
+}
+
 fn escapes_root(path: &Path, root: &Path) -> bool {
-    if !path.exists() {
+    if std::fs::symlink_metadata(path).is_err() {
         return false;
     }
     match std::fs::canonicalize(path) {
@@ -392,17 +458,20 @@ async fn spa_fallback(State(root): State<PathBuf>, request: Request, next: Next)
 /// is its content) unless `Authorization: Bearer <secret>` or
 /// `?token=<secret>` matches, constant-time; layered before confinement so a
 /// 404-scanner cannot probe which paths exist.
-async fn require_token(State(expected): State<String>, request: Request, next: Next) -> Response {
+async fn require_token(State(expected): State<Arc<str>>, request: Request, next: Next) -> Response {
     let header_token = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(bearer_token)
-        .map(str::to_owned);
-    let query_token = request.uri().query().and_then(|q| query_param(q, "token"));
-    let ok = header_token
-        .or(query_token)
-        .is_some_and(|t| tokens_match(&t, &expected));
+        .and_then(bearer_token);
+    let ok = match header_token {
+        Some(t) => tokens_match(t, &expected),
+        None => request
+            .uri()
+            .query()
+            .and_then(|q| query_param(q, "token"))
+            .is_some_and(|t| tokens_match(t.as_ref(), &expected)),
+    };
     if !ok {
         return (
             StatusCode::UNAUTHORIZED,
@@ -414,31 +483,25 @@ async fn require_token(State(expected): State<String>, request: Request, next: N
     next.run(request).await
 }
 
-/// Case-insensitive `Bearer` scheme match (RFC 7235). Byte-in-sync twin of
-/// `drop_server::bearer_token`; keep the two in sync.
-fn bearer_token(value: &str) -> Option<&str> {
+pub(crate) fn bearer_token(value: &str) -> Option<&str> {
     let (scheme, credentials) = value.split_once(' ')?;
     scheme.eq_ignore_ascii_case("bearer").then_some(credentials)
 }
 
 /// First value of `key`, percent-decoded (a literal `+` stays a plus).
-/// Byte-in-sync twin of `drop_server::query_param`; keep the two in sync.
-fn query_param(query: &str, key: &str) -> Option<String> {
+pub(crate) fn query_param<'a>(query: &'a str, key: &str) -> Option<Cow<'a, str>> {
     query.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
         if k != key {
             return None;
         }
-        percent_decode(v.as_bytes())
-            .decode_utf8()
-            .ok()
-            .map(|d| d.into_owned())
+        percent_decode(v.as_bytes()).decode_utf8().ok()
     })
 }
 
 /// Constant-time compare (length folded in, no early return; empty expected
-/// matches nothing). Twin of `drop_server::tokens_match`; keep in sync.
-fn tokens_match(provided: &str, expected: &str) -> bool {
+/// matches nothing).
+pub(crate) fn tokens_match(provided: &str, expected: &str) -> bool {
     if expected.is_empty() {
         return false;
     }
@@ -515,6 +578,23 @@ mod confinement_tests {
         assert!(root.join("a").starts_with(root));
         assert!(!Path::new("/etc/passwd").starts_with(root));
     }
+
+    #[test]
+    fn confine_blocking_reports_the_target_kind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("d")).expect("mkdir");
+        std::fs::write(dir.path().join("d").join("f.txt"), "x").expect("write");
+        let root = std::fs::canonicalize(dir.path()).expect("canonicalize");
+
+        assert_eq!(super::confine_blocking(&root.join("d"), &root), Some(true));
+        assert_eq!(
+            super::confine_blocking(&root.join("d").join("f.txt"), &root),
+            Some(false)
+        );
+
+        assert!(super::confine_blocking(&root.join("missing"), &root).is_none());
+        assert!(super::confine_blocking(Path::new("/etc"), &root).is_none());
+    }
 }
 
 #[cfg(test)]
@@ -584,6 +664,67 @@ mod http_confinement_tests {
             r.oneshot(req("/../etc/passwd")).await.unwrap().status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn undecodable_paths_refuse_at_the_guard_not_the_fallthrough() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("f.txt"), "x").expect("write");
+        for uri in ["/%FF", "/sub/%FF/"] {
+            let r = plain_router(dir.path().to_path_buf());
+            assert_eq!(
+                r.oneshot(req(uri)).await.unwrap().status(),
+                StatusCode::NOT_FOUND,
+                "{uri}: confine's decode-failure 404 must stay ahead of the listing fallthrough"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn non_get_head_methods_answer_a_uniform_405() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(".env"), "SECRET=1").expect("write");
+        for method in ["POST", "PUT", "DELETE", "OPTIONS"] {
+            let request = Request::builder()
+                .method(method)
+                .uri("/.env")
+                .body(Body::empty())
+                .expect("build request");
+            let r = plain_router(dir.path().to_path_buf());
+            assert_eq!(
+                r.oneshot(request).await.unwrap().status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} must answer uniformly — a 404/405 split would probe paths"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_broken_index_symlink_refuses_the_directory_listing() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("sub")).expect("mkdir");
+        std::fs::write(dir.path().join("ok.txt"), "x").expect("write");
+        symlink(
+            "never-planted.html",
+            dir.path().join("sub").join("index.html"),
+        )
+        .expect("symlink");
+
+        for uri in ["/sub/", "/sub", "/sub/index.html"] {
+            let r = plain_router(dir.path().to_path_buf());
+            let resp = r.oneshot(req(uri)).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "{uri} must be refused while the index symlink is broken"
+            );
+        }
+
+        let r = plain_router(dir.path().to_path_buf());
+        let resp = r.oneshot(req("/")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[cfg(unix)]
@@ -857,6 +998,25 @@ mod listing_tests {
     }
 
     #[tokio::test]
+    async fn the_path_is_decoded_exactly_once_by_every_observer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a%20b.txt"), "literal").expect("write");
+
+        let resp = plain_router(dir.path().to_path_buf())
+            .oneshot(req("GET", "/a%2520b.txt"))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_of(resp).await, "literal");
+
+        let resp = plain_router(dir.path().to_path_buf())
+            .oneshot(req("GET", "/a%20b.txt"))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn head_requests_answer_with_headers_but_no_body() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("f.txt"), "x").expect("write");
@@ -1074,6 +1234,54 @@ mod listing_tests {
         assert!(
             !html.contains("dangling"),
             "a broken symlink must not be listed: {html}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn render_listing_refuses_a_directory_swapped_to_an_escaping_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        std::fs::create_dir(dir.path().join("sub")).expect("mkdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonicalize");
+        std::fs::remove_dir(root.join("sub")).expect("remove dir");
+        symlink(outside.path(), root.join("sub")).expect("symlink");
+        assert_eq!(render_listing(&root.join("sub"), &root), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stale_confined_kind_never_lists_a_swapped_directory() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        std::fs::write(outside.path().join("leak.txt"), "OUT").expect("write");
+        std::fs::create_dir(dir.path().join("sub")).expect("mkdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonicalize");
+        std::fs::remove_dir(root.join("sub")).expect("remove dir");
+        symlink(outside.path(), root.join("sub")).expect("symlink");
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/sub/")
+            .extension(super::Confined { is_dir: true })
+            .body(Body::empty())
+            .expect("build request");
+        let app = Router::new()
+            .fallback_service(ServeDir::new(root.clone()))
+            .layer(from_fn_with_state(root, serve_or_list));
+        let resp = app.oneshot(request).await.expect("oneshot");
+        let status = resp.status();
+        let body = body_of(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "the swap must not be answered with a listing"
+        );
+        assert!(
+            !body.contains("leak.txt"),
+            "no outside-root names may be listed: {body}"
         );
     }
 }
@@ -1462,5 +1670,176 @@ mod origin_flags_tests {
         assert!(!m("sekritlonger", "sekrit"), "longer never matches");
         assert!(!m("", "sekrit"), "nothing provided never matches");
         assert!(!m("sekrit", ""), "an unconfigured token matches nothing");
+    }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) mod parity_fixtures {
+    use std::os::unix::fs::symlink;
+    use std::path::{Path, PathBuf};
+
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+    use proptest::sample::select;
+
+    #[derive(Clone, Debug)]
+    pub(crate) enum Seed {
+        File(String),
+        Dir(String),
+        LinkIn(String, String),
+        LinkRel(String, String),
+        LinkOut(String),
+        LinkOutDir(String),
+        Dangling(String),
+    }
+
+    const SEGMENTS: &[&str] = &[
+        "a",
+        "b.txt",
+        "zed",
+        "sub dir",
+        "amp&and",
+        "eq=semi;.txt",
+        "lt<gt>",
+        "üñí.txt",
+        ".env",
+        ".git",
+        "dot.",
+        "plain",
+        "real",
+        "index.html",
+        "link",
+        "target",
+    ];
+
+    fn rel() -> impl Strategy<Value = String> {
+        vec(select(SEGMENTS), 1..=3).prop_map(|segs| segs.join("/"))
+    }
+
+    pub(crate) fn seeds() -> impl Strategy<Value = Vec<Seed>> {
+        vec((0u8..7, rel(), rel()), 0..24).prop_map(|rows| {
+            rows.into_iter()
+                .map(|(kind, a, b)| match kind {
+                    0 => Seed::File(a),
+                    1 => Seed::Dir(a),
+                    2 => Seed::LinkIn(a, b),
+                    3 => Seed::LinkRel(a, b),
+                    4 => Seed::LinkOut(a),
+                    5 => Seed::LinkOutDir(a),
+                    _ => Seed::Dangling(a),
+                })
+                .collect()
+        })
+    }
+
+    pub(crate) struct Planted {
+        pub _keep_alive: (tempfile::TempDir, tempfile::TempDir),
+        pub root: PathBuf,
+        pub dirs: Vec<PathBuf>,
+    }
+
+    pub(crate) fn plant(seeds: &[Seed]) -> Planted {
+        let inside = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        std::fs::write(outside.path().join("secret"), "OUT").expect("write");
+        std::fs::create_dir(outside.path().join("sdir")).expect("mkdir");
+        for seed in seeds {
+            let _ = plant_one(seed, inside.path(), outside.path());
+        }
+        let root = std::fs::canonicalize(inside.path()).expect("canonicalize root");
+        let mut dirs = vec![root.clone()];
+        collect_dirs(&root, &mut dirs);
+        Planted {
+            _keep_alive: (inside, outside),
+            root,
+            dirs,
+        }
+    }
+
+    fn ensure_parent(path: &Path) -> std::io::Result<()> {
+        match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => std::fs::create_dir_all(parent),
+            _ => Ok(()),
+        }
+    }
+
+    fn plant_one(seed: &Seed, root: &Path, outside: &Path) -> std::io::Result<()> {
+        let link = |rel: &str, target: &Path| -> std::io::Result<()> {
+            let path = root.join(rel);
+            ensure_parent(&path)?;
+            symlink(target, path)
+        };
+        match seed {
+            Seed::File(rel) => {
+                let path = root.join(rel);
+                ensure_parent(&path)?;
+                std::fs::write(&path, rel.as_bytes())
+            }
+            Seed::Dir(rel) => std::fs::create_dir_all(root.join(rel)),
+            Seed::LinkIn(rel, target) => link(rel, &root.join(target)),
+            Seed::LinkRel(rel, target) => link(rel, Path::new(target)),
+            Seed::LinkOut(rel) => link(rel, &outside.join("secret")),
+            Seed::LinkOutDir(rel) => link(rel, &outside.join("sdir")),
+            Seed::Dangling(rel) => link(rel, &root.join("never-planted")),
+        }
+    }
+
+    fn collect_dirs(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in read.flatten() {
+            if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                let path = entry.path();
+                collect_dirs(&path, out);
+                out.push(path);
+            }
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod listing_parity_proptests {
+    use super::parity_fixtures;
+    use super::*;
+    use proptest::prelude::*;
+
+    fn canonicalize_classified(dir: &Path, root: &Path) -> Vec<(String, bool)> {
+        let mut entries: Vec<(String, bool)> = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("read_dir").flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            let target = match std::fs::canonicalize(entry.path()) {
+                Ok(target) if target.starts_with(root) => target,
+                _ => continue,
+            };
+            entries.push((name, target.is_dir()));
+        }
+        entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        entries
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        #[test]
+        fn dtype_listing_matches_canonicalize_listing(seeds in parity_fixtures::seeds()) {
+            let planted = parity_fixtures::plant(&seeds);
+            for dir in &planted.dirs {
+                let oracle = canonicalize_classified(dir, &planted.root);
+                prop_assert_eq!(
+                    visible_entries(dir, &planted.root).expect("read_dir"),
+                    oracle.clone()
+                );
+                let reference = if dir.join("index.html").exists() {
+                    None
+                } else {
+                    Some(listing_html(&oracle, dir, &planted.root))
+                };
+                prop_assert_eq!(render_listing(dir, &planted.root), reference);
+            }
+        }
     }
 }
