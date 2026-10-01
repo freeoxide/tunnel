@@ -1,7 +1,10 @@
 //! Criterion benches for the webhook store's record->persist path
-//! (`server::hook_server::HookLog::record`): insert + truncate to `keep`,
-//! then `persist`'s serialize + atomic tmp+rename write of the WHOLE store —
-//! the per-webhook fs cost at the two retention ceilings the campaign tracks.
+//! (`server::hook_server::HookLog::record`): push + retain to `keep`, then
+//! the append-window write — one serialized record positional-written into
+//! the store file's tail pad (a whole-file atomic tmp+rename only on the
+//! amortized re-reserve: pad exhaustion, untrusted framing after a load, or
+//! a healed in-place write error) — the per-webhook fs cost at the two
+//! retention ceilings the campaign tracks.
 
 // The crate is bin-only (no lib target), so a bench cannot link it as a
 // library; instead each bench compiles the SAME module tree into its own
@@ -73,7 +76,8 @@ fn bench(c: &mut Criterion) {
         // iterations of the group REUSE it: each iteration measures the
         // steady-state record->persist at this keep — the store file grows to
         // keep × 64 B bodies and plateaus there (record truncates), so the fs
-        // effects stay real (real tmp+rename writes) but bounded.
+        // effects stay real (real positional writes, periodic re-reserve)
+        // but bounded.
         let dir = tempfile::tempdir().expect("tempdir for the hook store");
         let mut log =
             HookLog::load(dir.path().join("requests.json"), keep).expect("load a fresh HookLog");

@@ -309,8 +309,10 @@ impl HookLog {
     /// serialized once and written into the file's tail pad, the evicted
     /// oldest is whitened in place — the retained bytes in between never
     /// move. Only when the pad runs out (or after a load of untrusted
-    /// framing, or an io error) does [`HookLog::reserve`] rewrite the whole
-    /// file atomically, amortized over half-the-live-bytes of pad.
+    /// framing) does [`HookLog::reserve`] rewrite the whole file atomically,
+    /// amortized over half-the-live-bytes of pad; a torn in-place write is
+    /// healed by that same rewrite in the SAME delivery, never left on disk
+    /// for a restart to trip over.
     ///
     /// No fsync, by contract: exactly like the old whole-file persist,
     /// durability ends at the page cache — the drop store's fsync
@@ -363,15 +365,35 @@ impl HookLog {
                 }
                 return self.reserve();
             }
-            Err(e) => Err(e),
+            // Nothing reached the file, so the window still describes it.
+            Err(e) => {
+                self.window = Some(window);
+                return Err(e);
+            }
         };
         match result {
-            Ok(()) => self.window = Some(window),
-            // In-place edits may have torn the framing mid-write; force a
-            // full rewrite on the next record.
-            Err(_) => self.window = None,
+            Ok(()) => {
+                self.window = Some(window);
+                Ok(())
+            }
+            Err(e) => {
+                // The edit may have torn the file mid-write. Heal NOW with
+                // the atomic rewrite — leaving a torn file behind for a
+                // restart to trip over is the loss path the old atomic
+                // persist excluded. If even the rewrite fails the disk is
+                // failing outright: report the ORIGINAL error and let the
+                // 500-retry contract take over (window stays None, so the
+                // next record retries the rewrite).
+                self.window = None;
+                while self.requests.len() > self.keep {
+                    self.requests.pop_back();
+                }
+                match self.reserve() {
+                    Ok(()) => Ok(()),
+                    Err(_) => Err(e),
+                }
+            }
         }
-        result
     }
 
     /// Saturates like load (see the comment there); at saturation duplicate
@@ -490,19 +512,28 @@ fn ser_io(e: serde_json::Error) -> std::io::Error {
 
 /// Recover the intact records from a torn append window. A record makes at
 /// most ONE positional write per edge, so a genuine tear damages exactly one
-/// edge: at the left, the tail of the half-whitened oldest record (bytes
-/// that contain no `{` — a record's serialization has none — and end with
-/// the `"truncated":…}` field every record ends with), optionally reduced
-/// to just its separator comma; at the right, an incomplete new record.
-/// Anything else — damage between good records, two values with no
-/// separator, leading junk that is not a record tail — is foreign
-/// corruption: None, and the caller wipes exactly as before. A remnant
-/// shorter than the trailing field is indistinguishable from foreign junk
-/// and also wipes. Without this, a crash between a torn write and the next
-/// successful record cost the WHOLE retained history — a loss path the old
-/// atomic tmp+rename persist excluded.
+/// edge: at the left, the tail of the half-whitened oldest record — a
+/// suffix of that record's serialization, so it ends with the fixed
+/// `,"truncated":…}` field and carries at least one unmatched closing
+/// bracket (the record's own `}`) under a string-aware count, whatever the
+/// body bytes — optionally reduced to just its separator comma; at the
+/// right, an incomplete new record, which always begins `{`. Anything else
+/// — damage between good records, leading junk that is not a record tail, a
+/// torn tail not starting `{`, no pad byte before the closing bracket (the
+/// writer's strictly-greater `fits` always leaves one) — is foreign
+/// corruption: None, and the caller wipes exactly as before. A remnant cut
+/// inside the trailing field is shorter than that field, indistinguishable
+/// from foreign junk, and wipes too. Without this, a crash between a torn
+/// write and the next successful record cost the WHOLE retained history —
+/// a loss path the old atomic tmp+rename persist excluded.
 fn repair_torn_window(bytes: &[u8]) -> Option<Vec<RecordedRequest>> {
     if bytes.first() != Some(&b'[') || bytes.last() != Some(&b']') {
+        return None;
+    }
+    // The writer always leaves at least one pad byte before the closing
+    // bracket (reserve pads; `fits` is strictly-greater), so anything else
+    // jammed against `]` is foreign.
+    if !bytes[bytes.len() - 2].is_ascii_whitespace() {
         return None;
     }
     let interior = &bytes[1..bytes.len() - 1];
@@ -544,9 +575,10 @@ fn repair_torn_window(bytes: &[u8]) -> Option<Vec<RecordedRequest>> {
                         i = end;
                         expect_separator = true;
                     }
-                    // An incomplete value is the torn new record; it simply
-                    // yields no range.
-                    None => i = interior.len(),
+                    // An incomplete value is the torn new record — records
+                    // serialize as objects, so it must begin `{`.
+                    None if interior[i] == b'{' => i = interior.len(),
+                    None => return None,
                 }
             }
         }
@@ -584,10 +616,50 @@ fn repair_torn_window(bytes: &[u8]) -> Option<Vec<RecordedRequest>> {
         return (head.is_empty()).then_some(records);
     };
     (remnant.is_empty()
-        || ((remnant.ends_with(b"\"truncated\":true}")
-            || remnant.ends_with(b"\"truncated\":false}"))
-            && !remnant.contains(&b'{')))
+        || (RECORD_TAILS.iter().any(|t| remnant.ends_with(t))
+            || RECORD_TAIL_FIELDS.iter().any(|f| f.ends_with(remnant)))
+            && [false, true]
+                .iter()
+                .any(|&phase| bracket_balance(remnant, phase) <= -1))
     .then_some(records)
+}
+
+/// The fixed end of every record serialization: the last field, plus the
+/// comma that separates it from `body_len`. A genuine evict remnant long
+/// enough to span it ends with one of these; a remnant cut INSIDE the field
+/// is a proper suffix of the bare field.
+const RECORD_TAILS: [&[u8]; 2] = [b",\"truncated\":true}", b",\"truncated\":false}"];
+const RECORD_TAIL_FIELDS: [&[u8]; 2] = [b"\"truncated\":true}", b"\"truncated\":false}"];
+
+/// String-aware bracket balance of `bytes` (`{[=+1`, `}]=-1`, quoted bytes
+/// ignored), with the caller picking the phase at offset 0 — a remnant cut
+/// mid-string begins inside one, and only one of the two phases is the true
+/// one. A record suffix always closes its own record brace unmatched, so
+/// its true-phase balance is ≤ -1; complete values (numbers, strings,
+/// balanced objects) sit at 0.
+fn bracket_balance(bytes: &[u8], start_in_string: bool) -> i32 {
+    let mut balance = 0i32;
+    let mut in_string = start_in_string;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if b == b'\\' {
+                i += 1;
+            } else if b == b'"' {
+                in_string = false;
+            }
+        } else {
+            match b {
+                b'"' => in_string = true,
+                b'{' | b'[' => balance += 1,
+                b'}' | b']' => balance -= 1,
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    balance
 }
 
 /// Scan one comma-separated JSON value starting at `start` (a non-ws,
@@ -1427,10 +1499,12 @@ mod tests {
         let rec2 = RecordedRequest::capture(2, recv_stamp(), &parts("POST", "/two", &[]), b"");
         let ser1 = serde_json::to_vec(&rec1).expect("serialize");
         let ser2 = serde_json::to_vec(&rec2).expect("serialize");
-        // The round-4 audit's probe shapes, plus the interior damage one:
-        // none of these is producible by a single torn edge write, so all
-        // must wipe exactly like the pre-repair code did.
-        let probes: [(&str, Vec<u8>); 4] = [
+        // The round-4/5 audit's probe shapes, plus the interior damage one:
+        // none of these is producible by a single torn edge write (the
+        // writer always leaves a pad byte before `]`, and a torn append's
+        // record always begins `{`), so all must wipe exactly like the
+        // pre-repair code did.
+        let probes: [(&str, Vec<u8>); 6] = [
             ("leading number", {
                 let mut f = Vec::new();
                 f.push(b'[');
@@ -1469,6 +1543,22 @@ mod tests {
                 f.push(b']');
                 f
             }),
+            ("comma with no pad before the bracket", {
+                let mut f = Vec::new();
+                f.push(b'[');
+                f.extend_from_slice(&ser1);
+                f.push(b',');
+                f.push(b']');
+                f
+            }),
+            ("non-object torn tail", {
+                let mut f = Vec::new();
+                f.push(b'[');
+                f.extend_from_slice(&ser1);
+                f.extend_from_slice(b",\"abc   ");
+                f.push(b']');
+                f
+            }),
         ];
         for (label, file) in probes {
             std::fs::write(&path, &file).expect("plant damaged store");
@@ -1479,6 +1569,70 @@ mod tests {
                 "{label}: foreign damage must wipe, not recover"
             );
         }
+    }
+
+    /// A JSON webhook body carries literal braces through the record's
+    /// serialization; torn-edge recovery must survive them at ANY whitening
+    /// offset (the round-5 audit probed a body of `{"ok":true,"deep":{"x":1}}`
+    /// and the round-4 content heuristic rejected every cut before the last
+    /// brace).
+    #[test]
+    fn torn_edges_recover_for_brace_heavy_json_bodies() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("requests.json");
+        let body = br#"{"ok":true,"deep":{"x":1}}"#;
+        let rec1 = RecordedRequest::capture(1, recv_stamp(), &parts("POST", "/hook", &[]), body);
+        let rec2 = RecordedRequest::capture(2, recv_stamp(), &parts("POST", "/hook", &[]), body);
+        let ser1 = serde_json::to_vec(&rec1).expect("serialize");
+        let ser2 = serde_json::to_vec(&rec2).expect("serialize");
+        assert!(
+            ser1.iter().filter(|&&b| b == b'{').count() > 2,
+            "the fixture's serialization must carry body braces"
+        );
+
+        // Torn evict: the whitening stopped after k bytes, leaving k spaces
+        // plus the serialization's suffix and its separator comma. Every
+        // offset that leaves the full trailing field must recover rec2.
+        for k in [1usize, 10, 44, 88, ser1.len() / 2, ser1.len() - 24] {
+            let mut torn = Vec::new();
+            torn.push(b'[');
+            torn.extend(std::iter::repeat_n(b' ', k));
+            torn.extend_from_slice(&ser1[k..]);
+            torn.push(b',');
+            torn.extend_from_slice(&ser2);
+            torn.extend_from_slice(b"    ");
+            torn.push(b']');
+            std::fs::write(&path, &torn).expect("plant torn store");
+            let mut log = HookLog::load(path.clone(), 5).expect("reload");
+            let snap = log.snapshot();
+            assert_eq!(
+                snap.len(),
+                1,
+                "whitening offset {k} must recover the survivor"
+            );
+            assert_eq!(snap[0].path, "/hook");
+            assert_eq!(snap[0].body.as_bytes(), body);
+            // And the recovered store keeps recording.
+            let head = parts("POST", "/after", &[]);
+            log.record(RecordedRequest::capture(3, recv_stamp(), &head, b"x"))
+                .expect("record");
+            let reloaded = HookLog::load(path.clone(), 5).expect("reload");
+            assert_eq!(reloaded.len(), 2, "recovered store still records");
+        }
+
+        // Torn append: the incomplete new record begins `{` and may carry
+        // body braces of its own.
+        let mut torn = Vec::new();
+        torn.push(b'[');
+        torn.extend_from_slice(&ser1);
+        torn.push(b',');
+        torn.extend(br#"{"seq":2,"body":"{"ok""#);
+        torn.extend_from_slice(b"   ");
+        torn.push(b']');
+        std::fs::write(&path, &torn).expect("plant torn store");
+        let mut log = HookLog::load(path.clone(), 5).expect("reload");
+        assert_eq!(log.len(), 1, "the intact record survives the torn append");
+        assert_eq!(log.snapshot()[0].seq, 1);
     }
 
     /// External deletion mid-run: the old whole-file persist recreated the
@@ -1498,6 +1652,36 @@ mod tests {
         log.record(RecordedRequest::capture(2, recv_stamp(), &head, b"two"))
             .expect("record must recreate the store, not 500 once");
         assert!(path.exists(), "the store is back in THIS delivery");
+        let mut reloaded = HookLog::load(path, 5).expect("reload");
+        let paths: Vec<String> = reloaded.snapshot().into_iter().map(|r| r.path).collect();
+        assert_eq!(paths, vec!["/second", "/first"]);
+    }
+
+    /// A mid-write failure of the in-place edit must heal in the SAME
+    /// delivery via the atomic rewrite — not defer to the next record and
+    /// risk a restart wiping the torn file. /dev/full accepts opens and
+    /// seeks but fails every write with ENOSPC, standing in for a failing
+    /// disk (a Linux-only device).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn record_heals_a_torn_in_place_write_in_the_same_delivery() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("requests.json");
+        let mut log = HookLog::load(path.clone(), 5).expect("load");
+        let head = parts("POST", "/first", &[]);
+        log.record(RecordedRequest::capture(1, recv_stamp(), &head, b"one"))
+            .expect("record");
+        // Swap the live store for a write-failing device: the next record's
+        // in-place append fails mid-delivery. The healing rewrite's tmp
+        // lands beside it and the rename replaces the symlink itself.
+        std::fs::remove_file(&path).expect("remove the real store");
+        std::os::unix::fs::symlink("/dev/full", &path).expect("plant a failing store");
+
+        let head = parts("POST", "/second", &[]);
+        log.record(RecordedRequest::capture(2, recv_stamp(), &head, b"two"))
+            .expect("the healing rewrite must land the record");
+
+        assert!(path.is_file(), "the rewrite replaced the failing device");
         let mut reloaded = HookLog::load(path, 5).expect("reload");
         let paths: Vec<String> = reloaded.snapshot().into_iter().map(|r| r.path).collect();
         assert_eq!(paths, vec!["/second", "/first"]);
