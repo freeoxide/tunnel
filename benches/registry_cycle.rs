@@ -1,19 +1,9 @@
-//! Criterion benches for the registry's on-disk cycle: `Registry::load`
-//! (bounded read + JSON parse + validate) at 100/1000/5000 services, and one
-//! full `Registry::update` cycle at the 1000-service fixture — flock acquire,
-//! load, mutate, and `save`'s durable path (temp write + fsync, `.bak`
-//! promotion, rename, parent-dir fsync) included.
-
-// The crate is bin-only (no lib target), so a bench cannot link it as a
-// library; instead each bench compiles the SAME module tree into its own
-// crate via #[path], mirroring the declarations in src/main.rs. That is also
-// what keeps the modules' internal `crate::` paths resolving.
-// cargo builds bench targets with `--cfg test` (but no `--test`), so the
-// mirrored tree's #[cfg(test)] modules compile while their #[test] fns stay
-// dead — dead_code alone would leave their imports dangling into
-// unused_imports warnings. Both allows exist only for that fallout.
+// Benches build with `--cfg test` but no `--test`: the mirrored #[cfg(test)]
+// modules compile while their #[test] fns stay dead, tripping both allows.
 #![allow(dead_code, unused_imports)]
 
+// Bin-only crate — a bench cannot link it, so this mirrors the src/main.rs
+// module tree via #[path]; that is what keeps `crate::` paths resolving.
 #[path = "../src/cli.rs"]
 mod cli;
 #[path = "../src/cloudflared.rs"]
@@ -51,8 +41,6 @@ use criterion::{Criterion, criterion_group, criterion_main};
 
 use model::{Registry, Service, ServiceKind};
 
-/// A minimal valid service — Proxy kind (no directory to materialize), on a
-/// dead-looking high port, `public_url` set like a live Running entry.
 fn service(id: u64) -> Service {
     let port = 20_000 + (id % 20_000) as u16;
     Service {
@@ -73,8 +61,6 @@ fn service(id: u64) -> Service {
     }
 }
 
-/// A tempdir state dir holding a saved registry of `n` services, built once
-/// per bench outside the measured closure.
 fn fixture(n: usize) -> (tempfile::TempDir, state::StateDir) {
     let dir = tempfile::tempdir().expect("tempdir for the registry state");
     let state = state::StateDir::new_at(dir.path().join("ft-state"));
@@ -97,8 +83,6 @@ fn bench(c: &mut Criterion) {
     ] {
         let dir = fixture(n);
         let state = &dir.1;
-        // Verify the work actually happened (measurement hygiene): the
-        // fixture must load back with every seeded service.
         assert_eq!(
             Registry::load(state).expect("sanity load").services.len(),
             n,
@@ -108,10 +92,6 @@ fn bench(c: &mut Criterion) {
             b.iter(|| black_box(Registry::load(black_box(state)).expect("load")))
         });
     }
-    // The one full update cycle, at the mid fixture: flock + load + mutate +
-    // durable save. The mutation advances `next_id` only, so the registry
-    // stays a constant n across iterations (a growing one would skew late
-    // samples) while the whole write path still runs.
     {
         let dir = fixture(1000);
         let state = &dir.1;

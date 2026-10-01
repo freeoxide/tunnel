@@ -1,16 +1,7 @@
-//! Shared fixtures for the criterion benches: the served-tree builder. The
-//! bench files pull this in via `mod common;` (each bench compiles the
-//! crate's own module tree at its root — the crate is bin-only, so there is
-//! no library for benches to link against).
-
 use std::path::Path;
 
 use tempfile::TempDir;
 
-/// Realistic top-level file names, cycled with disambiguating numeric
-/// suffixes once the pool is exhausted. `index.html` is deliberately ABSENT
-/// from the pool: a root index hands the request to `ServeDir`, and these
-/// trees exist to exercise the listing render.
 const FILE_NAMES: &[&str] = &[
     "README.md",
     "CHANGELOG.md",
@@ -38,7 +29,6 @@ const FILE_NAMES: &[&str] = &[
     "migration_0001.sql",
 ];
 
-/// Realistic subdirectory names, cycled the same way.
 const DIR_NAMES: &[&str] = &[
     "src",
     "docs",
@@ -54,11 +44,8 @@ const DIR_NAMES: &[&str] = &[
     "vendor",
 ];
 
-/// Dotfiles planted at the root: the listing must hide them, and their
-/// presence keeps the entry loop honest (skip-path work per render).
 const DOTFILES: &[&str] = &[".gitignore", ".env", ".DS_Store"];
 
-/// Deterministic LCG — every run builds the byte-identical tree shape.
 struct Rng(u64);
 
 impl Rng {
@@ -75,14 +62,11 @@ impl Rng {
     }
 }
 
-/// `len` pseudo-random bytes (seeded), so file contents are stable per tree.
 pub fn content(len: usize, seed: u64) -> Vec<u8> {
     let mut rng = Rng(seed);
     (0..len).map(|_| (rng.below(251) as u8) + b' ').collect()
 }
 
-/// Unique per pool position: the bare name for the first cycle, then a
-/// numeric suffix (extension preserved) once the pool wraps.
 fn file_name(i: usize) -> String {
     let base = FILE_NAMES[i % FILE_NAMES.len()];
     if i < FILE_NAMES.len() {
@@ -93,7 +77,6 @@ fn file_name(i: usize) -> String {
     }
 }
 
-/// Directory counterpart of [`file_name`].
 fn dir_name(i: usize) -> String {
     let base = DIR_NAMES[i % DIR_NAMES.len()];
     if i < DIR_NAMES.len() {
@@ -103,17 +86,13 @@ fn dir_name(i: usize) -> String {
     }
 }
 
-/// A symlink-free tempdir tree with exactly `entries` VISIBLE top-level
-/// entries — a realistic mix of plain files (small deterministic contents)
-/// and subdirectories (every 4th entry; each holds 2–4 plain files), plus a
-/// few dotfiles the listing must hide. Deterministic, so bench fixtures are
-/// comparable run-to-run. Built ONCE per fixture, outside measured closures.
+/// Tempdir with exactly `entries` visible top-level entries (hidden dotfiles
+/// on top). Same `entries` → the same tree, every run.
 pub fn build_tree(entries: usize) -> TempDir {
     let dir = TempDir::new().expect("tempdir for the served tree");
     let root = dir.path();
     let mut rng = Rng(0x5eed_1234);
     for i in 0..entries {
-        // Every 4th entry a subdirectory (~25% of the tree).
         if i % 4 == 3 {
             let sub = root.join(dir_name(i / 4));
             std::fs::create_dir_all(&sub).expect("mkdir fixture subdirectory");
@@ -135,8 +114,6 @@ pub fn build_tree(entries: usize) -> TempDir {
     dir
 }
 
-/// Count of non-dot top-level entries — the sanity check for "the render
-/// listed the whole tree" (dotfiles are hidden by design).
 pub fn visible_entries(root: &Path) -> usize {
     std::fs::read_dir(root)
         .expect("read fixture root")

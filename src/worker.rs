@@ -501,9 +501,6 @@ async fn bind_loopback_fail_fast(
     }
 }
 
-/// Fails at startup: a store that cannot live on disk would 500 every
-/// webhook once the tunnel is up. The load reads and parses the whole
-/// store — blocking fs, moved off the async threads.
 async fn open_request_store(
     state: &StateDir,
     name: &str,
@@ -516,7 +513,6 @@ async fn open_request_store(
         let path = state
             .service_dir(&name)
             .join(hook_server::REQUESTS_FILENAME);
-        // load()'s Err is fatal here — never rename over an intact store.
         let log = HookLog::load(path.clone(), keep)
             .with_context(|| format!("opening hook request store {}", path.display()))?;
         Ok(Arc::new(std::sync::Mutex::new(log)))

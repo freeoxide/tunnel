@@ -1,21 +1,9 @@
-//! Criterion bench for a full GET through the static server's entire
-//! middleware stack (`server::static_server::router_with`): the body-limit,
-//! timeout, and nosniff layers, the `confine` and `serve_or_list` guards,
-//! and `ServeDir` itself — driven by `tower::ServiceExt::oneshot`, the same
-//! drive the in-module HTTP tests use. The tokio runtime is built ONCE,
-//! outside the measured closure, so per-iteration runtime setup cannot leak
-//! into the measurement.
-
-// The crate is bin-only (no lib target), so a bench cannot link it as a
-// library; instead each bench compiles the SAME module tree into its own
-// crate via #[path], mirroring the declarations in src/main.rs. That is also
-// what keeps the modules' internal `crate::` paths resolving.
-// cargo builds bench targets with `--cfg test` (but no `--test`), so the
-// mirrored tree's #[cfg(test)] modules compile while their #[test] fns stay
-// dead — dead_code alone would leave their imports dangling into
-// unused_imports warnings. Both allows exist only for that fallout.
+// Cargo builds bench targets with `--cfg test` but no `--test`, so the
+// mirrored #[test] fns compile dead and their imports dangle into warnings.
 #![allow(dead_code, unused_imports)]
 
+// Bin-only crate — a bench cannot link it, so this mirrors the src/main.rs
+// module tree via #[path]; that is what keeps `crate::` paths resolving.
 #[path = "../src/cli.rs"]
 mod cli;
 #[path = "../src/cloudflared.rs"]
@@ -56,7 +44,6 @@ use axum::http::{Request, StatusCode};
 use criterion::{Criterion, criterion_group, criterion_main};
 use tower::ServiceExt;
 
-/// The measured GET target: one small plain file (32 KiB) at the tree root.
 const FILE_PATH: &str = "/bench-file.txt";
 const FILE_LEN: usize = 32 * 1024;
 
@@ -79,8 +66,6 @@ fn bench(c: &mut Criterion) {
         .build()
         .expect("build the bench runtime");
 
-    // Verify the work actually happened (measurement hygiene): outside the
-    // timer, one full GET must 200 with the whole file body.
     {
         let req = Request::builder()
             .method("GET")

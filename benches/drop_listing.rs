@@ -1,19 +1,9 @@
-//! Criterion benches for the drop bucket's listing render
-//! (`server::drop_server::render_listing`) — read-dir + canonicalize +
-//! metadata + format over a `DropStore`, measured pure. Same tree shape as
-//! the static listing benches (`common::build_tree`), built once per size
-//! outside the measured closure.
-
-// The crate is bin-only (no lib target), so a bench cannot link it as a
-// library; instead each bench compiles the SAME module tree into its own
-// crate via #[path], mirroring the declarations in src/main.rs. That is also
-// what keeps the modules' internal `crate::` paths resolving.
-// cargo builds bench targets with `--cfg test` (but no `--test`), so the
-// mirrored tree's #[cfg(test)] modules compile while their #[test] fns stay
-// dead — dead_code alone would leave their imports dangling into
-// unused_imports warnings. Both allows exist only for that fallout.
+// Benches build with `--cfg test` but no `--test`: the mirrored #[cfg(test)]
+// modules compile while their #[test] fns stay dead, tripping both allows.
 #![allow(dead_code, unused_imports)]
 
+// Bin-only crate — a bench cannot link it, so this mirrors the src/main.rs
+// module tree via #[path]; that is what keeps `crate::` paths resolving.
 #[path = "../src/cli.rs"]
 mod cli;
 #[path = "../src/cloudflared.rs"]
@@ -57,9 +47,6 @@ fn bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("drop_listing");
     for (id, size) in [("render_100_plain", 100usize), ("render_1000_plain", 1000)] {
         let dir = common::build_tree(size);
-        // Generous caps: `open` only measures the tree against them, and the
-        // bench must never be cap-bound — it measures the render, not upload
-        // accounting.
         let store = DropStore::open(
             dir.path(),
             "bench-token-0000111122223333".to_string(),
@@ -67,9 +54,6 @@ fn bench(c: &mut Criterion) {
             1024 * 1024 * 1024,
         )
         .expect("open the bench DropStore");
-        // Verify the work actually happened (measurement hygiene): one render
-        // outside the timer must list every visible top-level entry (an empty
-        // store would print a single "(nothing uploaded yet)" row).
         let html = render_listing(&store);
         assert_eq!(
             html.matches("<li>").count(),

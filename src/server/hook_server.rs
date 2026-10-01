@@ -5,9 +5,6 @@
 //! records newest-first; the inspection endpoints themselves are never
 //! recorded. Header capture is an ALLOWLIST so credential-bearing headers
 //! can never reach the store or the public inspection view.
-//!
-//! The store file is a JSON array maintained as an append window so a
-//! record costs O(record), not O(retained bytes) (see [`HookLog::record`]).
 
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
@@ -88,11 +85,6 @@ pub struct RecordedRequest {
 }
 
 impl RecordedRequest {
-    /// Build a record from a request head + body + a caller-stamped receive
-    /// time; pure, so the capture rules are unit-testable. The stamp is the
-    /// CALLER's business so it can be taken before the store's lock wait —
-    /// a queued request must report when it arrived, not when it was
-    /// admitted.
     fn capture(seq: u64, received_at: DateTime<Utc>, parts: &Parts, body: &[u8]) -> Self {
         let headers = parts
             .headers
@@ -124,39 +116,21 @@ impl RecordedRequest {
     }
 }
 
-/// Newest-first deque mirrored to `requests.json` (0600): front-push and
-/// back-pop keep both the append and the eviction O(1) in memory.
+/// Newest-first recorded-request store mirrored to `requests.json` (0600).
 #[derive(Debug)]
 pub struct HookLog {
     path: PathBuf,
     keep: usize,
     next_seq: u64,
-    /// Newest-first (front = newest) — by construction on append, by
-    /// seq-sort on load.
     requests: VecDeque<RecordedRequest>,
-    /// Immutable view snapshot, rebuilt lazily: a record invalidates it and
-    /// the next view pays one O(keep) rebuild that every later view shares,
-    /// so the write path never copies the store for the inspection routes.
     snapshot: Option<Arc<Vec<RecordedRequest>>>,
-    /// Append-window cursors for the file on disk; `None` whenever the
-    /// framing cannot be trusted (fresh load of foreign bytes, any io
-    /// error), forcing the next record through a full atomic rewrite.
     window: Option<Window>,
 }
 
-/// Where the live records sit in `requests.json`. The file is
-/// `[` + evicted-whitespace + records oldest-first `,`-separated +
-/// tail-whitespace + `]`: appending the newest record writes only its own
-/// bytes into the tail pad, evicting the oldest whitens only its own bytes
-/// at the head — the retained bytes in between never move, so a record
-/// costs O(record) of fs work instead of a whole-file rewrite.
 #[derive(Debug)]
 struct Window {
-    /// Offset of the first live record (1 + evicted bytes).
     live_start: u64,
-    /// Offset one past the last live record (start of the tail pad).
     live_end: u64,
-    /// Total file length; the byte at `file_len - 1` is `]`.
     file_len: u64,
 }
 
@@ -179,23 +153,15 @@ const HYPER_HEAD_BUDGET: usize = 417_792;
 /// legitimate stores on reload and wipe them.
 const STORE_RECORD_OVERHEAD: usize = HYPER_HEAD_BUDGET * 2 + 2 * 1024;
 
-/// Tail-pad floor reserved by a full rewrite. The pad is what makes the
-/// per-record appends possible; half the live bytes (floored here) keeps a
-/// rewrite amortized over proportionally many records at any store shape.
 const MIN_TAIL_PAD: usize = 64 * 1024;
 
 /// Upper bound on a store this server could have written at `keep` records;
-/// saturating, u64 for [`read_store_blob`]'s `File::take`. Live bytes only —
-/// the journal's pad slack is added once, in [`absolute_read_bound`].
+/// saturating, u64 for [`read_store_blob`]'s `File::take`.
 fn store_read_bound(keep: usize) -> u64 {
     let per_record = (MAX_REQUEST_BODY * JSON_ESCAPE_FACTOR + STORE_RECORD_OVERHEAD) as u64;
     (keep as u64).saturating_mul(per_record)
 }
 
-/// [`store_read_bound`] at [`MAX_KEEP`], independent of the loading keep — a
-/// store written at ANY supported keep fits; load() truncates after — plus
-/// the journal's own slack: a file is live bytes + pad (≤ live/2, floored at
-/// [`MIN_TAIL_PAD`]) + the two framing bytes, all of it legitimate.
 fn absolute_read_bound() -> u64 {
     let live = store_read_bound(MAX_KEEP);
     live + live / 2 + MIN_TAIL_PAD as u64 + 2
@@ -203,8 +169,6 @@ fn absolute_read_bound() -> u64 {
 
 /// Read at most `bound + 1` bytes (the +1 tells at-the-bound from past-it);
 /// bounding the READ, not just the parse, so no stray huge file is slurped.
-/// `len_hint` (the stat that gated the read) reserves the Vec's capacity
-/// up front instead of growing it geometrically.
 fn read_store_blob(path: &Path, bound: u64, len_hint: u64) -> std::io::Result<Vec<u8>> {
     let file = File::open(path)?;
     let mut bytes = Vec::with_capacity(len_hint.min(bound.saturating_add(1)) as usize);
@@ -213,24 +177,14 @@ fn read_store_blob(path: &Path, bound: u64, len_hint: u64) -> std::io::Result<Ve
 }
 
 impl HookLog {
-    /// Load the store at `path`, or start empty when it does not exist. A
-    /// corrupt (or past-the-ceiling) store degrades to empty: corruption
-    /// implies disk trouble, and bricking the service is worse than
-    /// restarting the log — webhook senders re-deliver. The exception is a
-    /// TORN append window ([`repair_torn_window`]): the in-place protocol
-    /// can only damage an edge, so the intact records are recovered instead
-    /// of wiped. Any OTHER read error fails the load: the store may be
-    /// intact behind it, and an empty fallback would let the next append's
-    /// rename destroy it.
-    /// The loaded store is re-truncated to `keep` — a lowered keep never
-    /// wipes the log.
+    /// Load the store at `path`, or start empty when absent. A corrupt or
+    /// past-the-ceiling store degrades to empty — except a torn window,
+    /// whose intact records recover. Other errors fail. Truncates to `keep`.
     pub fn load(path: PathBuf, keep: usize) -> std::io::Result<Self> {
         // keep arrives unvalidated on the hidden run-worker path; clamp so
         // retention can't write past the ceiling.
         let keep = keep.min(MAX_KEEP);
         let ceiling = absolute_read_bound();
-        // One stat feeds both the oversized refusal and the read's capacity
-        // hint — no second metadata() pass.
         let mut window = None;
         let mut requests = match std::fs::metadata(&path) {
             // Past the ceiling by metadata: refuse without reading a giant.
@@ -283,9 +237,6 @@ impl HookLog {
                 }
             }
         };
-        // The file is oldest-first, so reverse first: the stable sort then
-        // keeps the LAST-recorded of equal (saturated) seqs in front, the
-        // same tie-break the record path's deque order gives.
         requests.reverse();
         requests.sort_by_key(|r| std::cmp::Reverse(r.seq));
         requests.truncate(keep);
@@ -305,37 +256,17 @@ impl HookLog {
         })
     }
 
-    /// Insert + persist. Steady state is O(record): the new record is
-    /// serialized once and written into the file's tail pad, the evicted
-    /// oldest is whitened in place — the retained bytes in between never
-    /// move. Only when the pad runs out (or after a load of untrusted
-    /// framing) does [`HookLog::reserve`] rewrite the whole file atomically,
-    /// amortized over half-the-live-bytes of pad; a torn in-place write is
-    /// healed by that same rewrite in the SAME delivery, never left on disk
-    /// for a restart to trip over. Whatever the io outcome, the deque never
-    /// exceeds `keep` past a return: a 500'd delivery still replaces the
-    /// oldest record, exactly like the old insert+truncate+persist did.
-    ///
-    /// No fsync, by contract: exactly like the old whole-file persist,
-    /// durability ends at the page cache — the drop store's fsync
-    /// asymmetry is documented behavior, not a bug to fix here; any future
-    /// fsync must ride a group commit, never land per record.
-    ///
-    /// `pub(crate)` so the benches can drive the record->persist path
-    /// directly; same-crate visibility only, no behavior change.
     pub(crate) fn record(&mut self, req: RecordedRequest) -> std::io::Result<()> {
         self.snapshot = None;
         self.requests.push_front(req);
         let bytes =
             serde_json::to_vec(self.requests.front().expect("just pushed")).map_err(ser_io)?;
         let fits = self.window.as_ref().is_some_and(|w| {
-            // Strictly greater: the extra byte is the separator comma; an
-            // empty live region skips it, so this over-requires by one.
+            // Gates on bytes.len(), but a non-empty live region's framed
+            // write is comma+record (bytes.len()+1): exact fit leaves no pad before `]`.
             w.file_len - 1 - w.live_end > bytes.len() as u64
         });
         if !fits {
-            // Evict in memory first so the rewrite carries exactly the
-            // retained set.
             while self.requests.len() > self.keep {
                 self.requests.pop_back();
             }
@@ -358,23 +289,12 @@ impl HookLog {
                 }
                 Ok(())
             })(),
-            // The store vanished under a live window (external deletion):
-            // recreate it in THIS delivery, like the old whole-file persist
-            // did — the retry contract is for real disk trouble, not this.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 while self.requests.len() > self.keep {
                     self.requests.pop_back();
                 }
                 return self.reserve();
             }
-            // Nothing reached the file — but the eviction above just broke
-            // the invariant the fits path relies on (the disk live region
-            // mirrors the deque): restoring the window is only sound while
-            // the deque still matches that region, and the disk still holds
-            // the evicted record instead of the 500'd one. Drop the window:
-            // the next delivery re-converges disk and memory through the
-            // atomic reserve() rewrite — an amortized one-rewrite cost
-            // after a transient error.
             Err(e) => {
                 while self.requests.len() > self.keep {
                     self.requests.pop_back();
@@ -389,13 +309,6 @@ impl HookLog {
                 Ok(())
             }
             Err(e) => {
-                // The edit may have torn the file mid-write. Heal NOW with
-                // the atomic rewrite — leaving a torn file behind for a
-                // restart to trip over is the loss path the old atomic
-                // persist excluded. If even the rewrite fails the disk is
-                // failing outright: report the ORIGINAL error and let the
-                // 500-retry contract take over (window stays None, so the
-                // next record retries the rewrite).
                 self.window = None;
                 while self.requests.len() > self.keep {
                     self.requests.pop_back();
@@ -416,9 +329,6 @@ impl HookLog {
         seq
     }
 
-    /// Shared immutable snapshot for the inspection views: the Arc hand-off
-    /// is a clone, not a store copy under the lock, and consecutive views
-    /// share one rebuild until the next record invalidates it.
     fn snapshot_arc(&mut self) -> Arc<Vec<RecordedRequest>> {
         Arc::clone(
             self.snapshot
@@ -426,8 +336,7 @@ impl HookLog {
         )
     }
 
-    /// Point-in-time copy, bounded by `keep` × the body cap (tests; the
-    /// views take the shared [`HookLog::snapshot_arc`]).
+    /// Point-in-time copy, bounded by `keep` × the body cap.
     #[cfg(test)]
     fn snapshot(&mut self) -> Vec<RecordedRequest> {
         self.requests.iter().cloned().collect()
@@ -438,11 +347,6 @@ impl HookLog {
         self.requests.len()
     }
 
-    /// The only O(retained) write, paid on a load of untrusted framing,
-    /// after io errors, and when the tail pad runs out. Atomic tmp+rename
-    /// with private perms (the store carries request paths and bodies — the
-    /// logs' 0600 class): a crash leaves either the old or the new file,
-    /// never a torn one.
     fn reserve(&mut self) -> std::io::Result<()> {
         let mut data = Vec::with_capacity(self.requests.len() * 256 + MIN_TAIL_PAD + 2);
         data.push(b'[');
@@ -476,16 +380,6 @@ impl HookLog {
 }
 
 impl Window {
-    /// Trust the on-disk framing only when the file is byte-for-byte
-    /// something this store writes: bracket-framed with no whitespace
-    /// outside the brackets, records already in canonical oldest-first
-    /// order (non-decreasing seq — the in-place evict whitens the LEFT
-    /// end), nothing about to be truncated (the live region must equal the
-    /// retained set), and every record re-serializing to its exact on-disk
-    /// length (serde is deterministic for these values, but a format
-    /// change across binary versions must force a rewrite, not corrupt
-    /// the file). Anything else — hand-edited, legacy newest-first —
-    /// returns None and the next record rewrites the file atomically.
     fn scan(bytes: &[u8], parsed: &[RecordedRequest], keep: usize) -> Option<Self> {
         if parsed.len() > keep
             || parsed.windows(2).any(|pair| pair[0].seq > pair[1].seq)
@@ -516,41 +410,14 @@ impl Window {
     }
 }
 
-/// serde failures are not io, but every caller of them is doing fs work and
-/// reports `io::Result` — fold the message in.
 fn ser_io(e: serde_json::Error) -> std::io::Error {
     std::io::Error::other(format!("serializing a recorded request: {e}"))
 }
 
-/// Recover the intact records from a torn append window. A record makes at
-/// most ONE positional write per edge, so a genuine tear damages exactly one
-/// edge: at the left, the tail of the half-whitened oldest record — a
-/// suffix of that record's serialization, so it ends with the fixed
-/// `,"truncated":…}` field and carries at least one unmatched closing
-/// bracket (the record's own `}`) under a string-aware count, whatever the
-/// body bytes — optionally reduced to just its separator comma; at the
-/// right, an incomplete new record, which always begins `{`. Anything else
-/// — damage between good records, leading junk that is not a record tail, a
-/// torn tail not starting `{`, no pad byte before the closing bracket (the
-/// writer's strictly-greater `fits` always leaves one) — is foreign
-/// corruption: None, and the caller wipes exactly as before. A remnant cut
-/// inside the trailing field is recovered exactly when it is a suffix of
-/// the bare field (`"truncated":…}` down to a lone `}`) — the
-/// data-preserving side of an unavoidable ambiguity; a non-matching tail
-/// like `x}` wipes. Without this, a crash between a torn
-/// write and the next successful record cost the WHOLE retained history —
-/// a loss path the old atomic tmp+rename persist excluded.
 fn repair_torn_window(bytes: &[u8]) -> Option<Vec<RecordedRequest>> {
     if bytes.first() != Some(&b'[') || bytes.last() != Some(&b']') {
         return None;
     }
-    // Anything but a pad byte immediately before the closing bracket is
-    // foreign: reserve always pads, and an append onto an empty live
-    // region leaves at least one (its framed write carries no separator,
-    // and `fits` is strictly-greater). One writer state does legally end
-    // with zero pad — an append onto a NON-empty region at the exact fit
-    // boundary (pad == len+1) — and a genuine tear on such a store is
-    // conservatively wiped with it; accepted cost, kept deliberate.
     if !bytes[bytes.len() - 2].is_ascii_whitespace() {
         return None;
     }
@@ -572,18 +439,11 @@ fn repair_torn_window(bytes: &[u8]) -> Option<Vec<RecordedRequest>> {
                 if expect_separator {
                     expect_separator = false;
                 } else if stray_comma.replace(i).is_some() {
-                    // Two separators with nothing between: no single tear
-                    // writes two commas.
                     return None;
                 }
                 i += 1;
             }
             _ => {
-                // A value at separator position is fine INSIDE the damaged
-                // leading region — a mid-record remnant scans as
-                // key/value fragments (`"method"` then `:"POST"`) — but
-                // fatal anywhere else: no tear removes a separator that
-                // sits BETWEEN records.
                 if expect_separator {
                     misfits.push(i);
                 }
@@ -593,8 +453,6 @@ fn repair_torn_window(bytes: &[u8]) -> Option<Vec<RecordedRequest>> {
                         i = end;
                         expect_separator = true;
                     }
-                    // An incomplete value is the torn new record — records
-                    // serialize as objects, so it must begin `{`.
                     None if interior[i] == b'{' => i = interior.len(),
                     None => return None,
                 }
@@ -611,24 +469,16 @@ fn repair_torn_window(bytes: &[u8]) -> Option<Vec<RecordedRequest>> {
                 }
                 records.push(record);
             }
-            // The torn-evict remnant leads; anything invalid AFTER a good
-            // record is foreign corruption, not a tear.
             Err(_) if records.is_empty() => continue,
             Err(_) => return None,
         }
     }
-    // A separator-only evict tear leaves exactly one comma at value
-    // position — it belongs to the leading damaged region, never between
-    // records.
     if stray_comma.is_some_and(|pos| pos >= first_good) {
         return None;
     }
     if misfits.iter().any(|&pos| pos >= first_good) {
         return None;
     }
-    // The leading damaged bytes must be a record tail (plus its separator
-    // comma, or nothing but that comma) — the only shapes a torn evict
-    // leaves.
     let head = interior[..first_good].trim_ascii();
     let Some(remnant) = head.strip_suffix(b",") else {
         return (head.is_empty()).then_some(records);
@@ -642,19 +492,9 @@ fn repair_torn_window(bytes: &[u8]) -> Option<Vec<RecordedRequest>> {
     .then_some(records)
 }
 
-/// The fixed end of every record serialization: the last field, plus the
-/// comma that separates it from `body_len`. A genuine evict remnant long
-/// enough to span it ends with one of these; a remnant cut INSIDE the field
-/// is a proper suffix of the bare field.
 const RECORD_TAILS: [&[u8]; 2] = [b",\"truncated\":true}", b",\"truncated\":false}"];
 const RECORD_TAIL_FIELDS: [&[u8]; 2] = [b"\"truncated\":true}", b"\"truncated\":false}"];
 
-/// String-aware bracket balance of `bytes` (`{[=+1`, `}]=-1`, quoted bytes
-/// ignored), with the caller picking the phase at offset 0 — a remnant cut
-/// mid-string begins inside one, and only one of the two phases is the true
-/// one. A record suffix always closes its own record brace unmatched, so
-/// its true-phase balance is ≤ -1; complete values (numbers, strings,
-/// balanced objects) sit at 0.
 fn bracket_balance(bytes: &[u8], start_in_string: bool) -> i32 {
     let mut balance = 0i32;
     let mut in_string = start_in_string;
@@ -680,11 +520,6 @@ fn bracket_balance(bytes: &[u8], start_in_string: bool) -> i32 {
     balance
 }
 
-/// Scan one comma-separated JSON value starting at `start` (a non-ws,
-/// non-comma byte); the exclusive end offset, or None when the value does
-/// not complete before the buffer ends (a torn write). Mismatched garbage
-/// brackets can "complete" early — harmless: the range then fails
-/// deserialization and is treated as damage.
 fn scan_value(bytes: &[u8], start: usize) -> Option<usize> {
     let end = bytes.len();
     match bytes[start] {
@@ -740,16 +575,11 @@ fn scan_value(bytes: &[u8], start: usize) -> Option<usize> {
     }
 }
 
-/// Positional write: seek+write_all stands in for pwrite (portable), and no
-/// reader exists outside the store's mutex, so the seek is race-free.
 fn write_at(file: &mut File, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
     file.seek(SeekFrom::Start(offset))?;
     file.write_all(bytes)
 }
 
-/// Write the newest record into the tail pad; the retained bytes are
-/// untouched. `window` must describe the live region exactly (see
-/// [`Window::scan`]).
 fn append_at(file: &mut File, window: &mut Window, bytes: &[u8]) -> std::io::Result<()> {
     let mut framed = Vec::with_capacity(bytes.len() + 1);
     if window.live_start != window.live_end {
@@ -761,9 +591,6 @@ fn append_at(file: &mut File, window: &mut Window, bytes: &[u8]) -> std::io::Res
     Ok(())
 }
 
-/// Whiten the evicted oldest record (and its trailing separator) at the
-/// head of the live region: the file keeps its length, the array just
-/// loses its last element.
 fn evict_at(
     file: &mut File,
     window: &mut Window,
@@ -820,9 +647,6 @@ async fn record(State(log): State<Arc<Mutex<HookLog>>>, request: Request) -> Res
                 .into_response();
         }
     };
-    // Stamped before the blocking hop and the store's lock wait: a request
-    // queued behind another delivery reports when it ARRIVED, not when it
-    // was admitted.
     let received_at = crate::model::now_utc();
     // Blocking fs work off the async threads (request-path discipline).
     let persisted = tokio::task::spawn_blocking(move || {
@@ -853,9 +677,6 @@ async fn record(State(log): State<Arc<Mutex<HookLog>>>, request: Request) -> Res
     }
 }
 
-/// Snapshot off the async thread: the record path holds this lock across
-/// the store write, so an async-side lock() could park a tokio worker. The
-/// Arc hand-off makes the lock hold a clone, not a store copy.
 async fn snapshot_offline(log: &Arc<Mutex<HookLog>>) -> Arc<Vec<RecordedRequest>> {
     let log = Arc::clone(log);
     tokio::task::spawn_blocking(move || lock(&log).snapshot_arc())
@@ -865,7 +686,6 @@ async fn snapshot_offline(log: &Arc<Mutex<HookLog>>) -> Arc<Vec<RecordedRequest>
 
 async fn inspect_html(State(log): State<Arc<Mutex<HookLog>>>) -> Html<String> {
     let requests = snapshot_offline(&log).await;
-    // Rendering walks every retained record — off the async runtime thread.
     let html = tokio::task::spawn_blocking(move || render_inspection(&requests))
         .await
         .unwrap_or_default();
@@ -911,9 +731,6 @@ fn render_inspection(requests: &[RecordedRequest]) -> String {
     html_page(&escape_html(&title), &body)
 }
 
-/// Same payload `Json<Vec<RecordedRequest>>` served, but serialized off the
-/// async runtime thread (it is O(retained bytes)) straight from the shared
-/// snapshot — no second deep copy under the lock.
 async fn inspect_json(State(log): State<Arc<Mutex<HookLog>>>) -> Response {
     let requests = snapshot_offline(&log).await;
     let body =
@@ -970,14 +787,12 @@ mod tests {
             .to_vec()
     }
 
-    /// Build a `Parts` head for [`RecordedRequest::capture`] without a full
-    /// request round-trip.
-    /// A receive stamp for [`RecordedRequest::capture`]; no pinned rule
-    /// asserts on the value, only on where it is taken (see `record`).
     fn recv_stamp() -> DateTime<Utc> {
         crate::model::now_utc()
     }
 
+    /// Build a `Parts` head for [`RecordedRequest::capture`] without a full
+    /// request round-trip.
     fn parts(method: &str, uri: &str, headers: &[(&str, &str)]) -> Parts {
         let mut builder = Request::builder().method(method).uri(uri);
         for (name, value) in headers {
@@ -1062,12 +877,9 @@ mod tests {
         );
     }
 
-    /// transfer-A11 pin: [`HYPER_HEAD_BUDGET`] must recompute hyper's own
-    /// whole-wire head budget — hyper-1.10.1 `src/proto/h1/io.rs:22-24`
-    /// (`DEFAULT_MAX_BUFFER_SIZE = 8192 + 4096 * 100`) built from
-    /// `src/proto/h1/role.rs:31` (`DEFAULT_MAX_HEADERS = 100`). If hyper
-    /// grows a default and this drifts low, load() classes legitimate
-    /// stores as oversized and the next append wipes the whole history.
+    /// [`HYPER_HEAD_BUDGET`] mirrors hyper-1.10.1's DEFAULT_MAX_BUFFER_SIZE
+    /// (src/proto/h1/io.rs: 8 KiB + 4 KiB × 100, from DEFAULT_MAX_HEADERS =
+    /// 100); drifting low makes load() wipe legitimate stores as oversized.
     #[test]
     fn hyper_head_budget_is_pinned_to_hyper_1_10_wire_defaults() {
         let recomputed = 8 * 1024 + 4 * 1024 * 100;
@@ -1087,10 +899,6 @@ mod tests {
         );
     }
 
-    /// The read bound refuses nothing AT the bound: a fixture of exactly
-    /// `bound` bytes reads in full, while the +1 slack is what surfaces a
-    /// past-the-bound fixture as longer than the bound (the load gate's
-    /// only discriminator between at-it and past-it).
     #[test]
     fn read_store_blob_reads_a_fixture_exactly_at_the_bound_in_full() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1379,9 +1187,6 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600, "store must be owner-only");
     }
 
-    /// A run long enough to cross the tail-pad exhaustion (several full
-    /// rewrites): the append-window cursors must still describe the file
-    /// exactly, or in-place appends/evicts would silently corrupt it.
     #[test]
     fn many_records_keep_the_window_truthful_across_rewrites() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1400,10 +1205,6 @@ mod tests {
         assert_eq!(reloaded.snapshot(), snap, "the window must land intact");
     }
 
-    /// A legacy (or hand-edited) newest-first array is not this store's
-    /// canonical oldest-first framing: it must still load, and the next
-    /// record must rewrite it into the canonical layout instead of
-    /// appending into cursors that do not describe it.
     #[test]
     fn a_legacy_newest_first_store_loads_and_is_normalized_on_the_next_record() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1428,16 +1229,12 @@ mod tests {
         let mut reloaded = HookLog::load(path.clone(), 5).expect("reload");
         let paths: Vec<String> = reloaded.snapshot().into_iter().map(|r| r.path).collect();
         assert_eq!(paths, vec!["/after", "/new", "/old"]);
-        // The normalized file is a plain JSON array — the format any
-        // external reader (and the bench) expects.
         let on_disk: Vec<RecordedRequest> =
             serde_json::from_slice(&std::fs::read(&path).expect("read the store"))
                 .expect("the store file stays a JSON array");
         assert_eq!(on_disk.len(), 3);
     }
 
-    /// A crash mid-append leaves a partial record at the right edge: the
-    /// intact records must come back instead of the whole store wiping.
     #[test]
     fn a_torn_append_keeps_the_intact_records_on_reload() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1450,7 +1247,7 @@ mod tests {
         torn.push(b',');
         torn.extend(serde_json::to_vec(&rec2).expect("serialize"));
         torn.push(b',');
-        torn.extend(br#"{"seq":3,"path":"/thre"#); // the torn new record
+        torn.extend(br#"{"seq":3,"path":"/thre"#);
         torn.extend_from_slice(b"      ");
         torn.push(b']');
         std::fs::write(&path, &torn).expect("plant torn store");
@@ -1459,8 +1256,6 @@ mod tests {
         let snap = log.snapshot();
         assert_eq!(snap.len(), 2, "the intact records survive the torn edge");
         assert_eq!(snap[0].path, "/two", "newest first as always");
-        // The recovered store keeps recording; the next record rewrites it
-        // into the canonical framing.
         let head = parts("POST", "/after", &[]);
         log.record(RecordedRequest::capture(3, recv_stamp(), &head, b"x"))
             .expect("record");
@@ -1469,10 +1264,6 @@ mod tests {
         assert_eq!(paths, vec!["/after", "/two", "/one"]);
     }
 
-    /// A crash mid-evict leaves the remnant of the half-whitened oldest at
-    /// the left edge — or just its separator comma, when the whitening
-    /// consumed the record bytes but not the comma: the records behind it
-    /// must come back.
     #[test]
     fn a_torn_evict_keeps_the_records_behind_it_on_reload() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1507,8 +1298,6 @@ mod tests {
         assert_eq!(log.snapshot()[0].path, "/new");
     }
 
-    /// Damage BETWEEN two good records is not a tear shape: foreign
-    /// corruption keeps the wipe semantics.
     #[test]
     fn foreign_damage_between_good_records_still_wipes() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1517,11 +1306,6 @@ mod tests {
         let rec2 = RecordedRequest::capture(2, recv_stamp(), &parts("POST", "/two", &[]), b"");
         let ser1 = serde_json::to_vec(&rec1).expect("serialize");
         let ser2 = serde_json::to_vec(&rec2).expect("serialize");
-        // The round-4/5 audit's probe shapes, plus the interior damage one:
-        // none of these is producible by a single torn edge write (the
-        // writer always leaves a pad byte before `]`, and a torn append's
-        // record always begins `{`), so all must wipe exactly like the
-        // pre-repair code did.
         let probes: [(&str, Vec<u8>); 6] = [
             ("leading number", {
                 let mut f = Vec::new();
@@ -1589,11 +1373,6 @@ mod tests {
         }
     }
 
-    /// A JSON webhook body carries literal braces through the record's
-    /// serialization; torn-edge recovery must survive them at ANY whitening
-    /// offset (the round-5 audit probed a body of `{"ok":true,"deep":{"x":1}}`
-    /// and the round-4 content heuristic rejected every cut before the last
-    /// brace).
     #[test]
     fn torn_edges_recover_for_brace_heavy_json_bodies() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1608,9 +1387,6 @@ mod tests {
             "the fixture's serialization must carry body braces"
         );
 
-        // Torn evict: the whitening stopped after k bytes, leaving k spaces
-        // plus the serialization's suffix and its separator comma. Every
-        // offset that leaves the full trailing field must recover rec2.
         for k in [1usize, 10, 44, 88, ser1.len() / 2, ser1.len() - 24] {
             let mut torn = Vec::new();
             torn.push(b'[');
@@ -1630,7 +1406,6 @@ mod tests {
             );
             assert_eq!(snap[0].path, "/hook");
             assert_eq!(snap[0].body.as_bytes(), body);
-            // And the recovered store keeps recording.
             let head = parts("POST", "/after", &[]);
             log.record(RecordedRequest::capture(3, recv_stamp(), &head, b"x"))
                 .expect("record");
@@ -1638,8 +1413,6 @@ mod tests {
             assert_eq!(reloaded.len(), 2, "recovered store still records");
         }
 
-        // Torn append: the incomplete new record begins `{` and may carry
-        // body braces of its own.
         let mut torn = Vec::new();
         torn.push(b'[');
         torn.extend_from_slice(&ser1);
@@ -1653,9 +1426,6 @@ mod tests {
         assert_eq!(log.snapshot()[0].seq, 1);
     }
 
-    /// External deletion mid-run: the old whole-file persist recreated the
-    /// store in the same delivery; the append window must too, not 500
-    /// once and wait for the sender's retry.
     #[test]
     fn record_recreates_an_externally_deleted_store_in_the_same_delivery() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1675,11 +1445,6 @@ mod tests {
         assert_eq!(paths, vec!["/second", "/first"]);
     }
 
-    /// A mid-write failure of the in-place edit must heal in the SAME
-    /// delivery via the atomic rewrite — not defer to the next record and
-    /// risk a restart wiping the torn file. /dev/full accepts opens and
-    /// seeks but fails every write with ENOSPC, standing in for a failing
-    /// disk (a Linux-only device).
     #[cfg(target_os = "linux")]
     #[test]
     fn record_heals_a_torn_in_place_write_in_the_same_delivery() {
@@ -1689,9 +1454,6 @@ mod tests {
         let head = parts("POST", "/first", &[]);
         log.record(RecordedRequest::capture(1, recv_stamp(), &head, b"one"))
             .expect("record");
-        // Swap the live store for a write-failing device: the next record's
-        // in-place append fails mid-delivery. The healing rewrite's tmp
-        // lands beside it and the rename replaces the symlink itself.
         std::fs::remove_file(&path).expect("remove the real store");
         std::os::unix::fs::symlink("/dev/full", &path).expect("plant a failing store");
 
@@ -1705,10 +1467,6 @@ mod tests {
         assert_eq!(paths, vec!["/second", "/first"]);
     }
 
-    /// A transient non-NotFound open failure (EISDIR here) must not leave
-    /// the 500'd record past `keep` in the view: the fits path evicts at
-    /// most one per delivery, so every error arm has to re-synchronize
-    /// retention itself. The round-6 bug left the deque at keep+1 forever.
     #[test]
     fn a_transient_open_failure_keeps_the_view_capped_at_keep() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1719,8 +1477,6 @@ mod tests {
             log.record(RecordedRequest::capture(seq, recv_stamp(), &head, b"x"))
                 .expect("record");
         }
-        // Stand the store path up as a directory: opens fail EISDIR (not
-        // NotFound), nothing reaches the file, the delivery 500s.
         std::fs::remove_file(&path).expect("remove the store");
         std::fs::create_dir(&path).expect("plant an EISDIR failure");
         let head = parts("POST", "/c", &[]);
@@ -1739,8 +1495,6 @@ mod tests {
             "the failed delivery still replaces the oldest record"
         );
 
-        // Recovery once the obstruction clears: the store recreates with
-        // exactly keep records.
         std::fs::remove_dir(&path).expect("clear the obstruction");
         let head = parts("POST", "/d", &[]);
         log.record(RecordedRequest::capture(4, recv_stamp(), &head, b"x"))
@@ -1751,12 +1505,6 @@ mod tests {
         assert_eq!(paths, vec!["/d", "/c"], "exactly keep records survive");
         drop(reloaded);
 
-        // The round-7 corruption reproduction: a transient non-NotFound
-        // failure on an INTACT store (chmod 000 -> EACCES), then one
-        // successful delivery. The arm must drop the window — restoring it
-        // would leave the next evict whitening the memory-oldest's length
-        // at the disk-oldest's offset, desyncing or corrupting the file
-        // until the next reserve.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1766,16 +1514,11 @@ mod tests {
             let failed = log.record(RecordedRequest::capture(5, recv_stamp(), &head, b"x"));
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
                 .expect("chmod 600 back");
-            // chmod is ineffective under root (and on mode-ignoring
-            // filesystems): the delivery succeeds and this phase is a
-            // no-op — skip gracefully.
             if failed.is_err() {
                 assert_eq!(log.snapshot_arc().len(), 2, "view still capped at keep");
                 let head = parts("POST", "/f", &[]);
                 log.record(RecordedRequest::capture(6, recv_stamp(), &head, b"x"))
                     .expect("the post-failure delivery must succeed");
-                // The fresh load is the corruption check: the file must
-                // parse and hold exactly keep records.
                 let mut reloaded = HookLog::load(path, 2).expect("reload");
                 let paths: Vec<String> = reloaded.snapshot().into_iter().map(|r| r.path).collect();
                 assert_eq!(
@@ -1787,9 +1530,6 @@ mod tests {
         }
     }
 
-    /// Pins the repair contract for remnants cut inside the trailing field:
-    /// suffixes of the bare field recover (down to a lone `}`); a
-    /// non-matching tail wipes.
     #[test]
     fn remnants_cut_inside_the_trailing_field_recover_by_suffix() {
         let tmp = tempfile::tempdir().expect("tempdir");

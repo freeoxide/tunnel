@@ -586,14 +586,10 @@ async fn listing(store: Arc<DropStore>, is_head: bool) -> Response {
 }
 
 /// Blocking half of [`listing`]; hides what the GET side would refuse.
-/// `pub(crate)` so the benches can drive it directly — same-crate visibility
-/// only, no behavior change.
 pub(crate) fn render_listing(store: &DropStore) -> String {
     listing_html(&visible_entries(&store.root))
 }
 
-/// The twin of `static_server::visible_entries`, plus each file's size —
-/// lstat of the entry itself, so an inner symlink shows its own length.
 fn visible_entries(root: &Path) -> Vec<(String, bool, u64)> {
     let mut entries: Vec<(String, bool, u64)> = Vec::new(); // (name, is_dir, size)
     if let Ok(read) = std::fs::read_dir(root) {
@@ -602,8 +598,6 @@ fn visible_entries(root: &Path) -> Vec<(String, bool, u64)> {
             if name.starts_with('.') {
                 continue;
             }
-            // d_type came with the readdir; a rare error (or a DT_UNKNOWN
-            // platform) falls back to lstat before classifying.
             let file_type = match entry.file_type() {
                 Ok(ft) => ft,
                 Err(_) => match std::fs::symlink_metadata(entry.path()) {
@@ -1589,9 +1583,6 @@ mod tests {
         assert!(res.is_ok(), "serve_on drained without error: {res:?}");
     }
 
-    /// transfer-A13 corpus: this module's helpers ARE `static_server`'s
-    /// (shared), and the cross-module assertion keeps it that way — a local
-    /// twin reintroduced here would resolve `super::` to itself and drift.
     #[test]
     fn token_helpers_match_the_static_origin_on_a_corpus() {
         use crate::server::static_server as origin;
@@ -1619,8 +1610,8 @@ mod tests {
         }
 
         let queries = [
-            ("token=a+b", "token", Some("a+b")), // a literal `+` stays a plus
-            ("token=a%2Bb", "token", Some("a+b")), // %2B decodes to the plus
+            ("token=a+b", "token", Some("a+b")),
+            ("token=a%2Bb", "token", Some("a+b")),
             ("token=a%20b", "token", Some("a b")),
             ("filename=x&token=t", "token", Some("t")),
             ("token", "token", None),
@@ -1658,16 +1649,12 @@ mod tests {
     }
 }
 
-/// d_type-classified drop listings must byte-match the
-/// canonicalize-everything classification they replaced, on the same random
-/// trees as the static listing's proptest.
 #[cfg(all(test, unix))]
 mod listing_parity_proptests {
     use super::*;
     use crate::server::static_server::parity_fixtures;
     use proptest::prelude::*;
 
-    /// The OLD classification, kept verbatim as the oracle.
     fn canonicalize_classified(root: &Path) -> Vec<(String, bool, u64)> {
         let mut entries: Vec<(String, bool, u64)> = Vec::new();
         for entry in std::fs::read_dir(root).expect("read_dir").flatten() {

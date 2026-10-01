@@ -19,10 +19,6 @@ impl StateDir {
         Ok(Self { root })
     }
 
-    /// Root directly at `root` — used by tests and the benches (which compile
-    /// the module tree into their own crates) to point at a tempdir without
-    /// mutating XDG_STATE_HOME (unsafe in edition 2024). Never used by the
-    /// shipped binary, hence the non-test `dead_code` allow.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new_at(root: PathBuf) -> Self {
         Self { root }

@@ -162,8 +162,6 @@ fn apply<'a>(reg: &mut Registry, candidates: &'a [Judgment]) -> Vec<(Service, &'
     removed
 }
 
-/// [`origin_alive_async`] once, and only if that failed again after
-/// [`REPROBE_DELAY`] — a restarting dev server drops the port briefly.
 async fn origin_dead_after_double_probe(port: u16) -> bool {
     if origin_alive_async(port).await {
         return false;
@@ -172,20 +170,11 @@ async fn origin_dead_after_double_probe(port: u16) -> bool {
     !origin_alive_async(port).await
 }
 
-/// Judge every snapshot entry — worker liveness (a fast /proc read), the
-/// origin double-probes, and [`plan`] — returning removal candidates plus
-/// the skipped-foreground names. The probes are spawned per service and
-/// awaited together: N dead origins pay ONE [`REPROBE_DELAY`] gap, not N;
-/// the gap itself is the deliberate mid-restart tolerance — overlapped,
-/// never shortened. A wall-clock test pins this exact loop: re-serializing
-/// it must fail CI, not just the wall-clock harness.
 async fn judge(services: &[Service]) -> (Vec<Judgment>, Vec<String>) {
     let mut liveness = Vec::with_capacity(services.len());
     let mut probes = Vec::with_capacity(services.len());
     for svc in services {
         let alive = worker_alive(svc);
-        // Probe the origin only when Running: a Starting worker's port may
-        // not be bound yet; a dead worker already explains a dead port.
         let probe = (alive == Some(true) && svc.public_url.is_some())
             .then(|| tokio::spawn(origin_dead_after_double_probe(svc.port)));
         liveness.push(alive);
@@ -195,8 +184,6 @@ async fn judge(services: &[Service]) -> (Vec<Judgment>, Vec<String>) {
     let mut candidates = Vec::new();
     let mut skipped_foreground = Vec::new();
     for ((svc, alive), probe) in services.iter().zip(liveness).zip(probes) {
-        // A probe task fails only by panicking; reading that as not-dead
-        // keeps a failed probe from ever removing an entry.
         let port_dead = match probe {
             Some(handle) => Some(handle.await.unwrap_or(false)),
             None => None,
@@ -221,13 +208,9 @@ async fn judge(services: &[Service]) -> (Vec<Judgment>, Vec<String>) {
 pub async fn run() -> Result<()> {
     let state = StateDir::new()?;
 
-    // --- snapshot + probe: strictly BEFORE the registry lock -----------------
-    // A dead double-probe can take ~1.75 s; never hold the lock that long.
     let snapshot = Registry::load(&state)?;
 
     if snapshot.services.is_empty() {
-        // Fresh machine: return before `Registry::update` — its lock-file
-        // creation would fail on a not-yet-existing state dir; stay a no-op.
         output::print_sanitized(&[], &[]);
         return Ok(());
     }
@@ -285,8 +268,6 @@ mod tests {
     //! over a seeded registry — asserted without sockets or signals.
     //! [`worker_alive`] probes real /proc state: the test binary's own pid
     //! is alive but lacks both needles — the recycled-pid scenario.
-    //! [`judge`]'s probe overlap is pinned by a real wall-clock bound driven
-    //! through the same helper `run` calls (decoy workers; unix only).
 
     use super::*;
     use chrono::TimeDelta;
@@ -473,10 +454,6 @@ mod tests {
         );
     }
 
-    // --- the double-probe (origin_dead_after_double_probe) ---------------------
-
-    /// Bind an ephemeral loopback listener, then drop it: a port that refuses
-    /// connections at once (the accepted-risk dead-port pattern).
     fn dead_loopback_port() -> u16 {
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .expect("bind loopback listener");
@@ -487,11 +464,6 @@ mod tests {
 
     #[tokio::test]
     async fn double_probes_overlap_their_reprobe_delay() {
-        // Two dead ports judged concurrently must pay ONE 750 ms gap, not two
-        // (the serial loop this replaces cost one gap per service), and never
-        // LESS than the gap — it is the deliberate mid-restart tolerance.
-        // Loopback refuses instantly, so the bounds leave the window pure
-        // REPROBE_DELAY plus scheduler noise.
         let port = dead_loopback_port();
         let start = std::time::Instant::now();
         let (first, second) = tokio::join!(
@@ -510,13 +482,6 @@ mod tests {
         );
     }
 
-    // --- the judge loop's concurrency ------------------------------------------
-
-    /// Spawn a decoy live worker: `sh` leading its own process group, argv
-    /// carrying the `run-worker` needle `pid_alive` probes for (the trailing
-    /// arg is $0, so it stays in argv; the body is a loop — a tail-exec'd
-    /// final command would replace argv). The wall-clock harness
-    /// (benches/sanitize_median.py) seeds the same shape via a double fork.
     #[cfg(unix)]
     fn spawn_decoy_worker() -> std::process::Child {
         use std::os::unix::process::CommandExt;
@@ -525,8 +490,6 @@ mod tests {
             .process_group(0)
             .spawn()
             .expect("spawn decoy sh");
-        // Fork returns before exec completes: spin until the needle is
-        // probe-visible, or worker_alive would flake on a blank cmdline.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !proc::pid_alive(child.id()) {
             assert!(
@@ -538,8 +501,6 @@ mod tests {
         child
     }
 
-    /// Reap the decoy's whole group (the endless loop's current `sleep` is a
-    /// grandchild); the negative pid addresses the pgid.
     #[cfg(unix)]
     fn kill_decoy(child: &mut std::process::Child) {
         let pgid = nix::unistd::Pid::from_raw(-(child.id() as i32));
@@ -547,14 +508,6 @@ mod tests {
         let _ = child.wait();
     }
 
-    /// THE loop-shape gate: judging FIVE dead-upstream services (the
-    /// wall-clock harness's zombie count) through the same [`judge`] `run`
-    /// calls must cost ONE 750 ms gap. Five, not two, so that ANY
-    /// re-serialization — fully serial, pairwise, or chunked — still runs
-    /// >= 2 gaps sequentially and fails the upper bound; a shortened gap
-    /// fails the lower. The futures-level test above cannot catch a
-    /// re-serialized caller; this one does. Unix-only: the decoy needs `sh`
-    /// and a /proc-style cmdline probe.
     #[cfg(unix)]
     #[tokio::test]
     async fn judge_pays_one_reprobe_gap_across_services() {

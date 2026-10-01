@@ -53,8 +53,6 @@ pub async fn run(
 }
 
 /// Open (and create the parent dir for) a hook service's request store.
-/// The load reads and parses the whole store — blocking fs, moved off the
-/// async threads.
 async fn open_hook_log(
     state: &StateDir,
     name: &str,
@@ -67,9 +65,6 @@ async fn open_hook_log(
         let path = state
             .service_dir(&name)
             .join(hook_server::REQUESTS_FILENAME);
-        // load fails fast on a non-NotFound read error (the store may be
-        // intact behind it) — surface the disk problem at startup, never
-        // rename over it.
         let log = HookLog::load(path.clone(), usize::from(keep))
             .with_context(|| format!("opening hook request store {}", path.display()))?;
         Ok(Arc::new(std::sync::Mutex::new(log)))

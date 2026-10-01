@@ -1,18 +1,6 @@
-//! The `doctor` command: read-only tunnel health diagnostics.
-//!
-//! Headline: a live tunnel whose origin port has nothing listening — a Proxy
-//! fronting a dead upstream 502s every request, invisible to `ft ls`. Plus
-//! `cloudflared` on PATH, worker liveness, state dir presence, and for `Run`
-//! services the orphan case: worker dead while the recorded command lives
-//! (no cmdline needle exists for an operator command — identity is
-//! best-effort, so the wording never attributes the pid or port outright).
-//! Strictly diagnostic: `Registry::load` only (creates nothing), no signals,
-//! no child processes; remediation is a printed `hint:`, never executed;
-//! exits 0 unless the state dir is unresolvable. [`origin_alive`] (blocking,
-//! `cmd/proxy.rs`'s pre-flight) and its async twin [`origin_alive_async`]
-//! (the concurrent probe paths here and in `cmd/sanitize.rs`) are this
-//! module's shared probes; `cmd/run.rs` keeps a private byte-identical async
-//! twin (`origin_ready`) — unifying the copies is a run.rs edit.
+//! The `doctor` command: read-only tunnel health diagnostics — `Registry::load`
+//! only (creates nothing), no signals, no child processes; remediation printed,
+//! never executed; exits 0 unless the state dir is unresolvable.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -83,10 +71,6 @@ pub async fn run() -> Result<()> {
     // falls back to empty); an unloadable one IS the finding.
     match Registry::load(&state) {
         Ok(reg) => {
-            // The per-service probes are network-bound (a PROBE_TIMEOUT window
-            // each); spawned and awaited together so N services pay one window,
-            // not N serialized ones. The checks are built afterwards, in
-            // registry order, so the printed report is unchanged.
             let probes: Vec<_> = reg
                 .services
                 .iter()
@@ -96,13 +80,8 @@ pub async fn run() -> Result<()> {
             for (svc, probe) in reg.services.iter().zip(probes) {
                 let (status, origin, command) = match probe.await {
                     Ok(triple) => triple,
-                    // Only a panicking probe task lands here; doctor stays
-                    // read-only and exits 0, so degrade to the probe-skipped
-                    // report instead of failing the command. Origin and
-                    // command drop TOGETHER: the Run dead-origin wording
-                    // reads a lone `None` command as "no pid recorded", so
-                    // ever re-probing just one of the two here would misword
-                    // a service whose pid IS recorded.
+                    // Origin and command drop together: the Run dead-origin
+                    // arm words a lone `None` command as "no pid recorded".
                     Err(_) => (svc.status(), None, None),
                 };
                 checks.extend(service_checks(svc, status, origin, command));
@@ -124,10 +103,6 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
-/// The per-service probes, run concurrently by [`run`]: the origin check
-/// (only when the worker is alive — a dead worker already explains any dead
-/// port) plus the Run command-child probe. Status rides along: it is a fast
-/// /proc read and spares the caller a second pass.
 async fn probe_service(svc: Service) -> (ServiceStatus, Option<bool>, Option<CommandProbe>) {
     let status = svc.status();
     let worker_alive = match status {
@@ -169,17 +144,13 @@ fn cloudflared_check() -> Check {
 }
 
 /// True when something accepts connections on `127.0.0.1:port` — shared
-/// `pub(crate)` so one probe copy exists. Blocking is fine for its remaining
-/// caller: `cmd/proxy.rs` makes a single pre-flight probe.
+/// `pub(crate)` so one probe copy exists. Blocking is fine for its only
+/// caller: `cmd/proxy.rs`'s single pre-flight probe.
 pub(crate) fn origin_alive(port: u16) -> bool {
     let addr = SocketAddr::new(IpAddr::from(Ipv4Addr::LOCALHOST), port);
     std::net::TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok()
 }
 
-/// Async twin of [`origin_alive`] for the concurrent probe paths — doctor's
-/// per-service loop and sanitize's double-probe issue many connects inside
-/// the runtime, where blocking ones would stall its workers; same
-/// `PROBE_TIMEOUT` bound, loopback-only by build.
 pub(crate) async fn origin_alive_async(port: u16) -> bool {
     let addr = SocketAddr::new(IpAddr::from(Ipv4Addr::LOCALHOST), port);
     matches!(
@@ -217,10 +188,6 @@ async fn command_probe(svc: &Service) -> Option<CommandProbe> {
     })
 }
 
-/// Build the checks for one service — a pure decision table over `(status,
-/// pid, kind, origin, command, state_dir)`, unit-testable without the real
-/// state dir. `origin` is the probe result, `None` when skipped because the
-/// worker is not alive; `command` is the Run-only child probe.
 fn service_checks(
     svc: &Service,
     status: ServiceStatus,
@@ -512,7 +479,6 @@ mod tests {
 
     #[tokio::test]
     async fn origin_alive_async_accepts_a_live_listener() {
-        // Parity with the blocking twin the concurrent paths replaced.
         let listener =
             std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback listener");
         let port = listener.local_addr().expect("local addr").port();

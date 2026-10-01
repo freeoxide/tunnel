@@ -35,10 +35,7 @@ const MAX_REQUEST_BODY: usize = 1024;
 
 /// Serve `dir` at `/` under the given flags (persisted on the registry
 /// entry, so the worker re-applies them); the layer order is load-bearing.
-/// The canonicalize below is a one-shot construction cost on the caller's
-/// thread — the no-blocking rule at [`confine`] governs request paths, not
-/// router building (and `block_in_place` would panic on a current-thread
-/// runtime, which tests use).
+/// The canonicalize is a one-shot construction cost — [`confine`]'s no-blocking rule covers request paths only.
 pub fn router_with(dir: PathBuf, flags: crate::model::StaticFlags) -> Router {
     let root = std::fs::canonicalize(&dir).unwrap_or(dir);
     let crate::model::StaticFlags { spa, cors, token } = flags;
@@ -106,9 +103,6 @@ async fn serve_or_list(State(root): State<PathBuf>, request: Request, next: Next
         Err(_) => return next.run(request).await,
     };
     let candidate = candidate_path(&root, &decoded);
-    // A plain file confine already verified is ServeDir's to serve — the
-    // whole second resolution is the waste this guard exists to skip. A
-    // directory still re-resolves (see [`Confined`]).
     let plain_file = request
         .extensions()
         .get::<Confined>()
@@ -139,8 +133,7 @@ async fn serve_or_list(State(root): State<PathBuf>, request: Request, next: Next
 }
 
 /// Blocking half of [`serve_or_list`]: render the listing, or `None` to fall
-/// through to `ServeDir`. `pub(crate)` so the benches can drive it directly —
-/// same-crate visibility only, no behavior change.
+/// through to `ServeDir`.
 pub(crate) fn render_listing(candidate: &Path, root: &Path) -> Option<String> {
     // Canonicalize fails on missing paths — those belong to ServeDir's 404.
     let resolved = std::fs::canonicalize(candidate).ok()?;
@@ -154,13 +147,6 @@ pub(crate) fn render_listing(candidate: &Path, root: &Path) -> Option<String> {
     Some(listing_html(&entries, candidate, root))
 }
 
-/// The entries a listing shows, classified. Dotfiles are hidden (confine
-/// refuses to serve them, so listing them would only advertise 404 links and
-/// leak names such as `.env`). Plain entries classify by d_type — free from
-/// readdir on Linux, no per-entry syscall — and only symlinks resolve, so
-/// escaping or dead links stay hidden (the guard 404s them) while an inner
-/// link shows its target's real kind. `None` = the directory cannot be read
-/// (ServeDir's 404, not an empty listing).
 fn visible_entries(dir: &Path, root: &Path) -> Option<Vec<(String, bool)>> {
     let mut entries: Vec<(String, bool)> = Vec::new(); // (name, is_dir)
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
@@ -169,8 +155,6 @@ fn visible_entries(dir: &Path, root: &Path) -> Option<Vec<(String, bool)>> {
         if name.starts_with('.') {
             continue;
         }
-        // d_type came with the readdir; a rare error (or a DT_UNKNOWN
-        // platform) falls back to lstat before classifying.
         let file_type = match entry.file_type() {
             Ok(ft) => ft,
             Err(_) => match std::fs::symlink_metadata(entry.path()) {
@@ -192,7 +176,6 @@ fn visible_entries(dir: &Path, root: &Path) -> Option<Vec<(String, bool)>> {
     Some(entries)
 }
 
-/// Row rendering for [`visible_entries`].
 fn listing_html(entries: &[(String, bool)], candidate: &Path, root: &Path) -> String {
     // The title is fs-derived — escaped like the labels.
     let title = escape_html(&format!("Index of {}", decoded_title(candidate, root)));
@@ -270,16 +253,13 @@ fn href_base(candidate: &Path, root: &Path) -> String {
     base
 }
 
-/// Percent-encode a name for an href (unreserved set plus `/`); shared with
-/// `drop_server`'s listing.
+/// Percent-encode a name for an href (unreserved set plus `/`).
 pub(crate) fn encode_href(name: &str) -> String {
     let mut out = String::new();
     push_encoded_href(&mut out, name);
     out
 }
 
-/// [`encode_href`] without the per-row String: the encoder is `Display`, so
-/// it appends straight into the row buffer.
 pub(crate) fn push_encoded_href(out: &mut String, name: &str) {
     const FRAGMENT: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
         .add(b' ')
@@ -318,7 +298,6 @@ pub(crate) fn escape_html(s: &str) -> String {
     out
 }
 
-/// [`escape_html`] appending into a caller-owned buffer.
 pub(crate) fn push_escaped_html(out: &mut String, s: &str) {
     for c in s.chars() {
         match c {
@@ -356,11 +335,9 @@ fn candidate_path(root: &Path, decoded: &str) -> PathBuf {
 /// Confinement guard (normative site — `drop_server` shares it verbatim):
 /// any dot segment 404s, and the canonicalised target must stay under the
 /// root (`canonicalize` follows symlinks, so an escaping link no longer
-/// `starts_with(root)`; missing paths fail canonicalize and 404 too). GET
-/// and HEAD only — other methods skip straight to ServeDir's uniform 405,
-/// so the answer cannot be used to probe which paths exist. A TOCTOU window
-/// remains before ServeDir's own open — closing it fully would mean
-/// replacing ServeDir.
+/// `starts_with(root)`; missing paths fail canonicalize and 404 too). A
+/// TOCTOU window remains before ServeDir's own open — closing it fully would
+/// mean replacing ServeDir.
 pub(crate) async fn confine(
     State(root): State<PathBuf>,
     mut request: Request,
@@ -387,14 +364,12 @@ pub(crate) async fn confine(
     let Some(is_dir) = confined else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    // Only the KIND is handed on (see [`Confined`]).
     request.extensions_mut().insert(Confined { is_dir });
     next.run(request).await
 }
 
 /// Blocking half of [`confine`] — also confines a directory's `index.html`
-/// (it may itself be an escaping symlink). `None` refuses; `Some(is_dir)` is
-/// the confined target's kind.
+/// (it may itself be an escaping symlink).
 fn confine_blocking(candidate: &Path, root: &Path) -> Option<bool> {
     let resolved = std::fs::canonicalize(candidate).ok()?;
     if !resolved.starts_with(root) {
@@ -407,23 +382,12 @@ fn confine_blocking(candidate: &Path, root: &Path) -> Option<bool> {
     Some(is_dir)
 }
 
-/// The one fact [`serve_or_list`] may take from [`confine`]: that the
-/// verified target was a plain file (its whole second resolution is then
-/// skippable). The resolved path itself is deliberately NOT handed on — a
-/// listing read_dir'ing confine's snapshot would list outside-root names for
-/// a directory swapped to an escaping symlink inside the window, where
-/// re-resolving refuses; the listing re-resolves instead. Single-request
-/// handoff only.
 #[derive(Clone)]
 struct Confined {
     is_dir: bool,
 }
 
-/// True if `path` exists and canonicalises to a target outside `root` —
-/// confines the directory-index file in addition to the request path.
 fn escapes_root(path: &Path, root: &Path) -> bool {
-    // symlink_metadata, not exists(): exists() follows links, so a broken
-    // symlink answers false and the branch below would be unreachable.
     if std::fs::symlink_metadata(path).is_err() {
         return false;
     }
@@ -519,16 +483,12 @@ async fn require_token(State(expected): State<Arc<str>>, request: Request, next:
     next.run(request).await
 }
 
-/// Case-insensitive `Bearer` scheme match (RFC 7235). Single shared
-/// implementation — `drop_server` imports it; no per-origin copies.
 pub(crate) fn bearer_token(value: &str) -> Option<&str> {
     let (scheme, credentials) = value.split_once(' ')?;
     scheme.eq_ignore_ascii_case("bearer").then_some(credentials)
 }
 
-/// First value of `key`, percent-decoded (a literal `+` stays a plus);
-/// borrowed unless percent-escapes force a copy. Single shared
-/// implementation — `drop_server` imports it; no per-origin copies.
+/// First value of `key`, percent-decoded (a literal `+` stays a plus).
 pub(crate) fn query_param<'a>(query: &'a str, key: &str) -> Option<Cow<'a, str>> {
     query.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
@@ -540,9 +500,7 @@ pub(crate) fn query_param<'a>(query: &'a str, key: &str) -> Option<Cow<'a, str>>
 }
 
 /// Constant-time compare (length folded in, no early return; empty expected
-/// matches nothing). The max(len) scan is a deliberate security property —
-/// never shorten it to an early-exit compare. Single shared implementation —
-/// `drop_server` imports it; no per-origin copies.
+/// matches nothing).
 pub(crate) fn tokens_match(provided: &str, expected: &str) -> bool {
     if expected.is_empty() {
         return false;
@@ -741,9 +699,6 @@ mod http_confinement_tests {
         }
     }
 
-    /// Pins the static-A9 decision: a broken `index.html` symlink makes
-    /// `escapes_root`'s unresolvable branch reachable and refuses `/sub/`
-    /// (before, `exists()` followed the dead link and a listing rendered).
     #[cfg(unix)]
     #[tokio::test]
     async fn a_broken_index_symlink_refuses_the_directory_listing() {
@@ -767,7 +722,6 @@ mod http_confinement_tests {
             );
         }
 
-        // The PARENT listing stays reachable — the breakage is /sub/-local.
         let r = plain_router(dir.path().to_path_buf());
         let resp = r.oneshot(req("/")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1043,9 +997,6 @@ mod listing_tests {
         }
     }
 
-    /// decode-parity contract (static-A8): confine and serve_or_list each
-    /// decode the RAW path exactly once — a literal `%20` filename is
-    /// reachable via `%2520`, never via double-decoding.
     #[tokio::test]
     async fn the_path_is_decoded_exactly_once_by_every_observer() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1058,7 +1009,6 @@ mod listing_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_of(resp).await, "literal");
 
-        // The once-decoded form names a different (missing) file.
         let resp = plain_router(dir.path().to_path_buf())
             .oneshot(req("GET", "/a%20b.txt"))
             .await
@@ -1295,17 +1245,11 @@ mod listing_tests {
         let outside = tempfile::tempdir().expect("outside tempdir");
         std::fs::create_dir(dir.path().join("sub")).expect("mkdir");
         let root = std::fs::canonicalize(dir.path()).expect("canonicalize");
-        // The in-flight swap: a confined directory becomes an escape.
         std::fs::remove_dir(root.join("sub")).expect("remove dir");
         symlink(outside.path(), root.join("sub")).expect("symlink");
         assert_eq!(render_listing(&root.join("sub"), &root), None);
     }
 
-    /// Pin for the confine→listing handoff: only the KIND may be handed on.
-    /// A `Confined` stashed before an in-flight swap must never let the
-    /// listing read a snapshot path — a directory turned escaping symlink
-    /// between the two guards refuses, exactly like the re-resolve always
-    /// did.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_stale_confined_kind_never_lists_a_swapped_directory() {
@@ -1729,9 +1673,6 @@ mod origin_flags_tests {
     }
 }
 
-/// Random-tree materializer shared by the listing-parity proptests here and
-/// in `drop_server`: both listings are asserted against a
-/// canonicalize-everything oracle on the same trees.
 #[cfg(all(test, unix))]
 pub(crate) mod parity_fixtures {
     use std::os::unix::fs::symlink;
@@ -1741,20 +1682,14 @@ pub(crate) mod parity_fixtures {
     use proptest::prelude::*;
     use proptest::sample::select;
 
-    /// One entry to plant, slash-nested under the root.
     #[derive(Clone, Debug)]
     pub(crate) enum Seed {
         File(String),
         Dir(String),
-        /// Absolute symlink to another path under the root.
         LinkIn(String, String),
-        /// Symlink whose target string is used verbatim (relative link).
         LinkRel(String, String),
-        /// Absolute symlink to a file outside the root.
         LinkOut(String),
-        /// Absolute symlink to a directory outside the root.
         LinkOutDir(String),
-        /// Symlink to a name that is never planted.
         Dangling(String),
     }
 
@@ -1797,17 +1732,12 @@ pub(crate) mod parity_fixtures {
         })
     }
 
-    /// A planted tree: `dirs` (root included, symlinks never followed) are
-    /// the candidates the parity assertions list. Both tempdirs stay alive
-    /// for the comparison's lifetime.
     pub(crate) struct Planted {
         pub _keep_alive: (tempfile::TempDir, tempfile::TempDir),
         pub root: PathBuf,
         pub dirs: Vec<PathBuf>,
     }
 
-    /// Plant `seeds` under a fresh tempdir. Colliding seeds are skipped —
-    /// the generator does not guarantee disjoint paths.
     pub(crate) fn plant(seeds: &[Seed]) -> Planted {
         let inside = tempfile::tempdir().expect("tempdir");
         let outside = tempfile::tempdir().expect("outside tempdir");
@@ -1859,8 +1789,6 @@ pub(crate) mod parity_fixtures {
             return;
         };
         for entry in read.flatten() {
-            // No-follow: a symlinked directory is a listing candidate as a
-            // SYMLINK, never recursed into.
             if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
                 let path = entry.path();
                 collect_dirs(&path, out);
@@ -1870,18 +1798,12 @@ pub(crate) mod parity_fixtures {
     }
 }
 
-/// d_type-classified listings must byte-match the canonicalize-everything
-/// classification they replaced, on random trees (names, depths, symlink
-/// kinds, dotfiles).
 #[cfg(all(test, unix))]
 mod listing_parity_proptests {
     use super::parity_fixtures;
     use super::*;
     use proptest::prelude::*;
 
-    /// The OLD classification, kept verbatim as the oracle: canonicalize
-    /// EVERY entry, hide what resolves outside the root, classify by the
-    /// target's kind.
     fn canonicalize_classified(dir: &Path, root: &Path) -> Vec<(String, bool)> {
         let mut entries: Vec<(String, bool)> = Vec::new();
         for entry in std::fs::read_dir(dir).expect("read_dir").flatten() {
