@@ -312,7 +312,9 @@ impl HookLog {
     /// framing) does [`HookLog::reserve`] rewrite the whole file atomically,
     /// amortized over half-the-live-bytes of pad; a torn in-place write is
     /// healed by that same rewrite in the SAME delivery, never left on disk
-    /// for a restart to trip over.
+    /// for a restart to trip over. Whatever the io outcome, the deque never
+    /// exceeds `keep` past a return: a 500'd delivery still replaces the
+    /// oldest record, exactly like the old insert+truncate+persist did.
     ///
     /// No fsync, by contract: exactly like the old whole-file persist,
     /// durability ends at the page cache — the drop store's fsync
@@ -366,7 +368,14 @@ impl HookLog {
                 return self.reserve();
             }
             // Nothing reached the file, so the window still describes it.
+            // Re-synchronize retention anyway: the fits path below evicts
+            // at most one per delivery, so a failed delivery that skipped
+            // this would leave the 500'd record past `keep` in the view
+            // forever.
             Err(e) => {
+                while self.requests.len() > self.keep {
+                    self.requests.pop_back();
+                }
                 self.window = Some(window);
                 return Err(e);
             }
@@ -522,17 +531,23 @@ fn ser_io(e: serde_json::Error) -> std::io::Error {
 /// torn tail not starting `{`, no pad byte before the closing bracket (the
 /// writer's strictly-greater `fits` always leaves one) — is foreign
 /// corruption: None, and the caller wipes exactly as before. A remnant cut
-/// inside the trailing field is shorter than that field, indistinguishable
-/// from foreign junk, and wipes too. Without this, a crash between a torn
+/// inside the trailing field is recovered exactly when it is a suffix of
+/// the bare field (`"truncated":…}` down to a lone `}`) — the
+/// data-preserving side of an unavoidable ambiguity; a non-matching tail
+/// like `x}` wipes. Without this, a crash between a torn
 /// write and the next successful record cost the WHOLE retained history —
 /// a loss path the old atomic tmp+rename persist excluded.
 fn repair_torn_window(bytes: &[u8]) -> Option<Vec<RecordedRequest>> {
     if bytes.first() != Some(&b'[') || bytes.last() != Some(&b']') {
         return None;
     }
-    // The writer always leaves at least one pad byte before the closing
-    // bracket (reserve pads; `fits` is strictly-greater), so anything else
-    // jammed against `]` is foreign.
+    // Anything but a pad byte immediately before the closing bracket is
+    // foreign: reserve always pads, and an append onto an empty live
+    // region leaves at least one (its framed write carries no separator,
+    // and `fits` is strictly-greater). One writer state does legally end
+    // with zero pad — an append onto a NON-empty region at the exact fit
+    // boundary (pad == len+1) — and a genuine tear on such a store is
+    // conservatively wiped with it; accepted cost, kept deliberate.
     if !bytes[bytes.len() - 2].is_ascii_whitespace() {
         return None;
     }
@@ -1685,6 +1700,91 @@ mod tests {
         let mut reloaded = HookLog::load(path, 5).expect("reload");
         let paths: Vec<String> = reloaded.snapshot().into_iter().map(|r| r.path).collect();
         assert_eq!(paths, vec!["/second", "/first"]);
+    }
+
+    /// A transient non-NotFound open failure (EISDIR here) must not leave
+    /// the 500'd record past `keep` in the view: the fits path evicts at
+    /// most one per delivery, so every error arm has to re-synchronize
+    /// retention itself. The round-6 bug left the deque at keep+1 forever.
+    #[test]
+    fn a_transient_open_failure_keeps_the_view_capped_at_keep() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("requests.json");
+        let mut log = HookLog::load(path.clone(), 2).expect("load");
+        for (seq, tag) in [(1u64, "/a"), (2, "/b")] {
+            let head = parts("POST", tag, &[]);
+            log.record(RecordedRequest::capture(seq, recv_stamp(), &head, b"x"))
+                .expect("record");
+        }
+        // Stand the store path up as a directory: opens fail EISDIR (not
+        // NotFound), nothing reaches the file, the delivery 500s.
+        std::fs::remove_file(&path).expect("remove the store");
+        std::fs::create_dir(&path).expect("plant an EISDIR failure");
+        let head = parts("POST", "/c", &[]);
+        let failed = log.record(RecordedRequest::capture(3, recv_stamp(), &head, b"x"));
+        assert!(failed.is_err(), "the EISDIR delivery must fail");
+        let view = log.snapshot_arc();
+        assert_eq!(
+            view.len(),
+            2,
+            "the inspection view must stay capped at keep after a failed delivery"
+        );
+        let paths: Vec<&str> = view.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["/c", "/b"],
+            "the failed delivery still replaces the oldest record"
+        );
+
+        // Recovery once the obstruction clears: the store recreates with
+        // exactly keep records.
+        std::fs::remove_dir(&path).expect("clear the obstruction");
+        let head = parts("POST", "/d", &[]);
+        log.record(RecordedRequest::capture(4, recv_stamp(), &head, b"x"))
+            .expect("record");
+        assert_eq!(log.snapshot_arc().len(), 2);
+        let mut reloaded = HookLog::load(path, 2).expect("reload");
+        let paths: Vec<String> = reloaded.snapshot().into_iter().map(|r| r.path).collect();
+        assert_eq!(paths, vec!["/d", "/c"], "exactly keep records survive");
+    }
+
+    /// Pins the repair contract for remnants cut inside the trailing field:
+    /// suffixes of the bare field recover (down to a lone `}`); a
+    /// non-matching tail wipes.
+    #[test]
+    fn remnants_cut_inside_the_trailing_field_recover_by_suffix() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("requests.json");
+        let rec = RecordedRequest::capture(2, recv_stamp(), &parts("POST", "/new", &[]), b"");
+        let ser = serde_json::to_vec(&rec).expect("serialize");
+        for (remnant, label) in [
+            (&b":false}"[..], "cut mid-field"),
+            (&b"se}"[..], "short suffix"),
+            (&b"}"[..], "lone closing brace"),
+        ] {
+            let mut torn = Vec::new();
+            torn.push(b'[');
+            torn.extend_from_slice(b"  ");
+            torn.extend_from_slice(remnant);
+            torn.push(b',');
+            torn.extend_from_slice(&ser);
+            torn.extend_from_slice(b"   ");
+            torn.push(b']');
+            std::fs::write(&path, &torn).expect("plant torn store");
+            let mut log = HookLog::load(path.clone(), 5).expect("reload");
+            let snap = log.snapshot();
+            assert_eq!(snap.len(), 1, "{label}: a field suffix must recover");
+            assert_eq!(snap[0].path, "/new");
+        }
+        let mut torn = Vec::new();
+        torn.push(b'[');
+        torn.extend_from_slice(b"  x},");
+        torn.extend_from_slice(&ser);
+        torn.extend_from_slice(b"   ");
+        torn.push(b']');
+        std::fs::write(&path, &torn).expect("plant foreign store");
+        let log = HookLog::load(path, 5).expect("reload");
+        assert_eq!(log.len(), 0, "a non-matching tail must wipe");
     }
 
     // --- the full Router, driven like the static server's HTTP tests --------
