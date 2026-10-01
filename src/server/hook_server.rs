@@ -488,14 +488,17 @@ fn ser_io(e: serde_json::Error) -> std::io::Error {
     std::io::Error::other(format!("serializing a recorded request: {e}"))
 }
 
-/// Recover the intact records from a torn append window. The in-place
-/// protocol can only damage an EDGE of the array — a partial new record at
-/// the right (append torn mid-write) or the remnant of a half-whitened
-/// oldest at the left (evict torn mid-write) — so recovery keeps every
-/// complete, well-formed record and drops leading junk plus an incomplete
-/// trailing value. Damage between two good records (or complete-but-invalid
-/// trailing bytes) is foreign corruption: None, and the caller wipes as
-/// before. Without this, a crash between a torn write and the next
+/// Recover the intact records from a torn append window. A record makes at
+/// most ONE positional write per edge, so a genuine tear damages exactly one
+/// edge: at the left, the tail of the half-whitened oldest record (bytes
+/// that contain no `{` — a record's serialization has none — and end with
+/// the `"truncated":…}` field every record ends with), optionally reduced
+/// to just its separator comma; at the right, an incomplete new record.
+/// Anything else — damage between good records, two values with no
+/// separator, leading junk that is not a record tail — is foreign
+/// corruption: None, and the caller wipes exactly as before. A remnant
+/// shorter than the trailing field is indistinguishable from foreign junk
+/// and also wipes. Without this, a crash between a torn write and the next
 /// successful record cost the WHOLE retained history — a loss path the old
 /// atomic tmp+rename persist excluded.
 fn repair_torn_window(bytes: &[u8]) -> Option<Vec<RecordedRequest>> {
@@ -504,6 +507,9 @@ fn repair_torn_window(bytes: &[u8]) -> Option<Vec<RecordedRequest>> {
     }
     let interior = &bytes[1..bytes.len() - 1];
     let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut stray_comma: Option<usize> = None;
+    let mut misfits: Vec<usize> = Vec::new();
+    let mut expect_separator = false;
     let mut i = 0;
     while i < interior.len() {
         while i < interior.len() && interior[i].is_ascii_whitespace() {
@@ -512,35 +518,76 @@ fn repair_torn_window(bytes: &[u8]) -> Option<Vec<RecordedRequest>> {
         if i >= interior.len() {
             break;
         }
-        if interior[i] == b',' {
-            // A separator at value position is edge damage too (a torn
-            // evict that whitened the record but not its comma, or a torn
-            // append that wrote only the comma).
-            i += 1;
-            continue;
-        }
-        match scan_value(interior, i) {
-            Some(end) => {
-                ranges.push(i..end);
-                i = end;
+        match (interior[i], expect_separator) {
+            (b',', _) => {
+                if expect_separator {
+                    expect_separator = false;
+                } else if stray_comma.replace(i).is_some() {
+                    // Two separators with nothing between: no single tear
+                    // writes two commas.
+                    return None;
+                }
+                i += 1;
             }
-            // An incomplete value is the torn new record; it simply yields
-            // no range.
-            None => break,
+            _ => {
+                // A value at separator position is fine INSIDE the damaged
+                // leading region — a mid-record remnant scans as
+                // key/value fragments (`"method"` then `:"POST"`) — but
+                // fatal anywhere else: no tear removes a separator that
+                // sits BETWEEN records.
+                if expect_separator {
+                    misfits.push(i);
+                }
+                match scan_value(interior, i) {
+                    Some(end) => {
+                        ranges.push(i..end);
+                        i = end;
+                        expect_separator = true;
+                    }
+                    // An incomplete value is the torn new record; it simply
+                    // yields no range.
+                    None => i = interior.len(),
+                }
+            }
         }
     }
     let mut records = Vec::with_capacity(ranges.len());
-    for range in ranges {
-        match serde_json::from_slice::<RecordedRequest>(&interior[range]) {
-            Ok(record) => records.push(record),
-            // A torn evict leaves the remnant of ONE half-whitened record
-            // at the head; anything invalid AFTER a good record is foreign
-            // corruption, not a tear.
+    let mut first_good = interior.len();
+    for range in &ranges {
+        match serde_json::from_slice::<RecordedRequest>(&interior[range.clone()]) {
+            Ok(record) => {
+                if records.is_empty() {
+                    first_good = range.start;
+                }
+                records.push(record);
+            }
+            // The torn-evict remnant leads; anything invalid AFTER a good
+            // record is foreign corruption, not a tear.
             Err(_) if records.is_empty() => continue,
             Err(_) => return None,
         }
     }
-    Some(records)
+    // A separator-only evict tear leaves exactly one comma at value
+    // position — it belongs to the leading damaged region, never between
+    // records.
+    if stray_comma.is_some_and(|pos| pos >= first_good) {
+        return None;
+    }
+    if misfits.iter().any(|&pos| pos >= first_good) {
+        return None;
+    }
+    // The leading damaged bytes must be a record tail (plus its separator
+    // comma, or nothing but that comma) — the only shapes a torn evict
+    // leaves.
+    let head = interior[..first_good].trim_ascii();
+    let Some(remnant) = head.strip_suffix(b",") else {
+        return (head.is_empty()).then_some(records);
+    };
+    (remnant.is_empty()
+        || ((remnant.ends_with(b"\"truncated\":true}")
+            || remnant.ends_with(b"\"truncated\":false}"))
+            && !remnant.contains(&b'{')))
+    .then_some(records)
 }
 
 /// Scan one comma-separated JSON value starting at `start` (a non-ws,
@@ -1378,18 +1425,60 @@ mod tests {
         let path = tmp.path().join("requests.json");
         let rec1 = RecordedRequest::capture(1, recv_stamp(), &parts("POST", "/one", &[]), b"");
         let rec2 = RecordedRequest::capture(2, recv_stamp(), &parts("POST", "/two", &[]), b"");
-        let mut damaged = Vec::new();
-        damaged.push(b'[');
-        damaged.extend(serde_json::to_vec(&rec1).expect("serialize"));
-        damaged.push(b',');
-        damaged.extend_from_slice(b"42");
-        damaged.push(b',');
-        damaged.extend(serde_json::to_vec(&rec2).expect("serialize"));
-        damaged.push(b']');
-        std::fs::write(&path, &damaged).expect("plant damaged store");
-
-        let log = HookLog::load(path, 5).expect("reload");
-        assert_eq!(log.len(), 0, "interior damage must wipe, not half-recover");
+        let ser1 = serde_json::to_vec(&rec1).expect("serialize");
+        let ser2 = serde_json::to_vec(&rec2).expect("serialize");
+        // The round-4 audit's probe shapes, plus the interior damage one:
+        // none of these is producible by a single torn edge write, so all
+        // must wipe exactly like the pre-repair code did.
+        let probes: [(&str, Vec<u8>); 4] = [
+            ("leading number", {
+                let mut f = Vec::new();
+                f.push(b'[');
+                f.extend_from_slice(b"42,");
+                f.extend_from_slice(&ser1);
+                f.push(b',');
+                f.extend_from_slice(&ser2);
+                f.push(b']');
+                f
+            }),
+            ("leading object", {
+                let mut f = Vec::new();
+                f.push(b'[');
+                f.extend_from_slice(b"{\"evil\":true},");
+                f.extend_from_slice(&ser1);
+                f.push(b']');
+                f
+            }),
+            ("separator between", {
+                let mut f = Vec::new();
+                f.push(b'[');
+                f.extend_from_slice(&ser1);
+                f.extend_from_slice(b", ,");
+                f.extend_from_slice(&ser2);
+                f.push(b']');
+                f
+            }),
+            ("junk between", {
+                let mut f = Vec::new();
+                f.push(b'[');
+                f.extend_from_slice(&ser1);
+                f.push(b',');
+                f.extend_from_slice(b"42");
+                f.push(b',');
+                f.extend_from_slice(&ser2);
+                f.push(b']');
+                f
+            }),
+        ];
+        for (label, file) in probes {
+            std::fs::write(&path, &file).expect("plant damaged store");
+            let log = HookLog::load(path.clone(), 5).expect("reload");
+            assert_eq!(
+                log.len(),
+                0,
+                "{label}: foreign damage must wipe, not recover"
+            );
+        }
     }
 
     /// External deletion mid-run: the old whole-file persist recreated the
