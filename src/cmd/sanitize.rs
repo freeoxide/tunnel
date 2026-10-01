@@ -547,17 +547,19 @@ mod tests {
         let _ = child.wait();
     }
 
-    /// THE loop-shape gate: judging two dead-upstream services through the
-    /// same [`judge`] `run` calls must cost ONE 750 ms gap, not two. The
-    /// futures-level test above cannot catch a re-serialized caller; this
-    /// one does (a serialized loop takes >= 2 gaps and fails the upper
-    /// bound, a shortened gap the lower). Unix-only: the decoy needs `sh`
+    /// THE loop-shape gate: judging FIVE dead-upstream services (the
+    /// wall-clock harness's zombie count) through the same [`judge`] `run`
+    /// calls must cost ONE 750 ms gap. Five, not two, so that ANY
+    /// re-serialization — fully serial, pairwise, or chunked — still runs
+    /// >= 2 gaps sequentially and fails the upper bound; a shortened gap
+    /// fails the lower. The futures-level test above cannot catch a
+    /// re-serialized caller; this one does. Unix-only: the decoy needs `sh`
     /// and a /proc-style cmdline probe.
     #[cfg(unix)]
     #[tokio::test]
     async fn judge_pays_one_reprobe_gap_across_services() {
         let mut decoys = Vec::new();
-        let services = (0..2)
+        let services = (0..5)
             .map(|i| {
                 let child = spawn_decoy_worker();
                 let mut svc = service(ServiceKind::Proxy, false);
@@ -578,8 +580,8 @@ mod tests {
         }
 
         assert!(
-            candidates.len() == 2 && skipped.is_empty(),
-            "both decoy-backed services must reach RemoveZombie (got {} candidates, \
+            candidates.len() == 5 && skipped.is_empty(),
+            "all decoy-backed services must reach RemoveZombie (got {} candidates, \
              skipped {skipped:?})",
             candidates.len()
         );
