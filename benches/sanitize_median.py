@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""CLI wall-clock harness for `ft sanitize` — the serialized double-probe
-wait this campaign optimizes.
+"""CLI wall-clock harness for `ft sanitize` — the double-probe wait this
+campaign overlapped (serialized at baseline, concurrent since 49cfdd5).
 
 Command line:
     python3 benches/sanitize_median.py --ft <binary> --zombies 5 --runs 31
@@ -23,9 +23,11 @@ each zombie is seeded as:
                   teardown (pid_matches("cloudflared") miss),
   - kind proxy, dir null, public_url set, foreground false — a registry.json
     shape model.rs accepts (see its serde defaults).
-With the current serialized code, 5 zombies = 5 x 750 ms ~ 3.75 s per run; if
-that wait ever disappears from MEDIAN_S, the harness stopped measuring the
-thing being optimized.
+Since the double-probes went concurrent (49cfdd5), the 5 zombies overlap
+their gaps into ONE 750 ms window: MEDIAN_S ~1.0 s, with process startup and
+teardown riding along. If MEDIAN_S ever loses that window, the harness
+stopped measuring the thing being guarded; if it climbs back toward
+N x 750 ms (~3.75 s for 5 zombies), the overlap regressed.
 
 Output: context lines, then VERSION_S=, LS_S= (medians of 7 runs each
 against the isolated state), and finally MEDIAN_S=<seconds> as the LAST
