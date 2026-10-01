@@ -367,16 +367,19 @@ impl HookLog {
                 }
                 return self.reserve();
             }
-            // Nothing reached the file, so the window still describes it.
-            // Re-synchronize retention anyway: the fits path below evicts
-            // at most one per delivery, so a failed delivery that skipped
-            // this would leave the 500'd record past `keep` in the view
-            // forever.
+            // Nothing reached the file — but the eviction above just broke
+            // the invariant the fits path relies on (the disk live region
+            // mirrors the deque): restoring the window is only sound while
+            // the deque still matches that region, and the disk still holds
+            // the evicted record instead of the 500'd one. Drop the window:
+            // the next delivery re-converges disk and memory through the
+            // atomic reserve() rewrite — an amortized one-rewrite cost
+            // after a transient error.
             Err(e) => {
                 while self.requests.len() > self.keep {
                     self.requests.pop_back();
                 }
-                self.window = Some(window);
+                self.window = None;
                 return Err(e);
             }
         };
@@ -1743,9 +1746,45 @@ mod tests {
         log.record(RecordedRequest::capture(4, recv_stamp(), &head, b"x"))
             .expect("record");
         assert_eq!(log.snapshot_arc().len(), 2);
-        let mut reloaded = HookLog::load(path, 2).expect("reload");
+        let mut reloaded = HookLog::load(path.clone(), 2).expect("reload");
         let paths: Vec<String> = reloaded.snapshot().into_iter().map(|r| r.path).collect();
         assert_eq!(paths, vec!["/d", "/c"], "exactly keep records survive");
+        drop(reloaded);
+
+        // The round-7 corruption reproduction: a transient non-NotFound
+        // failure on an INTACT store (chmod 000 -> EACCES), then one
+        // successful delivery. The arm must drop the window — restoring it
+        // would leave the next evict whitening the memory-oldest's length
+        // at the disk-oldest's offset, desyncing or corrupting the file
+        // until the next reserve.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+                .expect("chmod 000");
+            let head = parts("POST", "/e", &[]);
+            let failed = log.record(RecordedRequest::capture(5, recv_stamp(), &head, b"x"));
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod 600 back");
+            // chmod is ineffective under root (and on mode-ignoring
+            // filesystems): the delivery succeeds and this phase is a
+            // no-op — skip gracefully.
+            if failed.is_err() {
+                assert_eq!(log.snapshot_arc().len(), 2, "view still capped at keep");
+                let head = parts("POST", "/f", &[]);
+                log.record(RecordedRequest::capture(6, recv_stamp(), &head, b"x"))
+                    .expect("the post-failure delivery must succeed");
+                // The fresh load is the corruption check: the file must
+                // parse and hold exactly keep records.
+                let mut reloaded = HookLog::load(path, 2).expect("reload");
+                let paths: Vec<String> = reloaded.snapshot().into_iter().map(|r| r.path).collect();
+                assert_eq!(
+                    paths,
+                    vec!["/f", "/e"],
+                    "exactly keep records, disk converged with memory"
+                );
+            }
+        }
     }
 
     /// Pins the repair contract for remnants cut inside the trailing field:
