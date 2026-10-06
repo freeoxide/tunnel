@@ -1,8 +1,6 @@
-//! Detached worker spawning: background starts re-invoke the binary as
-//! `ft run-worker ...` in a new session (worker + cloudflared survive the
-//! parent exiting); stdout/stderr append to `worker.log`. On Unix a
-//! `setsid()` pre_exec makes the child a group leader so `kill(-worker_pid)`
-//! reaches the whole tree.
+//! Detached worker spawning: re-invokes the binary as `ft run-worker` in a
+//! new session so the worker (and cloudflared) survive the parent exiting;
+//! stdout/stderr append to `worker.log`.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -21,10 +19,9 @@ fn worker_token() -> String {
     format!("{mixed:016x}")
 }
 
-/// Stand-in for the mandatory `--dir` flag when the worker has no directory
-/// (proxy/run/hook; clap rejects empty values). The worker never reads it for
-/// those kinds; a mis-tagged Static invocation fails closed on the
-/// unresolvable path.
+/// Stand-in for the mandatory `--dir` flag for the directory-less kinds (clap
+/// rejects empty values). The worker never reads it; a mis-tagged Static
+/// invocation fails closed on the unresolvable path.
 pub(crate) const PROXY_DIR_SENTINEL: &str = "/ft-proxy-has-no-directory";
 
 /// The run-worker argv prefix. The Drop token does NOT ride the argv (`ps`
@@ -194,8 +191,6 @@ fn spawn_worker_full(
 
     use anyhow::Context;
 
-    // Own group so Ctrl-C in the parent's console cannot reach it; no
-    // inherited/created console.
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const DETACHED_PROCESS: u32 = 0x0000_0004;
 
@@ -250,8 +245,6 @@ mod tests {
 
     #[test]
     fn proxy_worker_passes_the_sentinel_directory() {
-        // A proxy worker has no directory: the mandatory `--dir` flag carries
-        // the sentinel, and the worker takes its real spec from the registry.
         let args = run_worker_args(9, "api", None, 3000, &[], None, None);
         assert_eq!(
             args,
@@ -267,8 +260,6 @@ mod tests {
                 "3000",
             ])
         );
-        // The sentinel must never name an existing path: a mis-tagged Static
-        // worker has to fail closed on it, not serve some real directory.
         assert!(!std::path::Path::new(PROXY_DIR_SENTINEL).exists());
     }
 
@@ -308,8 +299,6 @@ mod tests {
 
     #[test]
     fn hook_worker_carries_its_retention_flag_before_the_separator() {
-        // `--keep` belongs to run-worker's own clap definition, so it sits
-        // BEFORE the `--` separator (after it, everything is the child's).
         let args = run_worker_args(12, "gh", None, 9000, &[], Some(50), None);
         assert_eq!(
             args,

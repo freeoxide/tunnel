@@ -37,7 +37,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if let Err(err) = cmd::run(cli).await {
-        // Only the top-level message, so the CLI output stays clean.
         eprintln!("{err}");
         std::process::exit(1);
     }

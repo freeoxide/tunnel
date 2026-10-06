@@ -6,10 +6,9 @@ use crate::model::{Service, ServiceKind};
 use chrono::{Datelike, Timelike};
 use comfy_table::{Cell, ContentArrangement, Table};
 
-/// Restore default SIGPIPE so a short-lived printing command piped to a
-/// consumer (`ft ls | head`) dies quietly instead of panicking. NEVER call
-/// on a serving path (start/run/hook/drop/proxy, the worker): a SigDfl
-/// server dies on the first client disconnect.
+/// Restore default SIGPIPE so `ft ls | head` dies quietly instead of panicking.
+/// NEVER call on a serving path (start/run/hook/drop/proxy, the worker): a
+/// SigDfl server dies on the first client disconnect.
 pub fn reset_sigpipe() {
     #[cfg(unix)]
     {
@@ -20,7 +19,6 @@ pub fn reset_sigpipe() {
     }
 }
 
-/// Format a timestamp as `YYYY-MM-DD HH:MM` (no seconds, no timezone suffix).
 fn fmt_started(service: &Service) -> String {
     let t = service.created_at;
     format!(
@@ -46,7 +44,6 @@ pub fn print_started(service: &Service) {
     println!("ID:      {}", service.id);
     println!("Local:   {}", service.local_url);
     println!("Public:  {}", url_or_pending(service));
-    // Trailing slash mirrors how shells render directories.
     println!("Logs:    {}/", service.state_dir.display());
 }
 
@@ -79,8 +76,6 @@ pub fn print_list(services: &[Service]) {
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_header(vec!["ID", "NAME", "STATUS", "PORT", "URL"]);
 
-    // Cell::new stringifies exactly once; owned Strings would allocate twice
-    // per cell (ours plus comfy-table's re-stringify).
     for s in services {
         table.add_row(vec![
             Cell::new(s.id),
@@ -94,14 +89,10 @@ pub fn print_list(services: &[Service]) {
     println!("{table}");
 }
 
-/// A recorded pid rendered for the detail rows, `-` when absent (not yet
-/// spawned, or a kind of service that never carries one).
 fn pid_or_dash(pid: Option<u32>) -> String {
     pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())
 }
 
-/// The `Directory:` row value: the carried path, or `-` when this kind of
-/// service fronts a port and carries no directory.
 fn dir_or_dash(service: &Service) -> String {
     service
         .dir
@@ -109,11 +100,9 @@ fn dir_or_dash(service: &Service) -> String {
         .map_or_else(|| "-".to_string(), |d| d.display().to_string())
 }
 
-/// The key/value detail block. The `Mode`/`Directory` rows are kind-aware:
-/// Proxy renders `Upstream:`; Drop renders its target plus a `Token:` row
-/// read from the private token file (the token is NOT registry state — that
-/// file is the only recovery path); only Static renders the origin-flag rows
-/// and a `server.log`.
+/// The key/value detail block; `Mode`/`Directory` rows are kind-aware (Proxy
+/// renders `Upstream:`; Drop's `Token:` row comes from the private token file —
+/// its only recovery path; only Static shows flag rows and `server.log`).
 pub fn print_detail(service: &Service) {
     println!("Name:         {}", service.name);
     println!("ID:           {}", service.id);
@@ -140,8 +129,6 @@ pub fn print_detail(service: &Service) {
                 }
             );
             println!("Directory:    {}", dir_or_dash(service));
-            // Always rendered on/off so the shape is predictable; the token
-            // row only when configured (operator's choice, like drop's).
             println!(
                 "SPA:          {}",
                 if service.static_flags.spa {
@@ -171,8 +158,6 @@ pub fn print_detail(service: &Service) {
     println!("Local URL:    {}", service.local_url);
     println!("Public URL:   {}", url_or_pending(service));
     if service.kind == ServiceKind::Drop {
-        // The token's durable home is the private file; `-` on a missing or
-        // unreadable one rather than failing the whole detail.
         let token = crate::server::drop_server::read_token(&service.state_dir)
             .ok()
             .flatten()
@@ -209,7 +194,6 @@ pub fn print_removed_stale(name: &str) {
 /// lines, then the problem/note summary. Rendering only.
 pub fn print_doctor(checks: &[Check]) {
     for check in checks {
-        // Width 4 aligns `ok` under `warn`/`fail`.
         println!(
             "{:<4} {}: {}",
             check.status.as_str(),

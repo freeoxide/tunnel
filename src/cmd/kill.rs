@@ -7,12 +7,8 @@ use crate::proc;
 use crate::state::StateDir;
 use anyhow::bail;
 
-/// How a service is torn down — extracted pure so the shell-safety rule
-/// (foreground is NEVER group-signalled) is unit-testable.
 enum TeardownKind {
-    /// Foreground: signal the single `ft` pid directly.
     ForegroundDirect,
-    /// Background: `SIGTERM`→grace→`SIGKILL` the worker's whole process group.
     BackgroundGroup,
 }
 
@@ -24,18 +20,11 @@ fn teardown_kind(service: &Service) -> TeardownKind {
     }
 }
 
-/// What the locked lookup in [`run`] decided — extracted for unit-testing.
 enum KillPlan {
-    /// Remove the entry now and tear its process tree down (the normal path).
     Remove(Service),
-    /// Leave the entry: pid not recorded yet, START_GRACE still open —
-    /// `run` reports a friendly "still starting" error instead of reaping.
     Starting(String),
 }
 
-/// Decide — atomically with the removal — whether `target` may be reaped
-/// (`None` = no match); a `start_in_progress` entry is left untouched
-/// (reaping mid-window would orphan the just-spawned worker).
 fn plan_kill(reg: &mut Registry, target: &str) -> Option<KillPlan> {
     let svc = reg.find(target)?.clone();
     if svc.start_in_progress() {
@@ -45,11 +34,9 @@ fn plan_kill(reg: &mut Registry, target: &str) -> Option<KillPlan> {
     Some(KillPlan::Remove(svc))
 }
 
-/// Stop the target and remove its entry — atomically under the lock BEFORE
-/// any signalling, so a failed signal still leaves no stale entry.
-/// Background: group-signal only when a member is confirmed ours (cmdline
-/// match) — a recycled PID/group is never signalled. Foreground: the single
-/// `ft` pid only, NEVER the group (it shares the operator's shell's).
+/// Stop the target and remove its entry — atomically, before any signalling.
+/// Only pids confirmed ours by cmdline match are signalled (PID-reuse safe);
+/// a foreground service is signalled directly, never its shell's group.
 pub async fn run(target: String) -> Result<()> {
     let state = StateDir::new()?;
 
@@ -74,8 +61,6 @@ pub async fn run(target: String) -> Result<()> {
 
     match teardown_kind(&service) {
         TeardownKind::ForegroundDirect => {
-            // Signal the ft process directly (NEVER its group). Gate on an
-            // identity check so a recycled pid is not signalled.
             let worker_ours = proc::pid_matches(service.worker_pid, "--foreground");
             let tunnel_ours = service
                 .tunnel_pid
@@ -84,8 +69,6 @@ pub async fn run(target: String) -> Result<()> {
             if worker_ours {
                 proc::terminate_foreground(service.worker_pid);
             }
-            // Bind the pid directly: tunnel_ours implies tunnel_pid is Some,
-            // but a future change to that computation must not panic here.
             if let Some(p) = service.tunnel_pid
                 && tunnel_ours
             {
@@ -110,7 +93,6 @@ pub async fn run(target: String) -> Result<()> {
                 proc::shutdown_process_group(service.worker_pid).await;
             }
 
-            // Re-probe so the user-facing message reflects the actual outcome.
             let still_worker = proc::pid_matches(service.worker_pid, "run-worker");
             let still_cloudflared = service
                 .tunnel_pid
@@ -168,8 +150,6 @@ mod tests {
 
     #[test]
     fn foreground_service_is_never_group_signalled() {
-        // The shell-safety guarantee: a foreground service must select the
-        // single-pid path, NEVER BackgroundGroup (which kills the shell).
         assert!(matches!(
             teardown_kind(&svc(true)),
             TeardownKind::ForegroundDirect
@@ -184,12 +164,8 @@ mod tests {
         ));
     }
 
-    // --- the reserve→spawn→record guard --------------------------------------
-
     #[test]
     fn starting_entry_is_left_in_place_inside_the_grace_window() {
-        // Killing a reserved-but-unrecorded entry mid-window would orphan the
-        // just-spawned worker — kept, with a friendly error instead.
         let mut s = svc(false);
         s.worker_pid = 0;
         let mut reg = reg_with(s);
@@ -202,8 +178,6 @@ mod tests {
 
     #[test]
     fn abandoned_reservation_is_removed_once_grace_expires() {
-        // Past the grace the pid is never landing (the parent died mid-start);
-        // the entry is removed like any other, with nothing to signal.
         let mut s = svc(false);
         s.worker_pid = 0;
         s.created_at = crate::model::now_utc()
@@ -218,9 +192,7 @@ mod tests {
 
     #[test]
     fn recorded_entry_is_removed_immediately() {
-        // The pid already landed, so no start grace applies — kill proceeds
-        // regardless of the entry's age.
-        let mut reg = reg_with(svc(false)); // worker_pid = 12345, created now
+        let mut reg = reg_with(svc(false));
         assert!(matches!(
             plan_kill(&mut reg, "x"),
             Some(KillPlan::Remove(_))

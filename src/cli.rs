@@ -20,11 +20,9 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    /// Directory to expose when no subcommand is given (the implicit START).
-    ///
-    /// clap parses the first token as a subcommand only if it matches one of
-    /// the known subcommand names; otherwise it falls through to this
-    /// positional, so `ft ./site` works as expected.
+    /// Directory to expose when no subcommand is given (the implicit START). A
+    /// first token matching no known subcommand name falls through to this
+    /// positional, so `ft ./site` works.
     pub dir: Option<PathBuf>,
 
     /// Explicit service name. Defaults to a generated, unique name.
@@ -45,33 +43,20 @@ pub struct Cli {
     #[arg(long, short = 'y')]
     pub yes: bool,
 
-    /// Serve a single-page app: paths that match no file under the directory
-    /// fall back to the root `index.html`, so client-side router deep links
-    /// work. Security discipline is unchanged — dotfiles stay denied, symlink
-    /// confinement stays on, and directories without an `index.html` still
-    /// render the generated listing.
-    ///
-    /// See also `static_server`'s module docs — the normative semantics for
-    /// `--spa`/`--cors`/`--token` (this help and `StaticFlags` summarize them).
+    /// Serve a single-page app: unmatched paths fall back to the root `index.html`
+    /// (dotfiles still denied, symlink confinement unchanged).
     #[arg(long)]
     pub spa: bool,
 
-    /// Send permissive CORS headers (`Access-Control-Allow-Origin: *`,
-    /// methods GET/HEAD/OPTIONS, wildcard request headers) on this static
-    /// origin. Preflights are not answered specially (405 like any
-    /// non-GET/HEAD), so combined with `--token` a cross-origin BROWSER
-    /// cannot use `Authorization: Bearer` (it falls back to `?token=`);
-    /// plain GET/HEAD stays preflight-free.
+    /// Send permissive CORS headers (`Access-Control-Allow-Origin: *`, methods
+    /// GET/HEAD/OPTIONS) on this static origin. Preflights get 405, so with
+    /// `--token` a browser must use `?token=`; GET/HEAD is preflight-free.
     #[arg(long)]
     pub cors: bool,
 
-    /// Require this secret on every request of the static origin — sent as
-    /// `Authorization: Bearer <SECRET>` (preferred) or `?token=<SECRET>` —
-    /// compared in constant time; anything else is 401 before the tree can
-    /// be probed. You choose the value (never auto-generated); it is stored
-    /// in the service's registry entry and shown again by `ft detail`.
-    /// Also read from `FT_TOKEN` (argv wins when both are set), so the
-    /// secret need not ride the process list (`ps`).
+    /// Require this secret on every static-origin request — `Authorization: Bearer`
+    /// or `?token=`, constant-time; else 401 before the tree can be probed. Chosen
+    /// by you, shown by `ft detail`; also read from `FT_TOKEN` (argv wins; no `ps`).
     #[arg(long, value_name = "SECRET", env = "FT_TOKEN", hide_env_values = true)]
     pub token: Option<String>,
 }
@@ -90,14 +75,9 @@ pub enum Command {
         target: String,
     },
 
-    /// Diagnose tunnel health and report problems with actionable hints.
-    ///
-    /// Checks that `cloudflared` is on `PATH`, that every service's worker is
-    /// still alive, and that a live worker's local origin still accepts
-    /// connections (a proxy whose upstream died serves 502s through an
-    /// otherwise healthy tunnel). Strictly read-only: remediations are
-    /// printed as hints, never executed. Exits 0 whenever it ran — findings
-    /// are information, not failures.
+    /// Diagnose tunnel health: `cloudflared` on PATH, workers alive, live origins
+    /// accepting connections. Read-only — remediations print as hints, never
+    /// execute; exits 0 whenever it ran.
     Doctor,
 
     /// Stop a running service and remove it from the registry.
@@ -127,10 +107,9 @@ pub enum Command {
     #[command(alias = "gc")]
     Prune,
 
-    /// Attach a tunnel to a local server that is already running.
-    ///
-    /// Fronts the existing server on `PORT` with a cloudflared Quick Tunnel;
-    /// `ft` starts no server of its own here.
+    /// Attach a tunnel to a local server that is already running: front
+    /// `PORT` with a cloudflared Quick Tunnel; `ft` starts no server of its
+    /// own here.
     Proxy {
         /// Local port the existing server listens on (1-65535). The port is
         /// the service's identity in the registry; `ft` never binds it.
@@ -146,13 +125,9 @@ pub enum Command {
         foreground: bool,
     },
 
-    /// Run a command (e.g. a dev server) and expose it through a tunnel.
-    ///
-    /// Spawns the given command, waits for it to accept connections on
-    /// `PORT`, then fronts it with a cloudflared Quick Tunnel — nothing
-    /// ft-owned in between. `ft kill` tears the tunnel AND the command down
-    /// together; the child never outlives its tunnel. `PORT` is exported to
-    /// the command's environment.
+    /// Run a command (e.g. a dev server) and expose it through a tunnel: spawn it,
+    /// wait for it to accept on `PORT`, then front it with cloudflared — nothing
+    /// ft-owned in between. `ft kill` tears down both; `PORT` is exported to it.
     Run {
         /// Local port the command must end up listening on (1-65535).
         /// REQUIRED and explicit: `ft` never guesses which port a dev server
@@ -175,15 +150,9 @@ pub enum Command {
         command: Vec<OsString>,
     },
 
-    /// Run a webhook receiver/inspector and expose it through a tunnel.
-    ///
-    /// `ft` runs its own origin (the server lives inside the worker) that
-    /// records every request arriving through the tunnel — method, path,
-    /// query, selected headers, and the size-capped body — to a private
-    /// per-service store, answering each with 200 OK. Inspect the records
-    /// through the tunnel itself: `GET /__inspect` (HTML, newest first) or
-    /// `GET /__inspect.json` (JSON array). Only the newest N requests are
-    /// kept (`--keep`, default 200), so the disk cannot fill.
+    /// Run a webhook receiver/inspector: ft's own origin records every request
+    /// (method, path, query, headers, size-capped body) to a bounded per-service
+    /// store (`--keep`, default 200), answers 200; view via `GET /__inspect[.json]`.
     Hook {
         /// Local port for ft's own hook origin (1-65535). Defaults to a free,
         /// allocated port.
@@ -204,22 +173,13 @@ pub enum Command {
         keep: Option<u16>,
     },
 
-    /// Run an upload receiver ("drop bucket") and expose it through a tunnel.
-    ///
-    /// `ft` runs its own origin that accepts uploads into `DIR` and serves
-    /// the stored files back. Uploads are POST/PUT of a RAW body, named by
-    /// the path (`POST /file.txt`) or by `?filename=` on `/`; multipart is
-    /// not parsed and is stored as opaque bytes. Every upload MUST present
-    /// the access token (`Authorization: Bearer` or `?token=`); downloads
-    /// (GET) are public — anyone holding the tunnel URL can read what you
-    /// drop. Caps: per-upload `--max-size` (413) and a fixed 1 GiB
-    /// total-store cap (507). Uploads never overwrite; dotfiles, separators,
-    /// and traversal names are rejected.
+    /// Run an upload receiver ("drop bucket") into `DIR`: POST/PUT a RAW body named
+    /// by the path or `?filename=` (multipart stored as-is). Uploads REQUIRE the
+    /// token; GET is public. Caps: `--max-size` (413), 1 GiB store (507); no overwrites.
     Drop {
-        /// Directory uploads are stored in. Must already exist; sensitive
-        /// directories (/, $HOME, /etc, ...) are refused — uploads WRITE
-        /// into it through the public tunnel — and only ONE drop service
-        /// may target a given directory.
+        /// Directory uploads are stored in. Must already exist; sensitive directories
+        /// (/, $HOME, /etc, ...) are refused — uploads WRITE into it through the public
+        /// tunnel — and only ONE drop service may target it.
         #[arg(value_name = "DIR")]
         dir: PathBuf,
 
@@ -236,13 +196,9 @@ pub enum Command {
         #[arg(long, short)]
         foreground: bool,
 
-        /// Access token REQUIRED for every upload (POST/PUT) — sent as
-        /// `Authorization: Bearer <SECRET>` or `?token=<SECRET>` and compared
-        /// in constant time. When omitted, a crypto-random token is
-        /// generated, PRINTED ONCE here, stored in the service's private
-        /// state dir, and shown by `ft detail`. Downloads (GET) need no token.
-        /// Also read from `FT_TOKEN` (argv wins when both are set), so the
-        /// secret need not ride the process list (`ps`).
+        /// Access token REQUIRED for every upload (Bearer or `?token=`, constant-time).
+        /// When omitted: crypto-random, PRINTED ONCE, stored in the private state dir,
+        /// shown by `ft detail`. GET needs none. Also `FT_TOKEN` (argv wins; no `ps`).
         #[arg(long, value_name = "SECRET", env = "FT_TOKEN", hide_env_values = true)]
         token: Option<String>,
 
@@ -258,15 +214,8 @@ pub enum Command {
     },
 
     /// Remove every dangling service — stale entries AND live tunnels whose
-    /// local origin port is dead.
-    ///
-    /// Covers everything `ft prune` does plus the zombie prune cannot see:
-    /// a service whose worker and tunnel are up while the upstream behind
-    /// them died (502s while `ft ls` shows healthy). Origin ports are
-    /// double-probed (~750 ms apart) so a mid-restart dev server is not
-    /// reaped. Foreground services are never killed — reported as left alone
-    /// instead (stop them with Ctrl-C in their terminal). Takes no arguments
-    /// and exits 0 whenever it ran.
+    /// local origin port is dead (double-probed ~750 ms apart; foreground services are
+    /// never killed). Takes no arguments; exits 0 whenever it ran.
     #[command(alias = "clean")]
     Sanitize,
 
@@ -295,10 +244,9 @@ pub enum Command {
         /// worker's argv (like the command tail), not registry state.
         #[arg(long)]
         keep: Option<u16>,
-        /// Per-upload size cap for a Drop worker (`--max-size`). `None` for
-        /// every other kind. Runtime argv configuration like `--keep`; the
-        /// access token does NOT ride the argv (visible in `ps`) — the worker
-        /// reads it from the service's private token file.
+        /// Per-upload size cap for a Drop worker (`--max-size`); `None` for every
+        /// other kind. The access token does NOT ride the argv (`ps`-visible) — the
+        /// worker reads it from the service's private token file.
         #[arg(long)]
         max_size: Option<u64>,
     },
@@ -363,7 +311,6 @@ mod tests {
 
     #[test]
     fn proxy_rejects_port_zero() {
-        // 0 is the kernel's "assign me one" sentinel, never a real upstream.
         assert!(parse(&["proxy", "0"]).is_err(), "port 0 must be rejected");
     }
 
@@ -382,22 +329,18 @@ mod tests {
 
     #[test]
     fn doctor_parses_with_no_arguments() {
-        // Deliberately flagless/argumentless: everything is discovered from
-        // the environment.
         let cli = parse(&["doctor"]).expect("`ft doctor` must parse");
         assert!(matches!(cli.command, Some(Command::Doctor)));
     }
 
     #[test]
     fn doctor_rejects_any_arguments_or_flags() {
-        // Typos must be usage errors, not silently ignored tokens.
         assert!(parse(&["doctor", "--anything"]).is_err(), "no flags exist");
         assert!(parse(&["doctor", "extra"]).is_err(), "no arguments exist");
     }
 
     #[test]
     fn sanitize_parses_with_no_arguments() {
-        // Like doctor: flagless/argumentless by design.
         let cli = parse(&["sanitize"]).expect("`ft sanitize` must parse");
         assert!(matches!(cli.command, Some(Command::Sanitize)));
     }
@@ -419,8 +362,6 @@ mod tests {
 
     #[test]
     fn run_minimal_form_after_the_separator() {
-        // `ft run --port 3000 -- npm start`: the explicit port is required,
-        // and everything after `--` is the child command, verbatim.
         let cli = parse(&["run", "--port", "3000", "--", "npm", "start"])
             .expect("`ft run --port 3000 -- npm start` must parse");
         match cli.command {
@@ -444,8 +385,6 @@ mod tests {
 
     #[test]
     fn run_name_foreground_and_command_flags() {
-        // Flags belong BEFORE `--`; everything after the separator — including
-        // flag-looking tokens — goes to the child untouched.
         let cli = parse(&[
             "run",
             "--port",
@@ -476,8 +415,6 @@ mod tests {
                         OsString::from("npm"),
                         OsString::from("run"),
                         OsString::from("dev"),
-                        // A flag-looking token AFTER `--` must land in the
-                        // command, never be eaten as an ft flag.
                         OsString::from("--verbose"),
                     ]
                 );
@@ -488,7 +425,6 @@ mod tests {
 
     #[test]
     fn run_rejects_port_zero_and_out_of_range() {
-        // The port is the contract with the spawned command (exported as PORT).
         assert!(
             parse(&["run", "--port", "0", "--", "x"]).is_err(),
             "port 0 must be rejected"
@@ -521,8 +457,6 @@ mod tests {
 
     #[test]
     fn run_worker_command_is_optional_and_verbatim() {
-        // run-worker parses without a command tail (static/proxy/hook/drop
-        // workers pass none) and passes one verbatim after its own `--`.
         let cli = parse(&[
             "run-worker",
             "--id",
@@ -571,8 +505,6 @@ mod tests {
 
     #[test]
     fn hook_minimal_form_defaults_everything() {
-        // No flags: port allocated later, name derives from the port,
-        // retention falls back to the documented default.
         let cli = parse(&["hook"]).expect("`ft hook` must parse");
         match cli.command {
             Some(Command::Hook {
@@ -592,8 +524,6 @@ mod tests {
 
     #[test]
     fn hook_flags_parse_and_reject_out_of_range_values() {
-        // In-range flags parse; out-of-range numerics are usage errors before
-        // any state is touched.
         let cli = parse(&[
             "hook",
             "--port",
@@ -640,8 +570,6 @@ mod tests {
 
     #[test]
     fn run_worker_keep_flag_is_optional() {
-        // run-worker parses without --keep and carries it verbatim when a
-        // hook spawn passes it.
         let cli = parse(&[
             "run-worker",
             "--id",
@@ -681,8 +609,6 @@ mod tests {
 
     #[test]
     fn drop_minimal_form_is_just_the_directory() {
-        // Every flag defaulted: port allocated later, name derives from it,
-        // token generated at runtime, cap falls back to the default.
         let cli = parse(&["drop", "inbox"]).expect("`ft drop inbox` must parse");
         match cli.command {
             Some(Command::Drop {
@@ -706,8 +632,6 @@ mod tests {
 
     #[test]
     fn drop_flags_parse_and_reject_out_of_range_values() {
-        // In-range flags parse; out-of-range numerics are usage errors (the
-        // cap is bounded by the fixed 1 GiB total-store cap).
         let cli = parse(&[
             "drop",
             "/srv/inbox",
@@ -761,8 +685,6 @@ mod tests {
 
     #[test]
     fn run_worker_max_size_flag_is_optional() {
-        // run-worker parses without --max-size and carries it verbatim when a
-        // drop spawn passes it.
         let cli = parse(&[
             "run-worker",
             "--id",
@@ -802,8 +724,6 @@ mod tests {
 
     #[test]
     fn implicit_start_still_reaches_the_positional_dir() {
-        // The first token matching no subcommand falls through to the
-        // positional dir.
         let cli = parse(&["./site"]).expect("`ft ./site` must parse");
         assert!(cli.command.is_none());
         assert_eq!(cli.dir, Some(PathBuf::from("./site")));
@@ -811,7 +731,6 @@ mod tests {
 
     #[test]
     fn static_origin_flags_parse_on_the_implicit_start() {
-        // Before or after the positional directory; off/absent when omitted.
         let cli = parse(&["--spa", "--cors", "--token", "sekrit", "./site"])
             .expect("`ft --spa --cors --token s ./site` must parse");
         assert!(cli.command.is_none());
@@ -831,8 +750,6 @@ mod tests {
 
     #[test]
     fn proxy_takes_no_static_origin_flags() {
-        // NEVER-ON-PROXY: static-origin policy is a parse-level error
-        // everywhere but the implicit START, never silently ignored.
         for flag in [["--spa"].as_slice(), &["--cors"], &["--token", "sekrit"]] {
             let mut args = vec!["proxy", "3000"];
             args.extend_from_slice(flag);
@@ -842,7 +759,6 @@ mod tests {
                 args.join(" ")
             );
         }
-        // Same exclusion for the other non-static subcommands.
         for args in [
             vec!["hook", "--spa"],
             vec!["drop", "inbox", "--cors"],

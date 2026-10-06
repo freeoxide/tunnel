@@ -61,8 +61,6 @@ pub struct Check {
 
 /// Entry point for the DOCTOR command.
 pub async fn run() -> Result<()> {
-    // A broken state-dir resolution is the one environment failure doctor
-    // reports by failing itself; every per-check outcome is informational.
     let state = StateDir::new()?;
 
     let mut checks = vec![cloudflared_check()];
@@ -118,9 +116,6 @@ async fn probe_service(svc: Service) -> (ServiceStatus, Option<bool>, Option<Com
     (status, origin, command_probe(&svc).await)
 }
 
-/// `cloudflared` presence. Raw PATH probe via `toride_runner::discovery` —
-/// `ensure_installed` bails with the full install message; a miss is a warn,
-/// never a failure.
 fn cloudflared_check() -> Check {
     match toride_runner::discovery::find_binary("cloudflared") {
         Ok(path) => Check {
@@ -159,22 +154,13 @@ pub(crate) async fn origin_alive_async(port: u16) -> bool {
     )
 }
 
-/// Liveness probes for a `Run` service's recorded command child, fed into
-/// [`service_checks`] so the orphan decision stays a pure table.
 #[derive(Debug, Clone, Copy)]
 struct CommandProbe {
-    /// The recorded pid, echoed back for the finding wording.
     pid: u32,
-    /// Plain existence probe — deliberately NOT identity: no cmdline needle
-    /// exists for an operator command, so a recycled pid reads alive.
     alive: bool,
-    /// Whether the run's own port answers — evidence, never identity proof;
-    /// probed unconditionally so its meaning never depends on `alive`.
     port_alive: bool,
 }
 
-/// Probe a `Run` service's recorded command child, if any. Pid 0 is refused
-/// like unrecorded: probing it reads the CALLER's own group as "alive".
 async fn command_probe(svc: &Service) -> Option<CommandProbe> {
     if svc.kind != ServiceKind::Run {
         return None;
@@ -196,7 +182,6 @@ fn service_checks(
 ) -> Vec<Check> {
     let mut checks = Vec::new();
 
-    // --- worker liveness --------------------------------------------------
     // `Service::status` handles every pid subtlety (pid 0, foreground vs
     // background, PID-reuse safety); doctor only interprets its verdict.
     match (status, svc.worker_pid) {
@@ -250,12 +235,9 @@ fn service_checks(
         }),
     }
 
-    // --- run command child: orphan detection ---------------------------------
     // Only a Stale worker can orphan anything — a live worker owns its child.
-    // The pid is existence-probed only (no needle exists), so neither branch
-    // may attribute the live pid or the port outright — a recycled pid plus
-    // an unrelated squatter must not become a false orphan claim; one shared
-    // verify-first hint serves both branches.
+    // The pid is existence-probed only, so the wording may not attribute the
+    // pid or port outright: a recycled pid must not become a false orphan.
     if status == ServiceStatus::Stale
         && let Some(probe) = command
         && probe.alive
@@ -290,7 +272,6 @@ fn service_checks(
         });
     }
 
-    // --- origin probe -----------------------------------------------------
     // THE doctor check: a Proxy fronts an operator-owned port whose death is
     // invisible to everything else ft prints; ft-hosted kinds: anomaly only.
     if let Some(alive) = origin {
@@ -375,7 +356,6 @@ fn service_checks(
         }
     }
 
-    // --- state dir --------------------------------------------------------
     let state_ok = svc.state_dir.exists();
     checks.push(Check {
         name: format!("state-dir {}", svc.name),
@@ -405,10 +385,9 @@ fn service_checks(
 
 #[cfg(test)]
 mod tests {
-    //! [`service_checks`] is pure given `(status, origin, command)`, so the
-    //! whole matrix is asserted without the real state dir. Fixtures: pid 0
-    //! needs no probe, 4_000_000 is outside any real pid namespace, and the
-    //! test binary's own pid + `foreground: true` + a public URL reads Running.
+    //! [`service_checks`] is pure given `(status, origin, command)`, asserted
+    //! without the real state dir. Fixtures: 4_000_000 is outside any real pid
+    //! namespace; own pid + `foreground: true` + a public URL reads Running.
 
     use super::*;
     use chrono::TimeDelta;
@@ -433,8 +412,6 @@ mod tests {
         }
     }
 
-    /// Reads Running through the real probe: the test binary's own pid with
-    /// `foreground: true` and a published public URL.
     fn running_service(kind: ServiceKind) -> Service {
         let mut s = service(kind);
         s.foreground = true;
@@ -443,7 +420,6 @@ mod tests {
         s
     }
 
-    /// The check whose name starts with `prefix` (e.g. "worker alpha").
     fn find<'a>(checks: &'a [Check], prefix: &str) -> &'a Check {
         checks
             .iter()
@@ -453,7 +429,6 @@ mod tests {
 
     #[test]
     fn origin_alive_accepts_a_live_listener() {
-        // Loopback-only sockets: no external network is touched.
         let listener =
             std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback listener");
         let port = listener.local_addr().expect("local addr").port();
@@ -502,7 +477,6 @@ mod tests {
 
     #[test]
     fn stale_worker_warns_with_kill_hint_and_skips_the_probe() {
-        // 4_000_000 reads Stale through the real status probe.
         let svc = service(ServiceKind::Proxy);
         let stale = Service {
             worker_pid: 4_000_000,
@@ -538,8 +512,6 @@ mod tests {
 
     #[test]
     fn fresh_pid0_reservation_is_a_note_not_an_error() {
-        // created_at = now puts the reservation inside START_GRACE: mid-start
-        // is a note, not a finding.
         let svc = service(ServiceKind::Proxy);
         let checks = service_checks(&svc, svc.status(), None, None);
         let worker = find(&checks, "worker alpha");
@@ -550,8 +522,6 @@ mod tests {
 
     #[test]
     fn expired_pid0_reservation_warns_with_sanitize_hint() {
-        // Past the grace the pid will never land: an abandoned reservation,
-        // same split `ft prune` makes; sanitize is the cleanup command.
         let mut svc = service(ServiceKind::Proxy);
         svc.created_at = crate::model::now_utc()
             - (TimeDelta::from_std(crate::model::START_GRACE).expect("grace fits")
@@ -572,7 +542,6 @@ mod tests {
 
     #[test]
     fn live_proxy_with_dead_origin_fails_with_the_502_wording() {
-        // The motivating case for the whole command.
         let svc = running_service(ServiceKind::Proxy);
         let checks = service_checks(&svc, svc.status(), Some(false), None);
         let origin = find(&checks, "origin alpha");
@@ -599,8 +568,6 @@ mod tests {
 
     #[test]
     fn live_static_with_dead_origin_is_an_anomaly_warn() {
-        // Static hosts its own server, so a live worker with a closed port is
-        // an anomaly warn, not the proxy's fail.
         let svc = running_service(ServiceKind::Static);
         let checks = service_checks(&svc, svc.status(), Some(false), None);
         let origin = find(&checks, "origin alpha");
@@ -654,10 +621,6 @@ mod tests {
         );
     }
 
-    // --- run command child: orphan detection ---------------------------------
-
-    /// Reads Stale through the real probe (pid far outside any namespace)
-    /// with an optional recorded command pid.
     fn stale_run(command_pid: Option<u32>) -> Service {
         Service {
             worker_pid: 4_000_000,
@@ -668,8 +631,6 @@ mod tests {
 
     #[test]
     fn stale_run_with_a_live_listening_command_flags_the_orphan() {
-        // A recycled pid almost never listens on the run's port — the
-        // likelier-orphan reading; ft kill cannot reach it, stop by hand.
         let svc = stale_run(Some(4242));
         let checks = service_checks(
             &svc,
@@ -725,8 +686,6 @@ mod tests {
 
     #[test]
     fn stale_run_with_a_live_but_silent_command_hedges_the_finding() {
-        // pid alive, port dead: either a survivor that stopped serving or a
-        // recycled pid — reported, but hedged.
         let svc = stale_run(Some(4242));
         let checks = service_checks(
             &svc,
@@ -766,7 +725,6 @@ mod tests {
 
     #[test]
     fn stale_run_with_a_dead_command_pid_adds_no_command_finding() {
-        // The ordinary post-mortem: worker and command both gone.
         let svc = stale_run(Some(4242));
         let checks = service_checks(
             &svc,
@@ -787,7 +745,6 @@ mod tests {
 
     #[test]
     fn stale_run_without_a_recorded_command_pid_has_nothing_to_flag() {
-        // No recorded pid: no command child is knowable.
         let svc = stale_run(None);
         let checks = service_checks(&svc, svc.status(), None, None);
         assert!(
@@ -798,8 +755,6 @@ mod tests {
 
     #[test]
     fn live_run_with_dead_origin_and_live_command_names_the_running_pid() {
-        // The command has not bound the port — a 502-ing tunnel, with the
-        // running pid named so the operator looks at the right process.
         let svc = running_service(ServiceKind::Run);
         let checks = service_checks(
             &svc,
@@ -838,8 +793,6 @@ mod tests {
 
     #[test]
     fn live_run_with_dead_origin_and_exited_command_says_so() {
-        // The command exited; the worker's monitor should end the service
-        // within moments.
         let svc = running_service(ServiceKind::Run);
         let checks = service_checks(
             &svc,
@@ -864,7 +817,6 @@ mod tests {
 
     #[test]
     fn live_run_with_dead_origin_and_no_recorded_pid_says_the_spawn_has_not_landed() {
-        // Mid-spawn or recording failed — the finding must not invent a pid.
         let svc = running_service(ServiceKind::Run);
         let checks = service_checks(&svc, svc.status(), Some(false), None);
         let origin = find(&checks, "origin alpha");
@@ -878,7 +830,6 @@ mod tests {
 
     #[test]
     fn healthy_run_service_is_all_ok_and_names_no_command() {
-        // No "command" line on a healthy service — it only carries findings.
         let mut svc = running_service(ServiceKind::Run);
         let dir = tempfile::tempdir().expect("create temp state dir");
         svc.state_dir = dir.path().to_path_buf();
@@ -931,8 +882,6 @@ mod tests {
         );
     }
 
-    // --- command_probe: the Run-only probe policy -----------------------------
-
     #[tokio::test]
     async fn command_probe_skips_non_run_kinds_unrecorded_and_zero_pids() {
         // A command_pid on a Proxy is hand-edited nonsense; pid 0 would probe
@@ -959,8 +908,6 @@ mod tests {
 
     #[tokio::test]
     async fn command_probe_reads_real_liveness_and_port_state() {
-        // Real probes with controlled answers: the test's own pid + a bound
-        // listener; port_alive is probed even for a dead pid.
         let listener =
             std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback listener");
         let port = listener.local_addr().expect("local addr").port();

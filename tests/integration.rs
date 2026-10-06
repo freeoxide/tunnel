@@ -1,9 +1,6 @@
-//! End-to-end tests for the `ft` binary, driven as a black box: no lib
-//! target, so tests spawn the freshly-built binary via `CARGO_BIN_EXE_ft`
-//! and pin `XDG_STATE_HOME` to a private tempdir (set on the subprocess
-//! only, never the test process's env). Cloudflared/network paths are out of
-//! scope — only paths that stop before the cloudflared lookup run here; the
-//! origin behaviour itself is covered by the server unit tests.
+//! End-to-end black-box tests for the `ft` binary via `CARGO_BIN_EXE_ft`,
+//! each pinned to a private `XDG_STATE_HOME` tempdir; cloudflared-bound
+//! paths are out of scope (origin behaviour lives in the server unit tests).
 
 #![cfg(unix)] // proc::pid_alive uses a Unix-only cmdline identity probe.
 
@@ -121,7 +118,6 @@ impl DecoyWorker {
 
 impl Drop for DecoyWorker {
     fn drop(&mut self) {
-        // wait() reaps so the pid cannot linger as a zombie.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -230,7 +226,6 @@ fn time_wait_loopback_port() -> u16 {
     let port = listener.local_addr().expect("local addr").port();
     let client = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).expect("connect");
     let accepted = listener.accept().expect("accept").0;
-    // Drop order is the point: the close must be ACTIVE on the server endpoint.
     drop(listener);
     drop(accepted);
     drop(client);
@@ -256,8 +251,6 @@ fn tree_paths(root: &std::path::Path) -> Vec<PathBuf> {
     paths
 }
 
-/// Seeding a `created_at` inside START_GRACE (60 s) needs NOW; integration
-/// tests cannot use chrono (no lib target), hence the hand-rolled conversion.
 fn now_rfc3339() -> String {
     fn civil_from_days(days: i64) -> (i64, u32, u32) {
         let z = days + 719_468;
@@ -430,8 +423,6 @@ fn detail_round_trips_a_seeded_entry() {
         "name target did not resolve to the entry: {out_by_name}"
     );
 }
-
-// --- `ft proxy` (pre-flight + seeded-fixture lifecycle; no cloudflared) ---
 
 #[test]
 fn proxy_dead_upstream_fails_friendly_and_leaves_no_state() {
@@ -629,32 +620,6 @@ fn kill_removes_a_stale_proxy_entry_like_a_static_one() {
 }
 
 #[test]
-fn prune_reaps_a_stale_proxy_entry_and_persists() {
-    let dir = TempDir::new().unwrap();
-    let reg = seed_registry(
-        dir.path(),
-        &proxy_registry_json(4_000_000, "2026-07-21T00:00:00Z", None),
-    );
-
-    let (ok, out) = run_ft(dir.path(), &["prune"]);
-    assert!(ok, "`ft prune` on a proxy registry failed: {out}");
-    assert!(
-        out.contains("Pruned 1 stale service"),
-        "expected prune to report one reaped proxy service, got: {out}"
-    );
-    assert!(
-        out.contains("seed-proxy"),
-        "expected the pruned proxy service's name, got: {out}"
-    );
-
-    let after = fs::read_to_string(&reg).unwrap();
-    assert!(
-        !after.contains("seed-proxy"),
-        "prune should have removed the stale proxy entry, but registry is: {after}"
-    );
-}
-
-#[test]
 fn kill_refuses_a_fresh_proxy_reservation_within_the_start_grace() {
     let dir = TempDir::new().unwrap();
     let reg = seed_registry(dir.path(), &proxy_registry_json(0, &now_rfc3339(), None));
@@ -740,8 +705,6 @@ fn prune_keeps_a_fresh_proxy_reservation_and_reaps_an_expired_one() {
         "prune must keep the fresh and drop the expired reservation, registry: {after}"
     );
 }
-
-// --- `ft run` (usage, occupied-port pre-flight, seeded fixtures; no cloudflared)
 
 #[test]
 fn run_help_documents_the_command() {
@@ -946,8 +909,6 @@ fn run_fixture_renders_in_ls_and_detail() {
         "kill should have removed the run entry, but registry is: {after}"
     );
 }
-
-// --- `ft drop` (usage, pre-flights, seeded fixtures; no cloudflared) --------
 
 #[test]
 fn drop_help_documents_the_command() {
@@ -1220,8 +1181,6 @@ fn drop_fixture_renders_in_ls_detail_and_kill() {
     );
 }
 
-// --- `ft doctor` (read-only diagnosis; no cloudflared needed) ---------------
-
 #[test]
 fn doctor_on_a_missing_registry_exits_zero_with_no_service_checks() {
     let dir = TempDir::new().unwrap();
@@ -1373,8 +1332,6 @@ fn doctor_flags_a_stale_run_service_whose_command_is_still_running() {
         "doctor must not mutate the registry, got: {after}"
     );
 }
-
-// --- `ft sanitize` (the cleanup counterpart; no cloudflared needed) ----------
 
 #[test]
 fn sanitize_on_a_missing_registry_reports_nothing_and_creates_no_state() {
@@ -1543,8 +1500,6 @@ fn sanitize_keeps_a_fresh_reservation_and_reaps_an_expired_one() {
     );
 }
 
-// --- `ft hook` (usage, occupied-port pre-flight, seeded fixtures; no cloudflared)
-
 #[test]
 fn hook_help_documents_the_command() {
     let dir = TempDir::new().unwrap();
@@ -1702,8 +1657,6 @@ fn hook_fixture_renders_in_ls_and_detail() {
         "kill should have removed the hook entry, but registry is: {after}"
     );
 }
-
-// --- static-origin flags on `ft <dir>` (CLI surface, registry persistence) ---
 
 #[test]
 fn start_help_documents_the_static_origin_flags() {

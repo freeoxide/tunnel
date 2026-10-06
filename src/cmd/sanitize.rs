@@ -1,15 +1,6 @@
-//! The `sanitize` command: remove every dangling service, not just stale ones.
-//!
-//! Beyond prune's staleness rule (dead/recycled worker, expired pid-0
-//! reservation), sanitize removes zombie-upstream entries: worker alive and
-//! Running but nothing answers on `127.0.0.1:<port>` (the operator's upstream
-//! died; the tunnel 502s every request). A port counts as dead only after a
-//! DOUBLE probe ~750 ms apart, so a mid-restart dev server is not reaped.
-//!
-//! Safety rules (mirroring `cmd/kill.rs`): port probes run BEFORE the
-//! registry lock; each candidate is re-verified under it (same id AND
-//! `worker_pid`) so a concurrent writer wins; signalling runs OUTSIDE the
-//! lock, gated on cmdline identity. A FOREGROUND service is never killed.
+//! The `sanitize` command: remove every dangling service (stale entries,
+//! zombie upstreams). Probes run before the registry lock; hits re-verified
+//! under it (id AND worker_pid); signals sent outside it. Foreground never killed.
 
 use std::time::Duration;
 
@@ -20,23 +11,14 @@ use crate::output;
 use crate::proc;
 use crate::state::StateDir;
 
-/// Pause between the two origin probes: long enough for a restarting dev
-/// server to rebind, short enough to keep a dead-proxy pass prompt.
 const REPROBE_DELAY: Duration = Duration::from_millis(750);
 
-/// Why a zombie-upstream entry is dangling: a Proxy fronts an operator-owned
-/// port; a Static/Hook/Drop worker IS the origin, so a dead port is an anomaly.
 enum ZombieReason {
-    /// `kind == Proxy`: the operator's upstream server died; the tunnel 502s
-    /// every request.
     UpstreamDead,
-    /// `kind == Static | Hook | Drop`: the live worker should be serving the
-    /// port in-process but is not.
     InProcessServerDead,
 }
 
 impl ZombieReason {
-    /// The bullet's parenthesised reason for a removed zombie.
     fn describe(&self, svc: &Service) -> String {
         match self {
             ZombieReason::UpstreamDead => format!(
@@ -52,27 +34,13 @@ impl ZombieReason {
     }
 }
 
-/// What sanitize decided for one service — a pure decision over injected
-/// inputs ([`plan`]); `run` performs the effects.
 enum Action {
-    /// Alive and healthy, or not yet judgeable — leave the entry alone.
     Keep,
-    /// Dead worker or abandoned pid-0 reservation: prune's existing rule.
     PruneStale,
-    /// Live worker, Running, but the origin port failed the double probe.
-    RemoveZombie {
-        /// Which kind of zombie this is (drives the bullet wording).
-        reason: ZombieReason,
-    },
-    /// The zombie rule fired on a FOREGROUND service: never killed by
-    /// sanitize — reported as skipped for the operator to stop by hand.
+    RemoveZombie { reason: ZombieReason },
     SkipForeground,
 }
 
-/// Worker liveness, PID-reuse-safe: background via the cmdline-aware
-/// [`proc::pid_alive`], foreground via `pid_matches(pid, "--foreground")` —
-/// NOT [`Service::status`], whose plain `process_exists` a recycled pid
-/// satisfies. `None` = pid-0 reservation.
 fn worker_alive(svc: &Service) -> Option<bool> {
     if svc.worker_pid == 0 {
         return None;
@@ -84,11 +52,7 @@ fn worker_alive(svc: &Service) -> Option<bool> {
     })
 }
 
-/// The fate of one service, pure over injected inputs. `worker_alive`:
-/// `None` = pid-0 reservation, `Some(false)` = dead/recycled, `Some(true)`
-/// = live; `port_dead`: `None` = not probed, `Some(true)` = both failed.
 fn plan(svc: &Service, worker_alive: Option<bool>, port_dead: Option<bool>) -> Action {
-    // --- rule 1: prune's staleness rule --------------------------------------
     match worker_alive {
         Some(false) => return Action::PruneStale,
         // A pid-0 reservation: fresh = a start in progress (reaping would
@@ -109,7 +73,6 @@ fn plan(svc: &Service, worker_alive: Option<bool>, port_dead: Option<bool>) -> A
         return Action::Keep;
     }
 
-    // --- rule 2: zombie upstream ---------------------------------------------
     // Reached only when Running; only a DEAD double-probe counts.
     match port_dead {
         Some(true) if svc.foreground => Action::SkipForeground,
@@ -127,17 +90,11 @@ fn plan(svc: &Service, worker_alive: Option<bool>, port_dead: Option<bool>) -> A
     }
 }
 
-/// One snapshot entry plus the decision made against it.
 struct Judgment {
-    /// The entry as it was when judged; the re-verification inside [`apply`]
-    /// compares the freshly loaded registry against this.
     svc: Service,
-    /// The decision; only PruneStale/RemoveZombie become candidates (Keep
-    /// drops out; SkipForeground is reported, not removed).
     action: Action,
 }
 
-/// Bullet reason for a stale removal — dead worker vs abandoned reservation.
 fn stale_reason(svc: &Service) -> String {
     if svc.worker_pid == 0 {
         "worker pid was never recorded — the start reservation was abandoned".to_string()
@@ -146,8 +103,6 @@ fn stale_reason(svc: &Service) -> String {
     }
 }
 
-/// Remove, under the lock, every candidate still identical to what the
-/// (unlocked, slow-probe) snapshot judged — same id AND `worker_pid`.
 fn apply<'a>(reg: &mut Registry, candidates: &'a [Judgment]) -> Vec<(Service, &'a Action)> {
     let mut removed = Vec::new();
     for c in candidates {
@@ -217,10 +172,8 @@ pub async fn run() -> Result<()> {
 
     let (candidates, skipped_foreground) = judge(&snapshot.services).await;
 
-    // --- locked removal, re-verified against the freshly loaded registry -----
     let removed = Registry::update(&state, |reg| apply(reg, &candidates))?;
 
-    // --- signalling + reporting: OUTSIDE the lock -----------------------------
     // Every signal below is cmdline-identity-gated (no recycled-pid kills).
     let mut bullets = Vec::new();
     for (svc, action) in &removed {
@@ -264,10 +217,9 @@ pub async fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    //! [`plan`] is a decision table over injected inputs and [`apply`] pure
-    //! over a seeded registry — asserted without sockets or signals.
-    //! [`worker_alive`] probes real /proc state: the test binary's own pid
-    //! is alive but lacks both needles — the recycled-pid scenario.
+    //! [`plan`] is a decision table over injected inputs, [`apply`] pure over
+    //! a seeded registry. [`worker_alive`] probes real /proc state: the test
+    //! binary's own pid is alive but lacks both needles (the recycled case).
 
     use super::*;
     use chrono::TimeDelta;
@@ -291,8 +243,6 @@ mod tests {
             foreground,
         }
     }
-
-    // --- the liveness input (worker_alive) -------------------------------------
 
     #[test]
     fn foreground_self_pid_without_the_flag_reads_dead() {
@@ -320,15 +270,11 @@ mod tests {
 
     #[test]
     fn foreground_entry_on_a_recycled_pid_is_pruned_not_skipped() {
-        // A live-but-not-ours pid in a foreground slot must classify
-        // PruneStale, not SkipForeground (no stranding, no bogus Ctrl-C hint).
         let mut svc = service(ServiceKind::Static, true);
         svc.worker_pid = std::process::id();
         let alive = worker_alive(&svc);
         assert!(matches!(plan(&svc, alive, Some(true)), Action::PruneStale));
     }
-
-    // --- rule 1: prune's staleness rule ---------------------------------------
 
     #[test]
     fn dead_background_worker_is_pruned() {
@@ -338,16 +284,12 @@ mod tests {
 
     #[test]
     fn dead_foreground_worker_is_pruned() {
-        // `Some(false)` here comes from the --foreground identity probe, so a
-        // recycled pid reads dead; no live signalling is involved.
         let svc = service(ServiceKind::Static, true);
         assert!(matches!(plan(&svc, Some(false), None), Action::PruneStale));
     }
 
     #[test]
     fn fresh_pid0_reservation_is_kept() {
-        // created_at = now keeps the entry inside START_GRACE: reaping now
-        // would orphan the just-spawned worker.
         let mut svc = service(ServiceKind::Proxy, false);
         svc.worker_pid = 0;
         svc.public_url = None;
@@ -356,8 +298,6 @@ mod tests {
 
     #[test]
     fn expired_pid0_reservation_is_pruned() {
-        // Past the grace the pid will never land: an abandoned reservation,
-        // pruned with nothing to signal (no worker ever landed).
         let mut svc = service(ServiceKind::Proxy, false);
         svc.worker_pid = 0;
         svc.public_url = None;
@@ -369,14 +309,10 @@ mod tests {
 
     #[test]
     fn starting_worker_with_recorded_pid_is_kept() {
-        // Live worker, URL not discovered yet: the port may not be bound —
-        // left alone, and never probed by `run` in the first place.
         let mut svc = service(ServiceKind::Proxy, false);
         svc.public_url = None;
         assert!(matches!(plan(&svc, Some(true), None), Action::Keep));
     }
-
-    // --- rule 2: zombie upstream ----------------------------------------------
 
     #[test]
     fn running_service_with_answering_port_is_kept() {
@@ -386,8 +322,6 @@ mod tests {
 
     #[test]
     fn running_service_without_a_probe_is_kept() {
-        // Defensive: `run` passes None only for non-Running services, but a
-        // missing probe must never read as evidence of a dead port.
         let svc = service(ServiceKind::Proxy, false);
         assert!(matches!(plan(&svc, Some(true), None), Action::Keep));
     }
@@ -549,8 +483,6 @@ mod tests {
         );
     }
 
-    // --- the under-lock re-verification (apply) --------------------------------
-
     #[test]
     fn apply_removes_a_candidate_that_still_matches() {
         let svc = service(ServiceKind::Proxy, false);
@@ -570,8 +502,6 @@ mod tests {
 
     #[test]
     fn apply_leaves_an_entry_whose_worker_pid_changed() {
-        // A concurrent `ft start` re-recorded a different pid: the decision
-        // was about the OLD entry — the NEW one must survive.
         let judged = service(ServiceKind::Proxy, false);
         let mut live = judged.clone();
         live.worker_pid = 999;
@@ -591,8 +521,6 @@ mod tests {
 
     #[test]
     fn apply_leaves_an_entry_that_vanished() {
-        // A concurrent `ft kill` already removed it: nothing to do, and the
-        // concurrent writer's outcome stands.
         let judged = service(ServiceKind::Static, false);
         let mut reg = Registry::default(); // empty
         let candidates = [Judgment {

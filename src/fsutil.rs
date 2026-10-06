@@ -31,8 +31,6 @@ pub async fn open_private_append_async(path: impl AsRef<Path>) -> std::io::Resul
     let path = path.as_ref();
     #[cfg(unix)]
     {
-        // tokio's `OpenOptions::mode` is a native method (not the std
-        // `OpenOptionsExt` trait), so no trait import is needed here.
         tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -61,7 +59,6 @@ pub fn ensure_private_dir(dir: impl AsRef<Path>) -> anyhow::Result<()> {
             .mode(0o700)
             .create(dir)
             .with_context(|| format!("creating directory {}", dir.display()))?;
-        // Re-seal an existing tree created by an older build to 0700.
         let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
     }
     #[cfg(not(unix))]
@@ -82,7 +79,6 @@ pub fn apply_private_mode(opts: &mut std::fs::OpenOptions) -> &mut std::fs::Open
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600)
     }
-    // No-op: Windows file privacy comes from the profile-dir ACL, not a mode bit.
     #[cfg(not(unix))]
     {
         opts

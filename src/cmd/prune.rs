@@ -1,28 +1,17 @@
-//! The `prune` command: reconcile the registry with reality — after a
-//! reboot/OOM/crash, remove entries whose worker no longer exists and
-//! best-effort reap an orphaned `cloudflared` (PDEATHSIG does not survive a
-//! host reboot). Fresh pid-0 reservations inside START_GRACE are left alone
-//! (reaping mid-window would orphan the just-spawned worker).
+//! The `prune` command: reconcile the registry with reality — remove entries
+//! whose worker no longer exists and best-effort reap an orphaned cloudflared
+//! (PDEATHSIG does not survive a host reboot); in-grace pid-0 entries are kept.
 
 use crate::error::Result;
 use crate::model::Registry;
 use crate::proc;
 use crate::state::StateDir;
 
-/// One reconciliation pass: [`classify`] decides (pure), [`run`] performs the
-/// signalling — the rules stay testable without real signals.
 struct Reconciliation {
-    /// Human-friendly names of the stale services, in removal order.
     stale_names: Vec<String>,
-    /// Recorded `cloudflared` pids of stale services that are confirmed ours
-    /// (cmdline identity check passed) and should be best-effort reaped.
     orphans_to_reap: Vec<u32>,
 }
 
-/// Decide every service's fate in one pass. Stale = recorded worker no longer
-/// alive: background via cmdline-aware `pid_alive` (PID-reuse safe),
-/// foreground via `pid_matches(.., "--foreground")`; a pid-0 reservation is
-/// kept while START_GRACE is open. Kept set written back; stale dropped.
 fn classify(reg: &mut Registry) -> Reconciliation {
     let mut keep = Vec::new();
     let mut stale_names = Vec::new();
@@ -113,16 +102,12 @@ mod tests {
         }
     }
 
-    /// A pid "ours" for the test: our cmdline lacks `run-worker`, so
-    /// `pid_alive` reads false for it — exactly the background arm's case.
     fn live_self_pid() -> u32 {
         std::process::id()
     }
 
     #[test]
     fn starting_entry_worker_pid_zero_is_kept() {
-        // A fresh pid-0 reservation is inside the grace window: the parent
-        // may be mid reserve→spawn→record — the entry must survive.
         let mut reg = Registry::default();
         reg.services.push(dummy_service(1, "starting"));
         let rec = classify(&mut reg);
@@ -134,8 +119,6 @@ mod tests {
 
     #[test]
     fn abandoned_reservation_past_grace_is_pruned() {
-        // Past the grace the pid will never land (parent died mid-start) —
-        // prune, or it sits in `ft ls` as "starting" forever.
         let mut reg = Registry::default();
         let mut s = dummy_service(1, "leftover");
         s.created_at = crate::model::now_utc()
@@ -165,13 +148,11 @@ mod tests {
     fn background_with_foreign_tunnel_pid_is_not_reaped() {
         let mut reg = Registry::default();
         let mut s = dummy_service(1, "bg-orphan");
-        s.worker_pid = live_self_pid(); // stale -> triggers orphan check
+        s.worker_pid = live_self_pid();
         s.tunnel_pid = Some(4_242_424); // a pid that is definitely not cloudflared
         reg.services.push(s);
         let rec = classify(&mut reg);
         assert_eq!(rec.stale_names, vec!["bg-orphan".to_string()]);
-        // pid 4242424 does not exist, so pid_matches(.., "cloudflared") is
-        // false -> it is NOT in the reap list (recycled-pid safety).
         assert!(rec.orphans_to_reap.is_empty());
     }
 
@@ -202,17 +183,13 @@ mod tests {
     #[test]
     fn mixed_registry_reconciles_to_right_keep_set() {
         let mut reg = Registry::default();
-        // keep: starting (pid 0)
         reg.services.push(dummy_service(1, "starting"));
-        // keep: a second starting entry (any non-zero pid we don't own reads stale).
         let mut s2 = dummy_service(2, "starting-2");
         s2.worker_pid = 0;
         reg.services.push(s2);
-        // stale: background self pid
         let mut s3 = dummy_service(3, "bg-stale");
         s3.worker_pid = live_self_pid();
         reg.services.push(s3);
-        // stale: foreground dead pid
         let mut s4 = dummy_service(4, "fg-stale");
         s4.foreground = true;
         s4.worker_pid = 999_999;

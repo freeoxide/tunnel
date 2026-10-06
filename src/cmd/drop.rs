@@ -1,14 +1,6 @@
 //! The DROP command: `ft drop <dir>` runs an ft-owned upload-receiver origin
-//! (see `drop_server`) behind a Quick Tunnel, mirroring START's reserve →
-//! spawn-worker → poll-for-URL shape (sharing start's fail-fast helpers); the
-//! worker binds the origin itself, so success is "URL published".
-//!
-//! `resolve_dir` + `is_sensitive_dir` run before any state (the worker
-//! re-runs them); a sensitive directory is refused UNCONDITIONALLY — no
-//! `--yes`: a drop bucket is WRITE-touched by the public tunnel. The token is
-//! resolved before any state (trimmed once, or a fresh mint), stored 0600
-//! after the reserve and before the worker spawns. One bucket, one owner: a
-//! directory already a drop target refuses a second drop service.
+//! behind a Quick Tunnel. Sensitive directories are refused unconditionally,
+//! and one bucket has one owner (a second drop on it is refused).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -43,8 +35,6 @@ pub async fn run(
     token: Option<String>,
     max_size: Option<u64>,
 ) -> Result<()> {
-    // Pre-flight 1: the upload target — resolved like a static publish;
-    // sensitive dirs refused unconditionally (module docs), zero state left.
     let dir = resolve_dir(&dir)?;
     ensure!(
         !is_sensitive_dir(&dir),
@@ -53,8 +43,6 @@ pub async fn run(
         dir.display()
     );
 
-    // Pre-flight 2: ft's own origin, so the port must be FREE — fail up
-    // front rather than a worker dying on its bind check seconds later.
     let port = match port {
         Some(p) => {
             ensure!(
@@ -70,8 +58,6 @@ pub async fn run(
     // Resolved TRIMMED ONCE, HERE — the single binding every consumer sees
     // (file, printed credential, comparison): no 401 on a pasted twin.
     let token = resolve_token(token)?;
-    // The per-upload cap; the total-store cap is the fixed
-    // drop_server::MAX_TOTAL_STORE.
     let max_size = max_size.unwrap_or(drop_server::DEFAULT_MAX_SIZE);
 
     if foreground {
@@ -81,8 +67,6 @@ pub async fn run(
     }
 }
 
-/// Resolve the drop token: `--token` trimmed once (refused when empty), or
-/// a freshly minted CSPRNG one when omitted.
 fn resolve_token(token: Option<String>) -> Result<String> {
     match token {
         Some(t) => {
@@ -94,8 +78,6 @@ fn resolve_token(token: Option<String>) -> Result<String> {
     }
 }
 
-/// Background flow: reserve, write the token file, spawn the detached DROP
-/// worker, poll for the URL (fail-fast); the success arm also prints the token.
 async fn run_background(
     dir: PathBuf,
     port: u16,
@@ -111,26 +93,19 @@ async fn run_background(
 
     state.ensure()?;
 
-    // Reserve atomically under the grace-window contract of start's
-    // `reserve_entry`; every failure path below removes the entry by id.
     let (id, name, service_dir) = reserve_entry(&state, &dir, port, name, 0, false)?;
 
     // Written AFTER the reserve (lifetime bounded by the entry's) and BEFORE
     // the worker spawn (it reads the token at startup, fail-fast without it).
     if let Err(e) = drop_server::store_token(&service_dir, &token) {
-        let _ = Registry::update(&state, |reg| {
-            reg.remove(id);
-        });
+        remove_reservation(&state, id);
         return Err(e)
             .with_context(|| format!("storing the drop token in {}", service_dir.display()));
     }
 
-    // The worker carries the real `dir` and the `--max-size` cap; the DROP
-    // arm binds the origin after reading the token file back.
     let worker_pid = match spawn::spawn_drop_worker(id, &name, &dir, port, max_size) {
         Ok(pid) => pid,
         Err(e) => {
-            // Release the reserved entry on spawn failure.
             remove_reservation(&state, id);
             return Err(e);
         }
@@ -198,18 +173,13 @@ async fn run_background(
                 // self-remove; tear down, don't poll 30 s with a live orphan.
                 return fail_start(&state, id, &name, worker_pid).await;
             }
-            // Still starting, or unchanged registry: poll again.
             _ => {}
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
-    // Timed out: tear the live worker + cloudflared down (the group kill
-    // reaches the worker's children) and remove the entry before bailing.
     fail_timeout(&state, id, &name, worker_pid).await
 }
 
-/// Reserve the drop entry inside the flock — drop-specific: refuses a second
-/// drop service on the same bucket and returns the service dir for the token.
 fn reserve_entry(
     state: &StateDir,
     dir: &Path,
@@ -234,7 +204,6 @@ fn reserve_entry(
                 ensure!(!reg.name_exists(n), "a service named '{n}' already exists");
                 n.clone()
             }
-            // drop-{port} in both flows, mirroring the hook-{port} convention.
             None => name::unique_name(reg, &format!("drop-{port}")),
         };
         let service_dir = state.ensure_service_dir(&name)?;
@@ -251,7 +220,7 @@ fn reserve_entry(
             public_url: None,
             worker_pid,
             tunnel_pid: None,
-            command_pid: None, // Run-only field; a drop spawns no command
+            command_pid: None,
             static_flags: Default::default(),
             created_at: crate::model::now_utc(),
             state_dir: service_dir.clone(),
@@ -261,12 +230,6 @@ fn reserve_entry(
     })?
 }
 
-/// One bucket, one owner: find an existing Drop service whose target IS
-/// `dir` (canonical comparison — aliases and `..` spellings resolve alike).
-/// Two origins would race writes and stack their total-cap allowances.
-/// Checked INSIDE the flock, so concurrent `ft drop`s serialize. Only
-/// Drop-vs-Drop: a read-only Static publish of the same dir stays allowed.
-/// An unresolvable entry dir cannot be PROVEN equal, so no conflict.
 fn find_drop_dir_conflict(reg: &Registry, dir: &Path) -> Option<String> {
     let target = std::fs::canonicalize(dir).ok()?;
     reg.services
@@ -280,15 +243,11 @@ fn find_drop_dir_conflict(reg: &Registry, dir: &Path) -> Option<String> {
         })
 }
 
-/// Why the foreground keep-alive loop ended. A drop foreground has no command
-/// child, so unlike `cmd/start.rs`'s enum there is no `CommandExited` arm.
 enum ReaderExit {
     ChildExited,
     Signal,
 }
 
-/// Foreground flow: origin + tunnel in THIS process until cloudflared exits,
-/// Ctrl-C, or SIGTERM; token file before the origin, token block right after.
 async fn run_foreground(
     dir: PathBuf,
     port: u16,
@@ -308,11 +267,8 @@ async fn run_foreground(
     let (id, name, service_dir) =
         reserve_entry(&state, &dir, port, name, std::process::id(), true)?;
 
-    // From here, every exit path must release the reserved entry.
     let _entry = EntryGuard::new(state.clone(), id);
 
-    // The token file before the origin starts: `ft detail` shows it, and the
-    // in-process origin below is built from the same value.
     drop_server::store_token(&service_dir, &token)
         .with_context(|| format!("storing the drop token in {}", service_dir.display()))?;
 
@@ -342,23 +298,17 @@ async fn run_foreground(
         }
     });
 
-    // Printed as soon as the origin exists (the public URL follows with
-    // cloudflared's first log line).
     output::print_drop_token(&token, &format!("http://127.0.0.1:{port}"));
 
     let mut child = match cloudflared::spawn(port) {
         Ok(c) => c,
         Err(e) => {
-            // Abort the just-spawned server task; the entry is released by
-            // the guard on return.
             server_handle.abort();
             return Err(e);
         }
     };
     let tunnel_pid = child.id();
 
-    // Mirror cloudflared output to stdout AND tunnel.log, publish the URL on
-    // first discovery — via start's shared drain_and_announce.
     let found = Arc::new(AtomicBool::new(false));
     let mut tasks = Vec::new();
     if let Some(out) = child.stdout.take() {
@@ -386,8 +336,6 @@ async fn run_foreground(
         )));
     }
 
-    // Race child.wait() against Ctrl-C/SIGTERM so a cloudflared that dies
-    // tears down instead of hanging.
     #[cfg(unix)]
     let exit_reason = tokio::select! {
         status = child.wait() => {
@@ -455,7 +403,6 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// A minimal Drop service entry targeting `dir`.
     fn drop_service(id: u64, name: &str, dir: Option<PathBuf>) -> Service {
         Service {
             id,
@@ -475,7 +422,6 @@ mod tests {
         }
     }
 
-    /// The same entry shape but STATIC (a read-only publish of the dir).
     fn static_service(id: u64, name: &str, dir: Option<PathBuf>) -> Service {
         Service {
             kind: ServiceKind::Static,
@@ -492,8 +438,6 @@ mod tests {
 
     #[test]
     fn resolve_token_trims_once_and_refuses_whitespace_only() {
-        // Regression: --token used to be validated via trim() but stored
-        // untrimmed — an edge-whitespace token 401'd every upload.
         assert_eq!(
             resolve_token(Some("  sekrit  ".to_string())).expect("padded token"),
             "sekrit",
@@ -515,7 +459,6 @@ mod tests {
 
     #[test]
     fn resolve_token_mints_when_omitted() {
-        // None ⇒ a freshly minted token: 64 lowercase hex chars.
         let minted = resolve_token(None).expect("minted token");
         assert_eq!(minted.len(), 64);
         assert!(
@@ -527,8 +470,6 @@ mod tests {
 
     #[test]
     fn conflict_found_for_the_same_directory() {
-        // The core contract: a second drop start on a directory already a
-        // Drop service's target finds that service by name.
         let tmp = tempfile::tempdir().expect("tempdir");
         let bucket = tmp.path().join("bucket");
         std::fs::create_dir_all(&bucket).expect("mkdir");
@@ -541,8 +482,6 @@ mod tests {
 
     #[test]
     fn conflict_found_through_path_aliases() {
-        // Canonical comparison: the guarantee is about the DIRECTORY, not the
-        // spelling of the argument.
         let tmp = tempfile::tempdir().expect("tempdir");
         let real = tmp.path().join("real");
         std::fs::create_dir_all(&real).expect("mkdir");
@@ -584,8 +523,6 @@ mod tests {
 
     #[test]
     fn static_publish_of_the_same_directory_is_no_conflict() {
-        // Deliberate policy: only Drop-vs-Drop conflicts — a read-only
-        // static publish is untouched by uploads landing in it.
         let tmp = tempfile::tempdir().expect("tempdir");
         let bucket = tmp.path().join("bucket");
         std::fs::create_dir_all(&bucket).expect("mkdir");

@@ -65,14 +65,12 @@ pub fn unique_name(registry: &Registry, base: &str) -> String {
     if !taken.contains(base) {
         return base.to_string();
     }
-    // Search `base-2`..`base-{LIMIT}`; the bound keeps the worst case finite.
     for n in 2..=LIMIT {
         let candidate = format!("{base}-{n}");
         if !taken.contains(candidate.as_str()) {
             return candidate;
         }
     }
-    // Pathological registry: fall back to the last candidate (best effort).
     format!("{base}-{LIMIT}")
 }
 
@@ -100,8 +98,6 @@ mod tests {
             foreground: false,
         }
     }
-
-    // --- validate_name ---------------------------------------------------
 
     #[test]
     fn validate_name_accepts_valid() {
@@ -145,8 +141,6 @@ mod tests {
         assert!(validate_name("12345").is_err());
     }
 
-    // --- generate_name ---------------------------------------------------
-
     #[test]
     fn generate_name_simple_basename() {
         assert_eq!(generate_name(&PathBuf::from("/home/u/blog")), "blog");
@@ -154,14 +148,11 @@ mod tests {
 
     #[test]
     fn generate_name_parent_dotdot() {
-        // `..` has no usable file_name, so we fall back to the default.
         assert_eq!(generate_name(&PathBuf::from("..")), "service");
     }
 
     #[test]
     fn generate_name_trailing_slash() {
-        // A trailing separator strips the final empty component; file_name is
-        // the last real segment.
         assert_eq!(generate_name(&PathBuf::from("/home/u/blog/")), "blog");
     }
 
@@ -174,8 +165,6 @@ mod tests {
     fn generate_name_sanitizes_unsafe_chars() {
         assert_eq!(generate_name(&PathBuf::from("/home/u/my blog!")), "my-blog");
     }
-
-    // --- unique_name -----------------------------------------------------
 
     #[test]
     fn unique_name_base_free() {
@@ -198,12 +187,9 @@ mod tests {
         assert_eq!(unique_name(&registry, "blog"), "blog-3");
     }
 
-    // --- property tests ---------------------------------------------------
-
     use proptest::prelude::*;
 
     proptest! {
-        /// A valid name ([A-Za-z0-9_-], 1..=64, not all digits) is always accepted.
         #[test]
         fn validate_name_accepts_valid_inputs(
             s in "[A-Za-z][A-Za-z0-9_-]{0,62}[A-Za-z0-9]"
@@ -211,7 +197,6 @@ mod tests {
             prop_assert!(validate_name(&s).is_ok(), "{s} should be valid");
         }
 
-        /// A name with any character outside [A-Za-z0-9_-] is rejected.
         #[test]
         fn validate_name_rejects_outside_charset(
             s in "[A-Za-z0-9_-]*[^A-Za-z0-9_-][A-Za-z0-9_-]*"
@@ -219,8 +204,6 @@ mod tests {
             prop_assert!(validate_name(&s).is_err(), "{s} should be rejected");
         }
 
-        /// generate_name never yields an empty result and never contains a path
-        /// separator (so it is always a safe single path segment downstream).
         #[test]
         fn generate_name_never_empty_or_pathlike(base in "[^\\x00]{0,32}") {
             let n = generate_name(std::path::Path::new(&base));
@@ -228,7 +211,6 @@ mod tests {
             prop_assert!(!n.contains('/') && !n.contains('\\'), "{n} must not contain a separator");
         }
 
-        /// unique_name never collides with an existing name in the registry.
         #[test]
         fn unique_name_is_truly_unique(
             existing in proptest::collection::vec("[a-z]{1,5}", 0..8),

@@ -1,3 +1,5 @@
+// Benches build with `--cfg test` but no `--test`: the mirrored #[cfg(test)]
+// modules compile while their #[test] fns stay dead, tripping both allows.
 #![allow(dead_code, unused_imports)]
 
 #[path = "../src/cli.rs"]
