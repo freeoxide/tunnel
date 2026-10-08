@@ -5,9 +5,12 @@
 #![cfg(unix)] // proc::pid_alive uses a Unix-only cmdline identity probe.
 
 use std::fs;
-use std::net::{Ipv4Addr, TcpListener};
+use std::io::Write;
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 use tempfile::TempDir;
 
@@ -230,6 +233,77 @@ fn time_wait_loopback_port() -> u16 {
     drop(accepted);
     drop(client);
     port
+}
+
+const PUBLISHING_CLOUDFLARED: &str =
+    "#!/bin/sh\necho https://fake-e2e-words.trycloudflare.com\nexec sleep 300\n";
+const DYING_CLOUDFLARED: &str = "#!/bin/sh\necho fake cloudflared failed\nexit 1\n";
+
+fn install_fake_cloudflared(bin_dir: &std::path::Path, script: &str) {
+    fs::create_dir_all(bin_dir).unwrap();
+    let fake = bin_dir.join("cloudflared");
+    fs::write(&fake, script).unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(bin_dir, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+fn path_env_prepending(bin_dir: &std::path::Path) -> String {
+    format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+fn process_alive_zombie_aware(pid: u32) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    match stat
+        .rfind(')')
+        .and_then(|close| stat[close + 1..].trim_start().chars().next())
+    {
+        None | Some('Z') => false,
+        Some(_) => true,
+    }
+}
+
+fn wait_for_process_death(pid: u32) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if !process_alive_zombie_aware(pid) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    !process_alive_zombie_aware(pid)
+}
+
+fn wait_for_port_refusal(port: u16) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_err() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_err()
+}
+
+fn json_u64_field(body: &str, field: &str) -> Option<u64> {
+    let needle = format!("\"{field}\":");
+    let rest = &body[body.find(&needle)? + needle.len()..];
+    let digits = &rest[..rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len())];
+    digits.parse().ok()
+}
+
+fn json_str_field(body: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\":\"");
+    let start = body.find(&needle)? + needle.len();
+    let end = start + body[start..].find('"')?;
+    Some(body[start..end].to_string())
 }
 
 /// Files AND directories, recursively: `StateDir::ensure` creates an empty
@@ -1927,5 +2001,348 @@ fn static_flags_persist_through_a_full_registry_rewrite() {
     assert!(
         !after.contains("expired-reservation"),
         "the expired reservation must be gone, registry: {after}"
+    );
+}
+
+#[test]
+fn start_fails_fast_when_cloudflared_dies_first_and_publishes_when_the_url_lands() {
+    let dir = TempDir::new().unwrap();
+    let site_a = dir.path().join("site-a");
+    let site_b = dir.path().join("site-b");
+    fs::create_dir_all(&site_a).unwrap();
+    fs::create_dir_all(&site_b).unwrap();
+    let bin_dir = dir.path().join("bin");
+    install_fake_cloudflared(&bin_dir, DYING_CLOUDFLARED);
+    let path_env = path_env_prepending(&bin_dir);
+    let site_a_arg = site_a.to_string_lossy().into_owned();
+
+    let (ok_fail, out_fail) = run_ft_with_env(dir.path(), &[&site_a_arg], &[("PATH", &path_env)]);
+    assert!(
+        !ok_fail,
+        "a cloudflared dying before the URL must fail the start, got: {out_fail}"
+    );
+    assert!(
+        out_fail.contains("exited before the tunnel came up"),
+        "expected the fail-fast message, got: {out_fail}"
+    );
+    assert!(
+        out_fail.contains("fake cloudflared failed"),
+        "expected the fake's last log line surfaced as the inline reason, got: {out_fail}"
+    );
+    let after_fail = fs::read_to_string(registry_path(dir.path())).unwrap_or_default();
+    assert!(
+        !after_fail.contains("site-a"),
+        "the failed start must tear its reservation down, registry: {after_fail}"
+    );
+
+    install_fake_cloudflared(&bin_dir, PUBLISHING_CLOUDFLARED);
+    let site_b_arg = site_b.to_string_lossy().into_owned();
+    let (ok_start, out_start) = run_ft_with_env(dir.path(), &[&site_b_arg], &[("PATH", &path_env)]);
+    let registry_at_start = fs::read_to_string(registry_path(dir.path())).unwrap_or_default();
+    let worker_pid = json_u64_field(&registry_at_start, "worker_pid").unwrap_or(0);
+    let (ok_kill, out_kill) = run_ft(dir.path(), &["kill", "site-b"]);
+
+    assert!(
+        ok_start,
+        "a publishing cloudflared must start the service, got: {out_start}"
+    );
+    assert!(
+        out_start.contains("Started site-b"),
+        "expected the service name line, got: {out_start}"
+    );
+    assert!(
+        out_start.contains("Public:  https://fake-e2e-words.trycloudflare.com"),
+        "expected the discovered public URL in the start output, got: {out_start}"
+    );
+    assert!(
+        registry_at_start.contains("\"kind\":\"static\"")
+            && registry_at_start.contains("https://fake-e2e-words.trycloudflare.com"),
+        "expected the entry with its public URL, registry: {registry_at_start}"
+    );
+    assert!(
+        worker_pid > 0,
+        "the entry must record a live worker pid, registry: {registry_at_start}"
+    );
+    assert!(ok_kill, "`ft kill site-b` failed: {out_kill}");
+    let after_kill = fs::read_to_string(registry_path(dir.path())).unwrap();
+    assert!(
+        after_kill.contains("\"services\":[]"),
+        "kill must empty the registry, got: {after_kill}"
+    );
+    assert!(
+        wait_for_process_death(u32::try_from(worker_pid).unwrap_or(u32::MAX)),
+        "worker pid {worker_pid} must be dead after `ft kill`"
+    );
+}
+
+#[test]
+fn run_publishes_the_tunnel_once_the_command_listens_and_kill_stops_the_whole_tree() {
+    let dir = TempDir::new().unwrap();
+    let bin_dir = dir.path().join("bin");
+    install_fake_cloudflared(&bin_dir, PUBLISHING_CLOUDFLARED);
+    let path_env = path_env_prepending(&bin_dir);
+    let port = dead_loopback_port();
+    let port_arg = port.to_string();
+
+    let (ok, out) = run_ft_with_env(
+        dir.path(),
+        &[
+            "run",
+            "--port",
+            &port_arg,
+            "--",
+            "python3",
+            "-m",
+            "http.server",
+            &port_arg,
+            "--bind",
+            "127.0.0.1",
+        ],
+        &[("PATH", &path_env)],
+    );
+    let registry_at_start = fs::read_to_string(registry_path(dir.path())).unwrap_or_default();
+    let worker_pid = json_u64_field(&registry_at_start, "worker_pid").unwrap_or(0);
+    let command_pid = json_u64_field(&registry_at_start, "command_pid").unwrap_or(0);
+    let tunnel_pid = json_u64_field(&registry_at_start, "tunnel_pid").unwrap_or(0);
+    let name = json_str_field(&registry_at_start, "name").unwrap_or_default();
+    let (ok_kill, out_kill) = run_ft(dir.path(), &["kill", &name]);
+
+    assert!(
+        ok,
+        "the run must succeed once the command listens on its port, got: {out}"
+    );
+    assert!(
+        out.contains("https://fake-e2e-words.trycloudflare.com"),
+        "expected the fake tunnel URL in the run output, got: {out}"
+    );
+    assert!(
+        registry_at_start.contains("\"kind\":\"run\"")
+            && registry_at_start.contains("https://fake-e2e-words.trycloudflare.com"),
+        "expected a run-kind entry with its public URL, registry: {registry_at_start}"
+    );
+    assert!(
+        worker_pid > 0,
+        "the entry must record the worker pid, registry: {registry_at_start}"
+    );
+    assert!(
+        command_pid > 0,
+        "the entry must record the spawned command pid, registry: {registry_at_start}"
+    );
+    assert!(
+        tunnel_pid > 0,
+        "the entry must record the tunnel pid, registry: {registry_at_start}"
+    );
+    assert!(ok_kill, "`ft kill {name}` failed: {out_kill}");
+    let after_kill = fs::read_to_string(registry_path(dir.path())).unwrap();
+    assert!(
+        after_kill.contains("\"services\":[]"),
+        "kill must empty the registry, got: {after_kill}"
+    );
+    assert!(
+        wait_for_process_death(u32::try_from(worker_pid).unwrap_or(u32::MAX)),
+        "worker pid {worker_pid} must be dead after `ft kill`"
+    );
+    assert!(
+        wait_for_port_refusal(port),
+        "the command's origin port must stop accepting after `ft kill`"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn start_answering_no_to_the_sensitive_prompt_aborts_without_publishing() {
+    let dir = TempDir::new().unwrap();
+    let bin_dir = dir.path().join("bin");
+    install_fake_cloudflared(&bin_dir, PUBLISHING_CLOUDFLARED);
+    let path_env = path_env_prepending(&bin_dir);
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let ft_arg = ft_bin().to_string_lossy().into_owned();
+    let home_arg = home.to_string_lossy().into_owned();
+
+    let mut script = Command::new("script");
+    if cfg!(target_os = "macos") {
+        script.args(["-q", "/dev/null"]).arg(&ft_arg).arg(&home_arg);
+    } else {
+        script
+            .arg("-qec")
+            .arg(format!("'{}' '{}'", ft_arg, home_arg))
+            .arg("/dev/null");
+    }
+    let mut child = script
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", dir.path())
+        .env("RUST_LOG", "")
+        .env("PATH", &path_env)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning the pty session");
+    let mut stdin = child.stdin.take().expect("the pty session's stdin");
+    stdin.write_all(b"n\n").expect("feeding the decline");
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .expect("waiting for the pty session");
+    let mut pty_out = String::from_utf8_lossy(&output.stdout).into_owned();
+    pty_out.push_str(&String::from_utf8_lossy(&output.stderr));
+
+    let seeded = fs::read_to_string(registry_path(dir.path())).unwrap_or_default();
+    if let Some(name) = json_str_field(&seeded, "name") {
+        let _ = run_ft(dir.path(), &["kill", &name]);
+    }
+
+    assert!(
+        !output.status.success(),
+        "answering n to the sensitive prompt must abort the start, got: {pty_out}"
+    );
+    assert!(
+        pty_out.contains("Proceed? [y/N]"),
+        "the pty must deliver the interactive prompt, got: {pty_out}"
+    );
+    assert!(
+        pty_out.contains("aborted"),
+        "expected the abort notice, got: {pty_out}"
+    );
+    assert!(
+        !registry_path(dir.path()).exists(),
+        "an aborted start must not create a registry"
+    );
+}
+
+#[test]
+fn open_refuses_a_tampered_public_url() {
+    let dir = TempDir::new().unwrap();
+    seed_registry(
+        dir.path(),
+        &registry_json(4_000_000, false, Some("https://evil.example.com")),
+    );
+
+    let (ok, out) = run_ft(dir.path(), &["open", "seed-svc"]);
+    assert!(!ok, "a tampered public URL must fail `ft open`, got: {out}");
+    assert!(
+        out.contains("malformed public URL"),
+        "expected the malformed-URL refusal, got: {out}"
+    );
+    assert!(
+        !out.contains("evil.example.com"),
+        "the tampered URL must never be printed as opened, got: {out}"
+    );
+}
+
+#[test]
+fn logs_prints_each_tail_with_the_missing_notice_and_follows_appends() {
+    use std::io::BufRead;
+
+    let dir = TempDir::new().unwrap();
+    seed_registry(dir.path(), &registry_json(4_000_000, false, None));
+    let svc = dir.path().join("freeoxide/tunnel/services/seed-svc");
+    fs::create_dir_all(&svc).unwrap();
+    let mut tunnel_body = String::from("tunnel-first-line-marker\n");
+    let mut line_no = 0;
+    while tunnel_body.len() < 100 * 1024 {
+        line_no += 1;
+        tunnel_body.push_str(&format!("tunnel-line-{line_no:06}\n"));
+    }
+    tunnel_body.push_str("tunnel-final-line-marker\n");
+    fs::write(svc.join("tunnel.log"), &tunnel_body).unwrap();
+
+    let (ok, out) = run_ft(dir.path(), &["logs", "seed-svc"]);
+    assert!(ok, "`ft logs seed-svc` failed: {out}");
+    assert!(
+        out.contains("--- tunnel ---"),
+        "expected the tunnel section header, got: {out}"
+    );
+    assert!(
+        out.contains("tunnel-final-line-marker"),
+        "expected the log's last line tailed, got: {out}"
+    );
+    assert!(
+        !out.contains("tunnel-first-line-marker"),
+        "a 100 KiB log's first line must fall outside the tail window, got: {out}"
+    );
+    assert!(
+        out.contains("(no worker.log yet)"),
+        "expected the missing worker.log notice, got: {out}"
+    );
+
+    fs::create_dir_all(svc.join("worker.log")).unwrap();
+    let (ok_dir, out_dir) = run_ft(dir.path(), &["logs", "seed-svc"]);
+    assert!(
+        !ok_dir,
+        "a directory at the worker.log path must fail `ft logs`, got: {out_dir}"
+    );
+    assert!(
+        out_dir.contains("reading log file"),
+        "expected the read failure surfaced, got: {out_dir}"
+    );
+    assert!(
+        !out_dir.contains("(no worker.log yet)"),
+        "a directory must not be confused with an absent log, got: {out_dir}"
+    );
+    fs::remove_dir(svc.join("worker.log")).unwrap();
+
+    let mut child = Command::new(ft_bin())
+        .args(["logs", "seed-svc", "-f"])
+        .env("XDG_STATE_HOME", dir.path())
+        .env("RUST_LOG", "")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning `ft logs seed-svc -f`");
+    let stdout = child.stdout.take().expect("the followed logs stdout");
+    let seen = Arc::new(Mutex::new(String::new()));
+    let reader_seen = Arc::clone(&seen);
+    let reader = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            match line {
+                Ok(l) => reader_seen.lock().unwrap().push_str(&l),
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut reached_follow = false;
+    let tail_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < tail_deadline {
+        if seen.lock().unwrap().contains("(no worker.log yet)") {
+            reached_follow = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let mut tunnel_log = fs::OpenOptions::new()
+        .append(true)
+        .open(svc.join("tunnel.log"))
+        .unwrap();
+    tunnel_log.write_all(b"a-late-appended-line\n").unwrap();
+    drop(tunnel_log);
+
+    let mut followed = false;
+    let follow_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < follow_deadline {
+        if seen.lock().unwrap().contains("a-late-appended-line") {
+            followed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader.join();
+
+    assert!(
+        reached_follow,
+        "the followed child never finished its initial tails, stdout so far: {}",
+        seen.lock().unwrap()
+    );
+    assert!(
+        followed,
+        "an appended tunnel.log line must arrive on the followed stdout, stdout so far: {}",
+        seen.lock().unwrap()
     );
 }
