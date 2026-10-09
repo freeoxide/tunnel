@@ -2474,3 +2474,153 @@ fn logs_prints_each_tail_with_the_missing_notice_and_follows_appends() {
         seen.lock().unwrap()
     );
 }
+
+fn wait_for_cmdline_token(pid: u32, token: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut last_seen = String::from("`ps` has not completed a poll yet");
+    while std::time::Instant::now() < deadline {
+        let poll = Command::new("ps")
+            .arg("-o")
+            .arg("command=")
+            .arg("-p")
+            .arg(pid.to_string())
+            .output();
+        match poll {
+            Ok(out) => {
+                let command = String::from_utf8_lossy(&out.stdout).into_owned();
+                if command.contains(token) {
+                    return;
+                }
+                last_seen = format!("`ps` reports {command:?}");
+            }
+            Err(e) => last_seen = format!("`ps` itself failed to run: {e}"),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("decoy never became probe-ready for pid {pid}: {last_seen}");
+}
+
+struct RunWorkerGroupDecoy {
+    child: std::process::Child,
+}
+
+impl RunWorkerGroupDecoy {
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Drop for RunWorkerGroupDecoy {
+    fn drop(&mut self) {
+        let pgid = self.child.id();
+        let _ = Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill -9 -{pgid}"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_run_worker_group() -> RunWorkerGroupDecoy {
+    use std::os::unix::process::CommandExt;
+    let child = Command::new("sh")
+        .args(["-c", "while :; do sleep 30; done", "run-worker"])
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning decoy run-worker group");
+    let decoy = RunWorkerGroupDecoy { child };
+    wait_for_cmdline_token(decoy.pid(), "run-worker");
+    decoy
+}
+
+fn wait_for_decoy_exit(child: &mut std::process::Child) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if child.try_wait().expect("try_wait the decoy").is_some() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    child.try_wait().expect("try_wait the decoy").is_some()
+}
+
+#[test]
+fn kill_and_sanitize_tear_down_a_live_run_worker_group() {
+    let dir_a = TempDir::new().unwrap();
+    let mut decoy_a = spawn_run_worker_group();
+    seed_registry(
+        dir_a.path(),
+        &registry_json(decoy_a.pid(), false, Some("https://x.trycloudflare.com")),
+    );
+
+    let (ok_kill, out_kill) = run_ft(dir_a.path(), &["kill", "seed-svc"]);
+    let kill_reaped = wait_for_decoy_exit(&mut decoy_a.child);
+    let after_kill = fs::read_to_string(registry_path(dir_a.path())).unwrap_or_default();
+
+    assert!(ok_kill, "`ft kill seed-svc` failed: {out_kill}");
+    assert!(
+        out_kill.contains("Stopped seed-svc."),
+        "expected the live worker's stopped message, got: {out_kill}"
+    );
+    assert!(
+        kill_reaped,
+        "`ft kill` must tear down the live run-worker group (pid {})",
+        decoy_a.pid()
+    );
+    assert!(
+        !after_kill.contains("seed-svc"),
+        "kill must remove the entry, registry: {after_kill}"
+    );
+
+    let dir_b = TempDir::new().unwrap();
+    let mut decoy_b = spawn_run_worker_group();
+    let port = dead_loopback_port();
+    let body = format!(
+        r#"{{
+  "next_id": 2,
+  "services": [
+    {{
+      "id": 1,
+      "name": "seed-run",
+      "kind": "run",
+      "dir": null,
+      "port": {port},
+      "local_url": "http://127.0.0.1:{port}",
+      "public_url": "https://x.trycloudflare.com",
+      "worker_pid": {worker_pid},
+      "tunnel_pid": null,
+      "created_at": "2026-07-21T00:00:00Z",
+      "state_dir": "/tmp/seed-run-state",
+      "foreground": false
+    }}
+  ]
+}}"#,
+        worker_pid = decoy_b.pid()
+    );
+    seed_registry(dir_b.path(), &body);
+
+    let (ok_sanitize, out_sanitize) = run_ft(dir_b.path(), &["sanitize"]);
+    let sanitize_reaped = wait_for_decoy_exit(&mut decoy_b.child);
+    let after_sanitize = fs::read_to_string(registry_path(dir_b.path())).unwrap_or_default();
+
+    assert!(ok_sanitize, "`ft sanitize` failed: {out_sanitize}");
+    assert!(
+        out_sanitize.contains(&format!("- seed-run (upstream 127.0.0.1:{port} is dead")),
+        "expected the zombie bullet naming the dead upstream, got: {out_sanitize}"
+    );
+    assert!(
+        sanitize_reaped,
+        "`ft sanitize` must tear down the live run-worker group (pid {})",
+        decoy_b.pid()
+    );
+    assert!(
+        !after_sanitize.contains("seed-run"),
+        "sanitize must remove the zombie entry, registry: {after_sanitize}"
+    );
+}

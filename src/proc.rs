@@ -763,6 +763,161 @@ mod tests {
         blob.extend_from_slice(b"ft run-worker --foreground\0"); // argv[0]
         assert!(argv_contains(&blob, "run-worker"));
     }
+
+    fn probe_alive(pid: u32) -> bool {
+        if kill(Pid::from_raw(pid as i32), None).is_err() {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                && let Some(close) = stat.rfind(')')
+                && let Some(state) = stat[close + 1..].trim().chars().next()
+            {
+                return state != 'Z';
+            }
+        }
+        true
+    }
+
+    struct GroupDecoy {
+        child: std::process::Child,
+    }
+
+    impl GroupDecoy {
+        fn pid(&self) -> u32 {
+            self.child.id()
+        }
+    }
+
+    impl Drop for GroupDecoy {
+        fn drop(&mut self) {
+            let group = Pid::from_raw(-(self.child.id() as i32));
+            let _ = kill(group, Signal::SIGKILL);
+            let _ = self.child.wait();
+        }
+    }
+
+    fn spawn_group_decoy(script: &str, argv_needle: Option<&str>) -> GroupDecoy {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .stdout(std::process::Stdio::piped());
+        if let Some(needle) = argv_needle {
+            command.arg(needle);
+        }
+        let child = command.process_group(0).spawn().expect("spawn decoy sh");
+        let decoy = GroupDecoy { child };
+        let ready = |pid: u32| match argv_needle {
+            Some(needle) => pid_matches(pid, needle),
+            None => process_exists(pid),
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready(decoy.pid()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "decoy never became probe-ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        decoy
+    }
+
+    async fn wait_for_decoy_exit(child: &mut std::process::Child, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while child.try_wait().expect("try_wait the decoy").is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what} did not die within the bound"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn wait_for_pid_death(pid: u32, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while probe_alive(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what} (pid {pid}) did not die within the bound"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_process_group_kills_only_a_matching_group_and_survives_a_term_ignoring_leader()
+     {
+        const BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+        let mut matching = spawn_group_decoy("sleep 30 & echo $!; wait", Some("run-worker"));
+        let member_pid: u32 = {
+            use std::io::BufRead;
+            let stdout = matching
+                .child
+                .stdout
+                .take()
+                .expect("the decoy stdout must be piped");
+            let mut line = String::new();
+            std::io::BufReader::new(stdout)
+                .read_line(&mut line)
+                .expect("the decoy must print its member pid");
+            line.trim().parse().expect("the member pid must be numeric")
+        };
+        assert!(
+            probe_alive(member_pid),
+            "the group member (pid {member_pid}) must be running before teardown"
+        );
+
+        tokio::time::timeout(BOUND, shutdown_process_group(matching.pid()))
+            .await
+            .expect("the matching group teardown must complete within the bound");
+        wait_for_decoy_exit(&mut matching.child, "the matching group leader").await;
+        wait_for_pid_death(member_pid, "the group member").await;
+
+        let mut foreign = spawn_group_decoy("sleep 30 & echo $!; wait", None);
+        tokio::time::timeout(BOUND, shutdown_process_group(foreign.pid()))
+            .await
+            .expect("a refused teardown must still complete");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            foreign
+                .child
+                .try_wait()
+                .expect("try_wait the foreign leader")
+                .is_none(),
+            "shutdown_process_group signalled a group whose leader lacks the run-worker identity"
+        );
+
+        let mut stubborn = spawn_group_decoy(
+            "trap '' TERM; while :; do sleep 30; done",
+            Some("run-worker"),
+        );
+        let escalated = std::time::Instant::now();
+        tokio::time::timeout(BOUND, shutdown_process_group(stubborn.pid()))
+            .await
+            .expect("the TERM-ignoring leader teardown must escalate within the bound");
+        assert!(
+            escalated.elapsed() >= std::time::Duration::from_millis(1400),
+            "a leader ignoring SIGTERM must die to the post-grace escalation, not an instant \
+             TERM kill, took {:?}",
+            escalated.elapsed()
+        );
+        wait_for_decoy_exit(&mut stubborn.child, "the TERM-ignoring leader").await;
+    }
+
+    #[tokio::test]
+    async fn terminate_orphan_and_foreground_stop_identity_matched_decoys() {
+        let mut orphan = spawn_group_decoy("while :; do sleep 30; done", Some("cloudflared"));
+        terminate_orphan(orphan.pid());
+        wait_for_decoy_exit(&mut orphan.child, "the cloudflared-matched decoy").await;
+
+        let mut foreground = spawn_group_decoy("while :; do sleep 30; done", Some("--foreground"));
+        terminate_foreground(foreground.pid());
+        wait_for_decoy_exit(&mut foreground.child, "the --foreground-matched decoy").await;
+    }
 }
 
 #[cfg(all(test, windows))]
