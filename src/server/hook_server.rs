@@ -1798,4 +1798,42 @@ mod tests {
             "empty store must say so: {html}"
         );
     }
+
+    #[test]
+    fn hook_store_eviction_removes_the_oldest_record_from_disk() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("requests.json");
+        let mut log = HookLog::load(path.clone(), 2).expect("load");
+        for (seq, body) in [
+            (1u64, "oldest-secret"),
+            (2, "middle-secret"),
+            (3, "newest-secret"),
+        ] {
+            let head = parts("POST", "/hooks", &[]);
+            log.record(RecordedRequest::capture(
+                seq,
+                recv_stamp(),
+                &head,
+                body.as_bytes(),
+            ))
+            .expect("record");
+        }
+        let raw = std::fs::read(&path).expect("read the raw store bytes");
+        let store = String::from_utf8_lossy(&raw);
+        assert!(
+            !store.contains("oldest-secret"),
+            "the evicted body must not linger on disk: {store}"
+        );
+        assert!(store.contains("middle-secret"));
+        assert!(store.contains("newest-secret"));
+        let mut reloaded = HookLog::load(path, 2).expect("reload");
+        let snap = reloaded.snapshot();
+        let bodies: Vec<&str> = snap.iter().map(|r| r.body.as_str()).collect();
+        assert_eq!(bodies, vec!["newest-secret", "middle-secret"]);
+        assert_eq!(
+            reloaded.next_seq(),
+            4,
+            "seqs must continue past the evicted records"
+        );
+    }
 }

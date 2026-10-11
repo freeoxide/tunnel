@@ -1001,3 +1001,66 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod drop_token_and_teardown_tests {
+    use super::*;
+
+    #[test]
+    fn open_drop_token_returns_the_stored_secret_and_refuses_an_empty_one() {
+        let tmp = tempfile::tempdir().expect("state dir");
+        let state = StateDir::new_at(tmp.path().to_path_buf());
+        state
+            .ensure_service_dir("drop-svc")
+            .expect("ensure service dir");
+        let token_path = state.service_dir("drop-svc").join("drop-token");
+        std::fs::write(&token_path, b"sekrit\n").expect("store the token");
+        assert_eq!(
+            open_drop_token(&state, "drop-svc").expect("the stored secret is served"),
+            "sekrit"
+        );
+        std::fs::write(&token_path, b"").expect("truncate the token");
+        let err = open_drop_token(&state, "drop-svc").expect_err("an empty token must be refused");
+        assert!(
+            err.to_string().contains("unauthenticated upload endpoint"),
+            "the refusal must name the unauthenticated endpoint: {err:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_exit_escalates_past_an_ignored_term_to_take_the_tunnel_down() {
+        use std::os::unix::process::ExitStatusExt;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("trap '' TERM; echo ready; while :; do sleep 30; done")
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the TERM-ignoring tunnel stand-in");
+        let tunnel_pid = child.id().expect("stand-in pid");
+        let mut out = BufReader::new(child.stdout.take().expect("piped stdout"));
+        let mut ready = String::new();
+        out.read_line(&mut ready)
+            .await
+            .expect("read the readiness line");
+        assert_eq!(
+            ready.trim(),
+            "ready",
+            "teardown may only start once the TERM trap is installed"
+        );
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            teardown_on_exit(ReaderExit::Signal, Some(tunnel_pid), &mut child).await;
+            child.wait().await
+        })
+        .await
+        .expect("the ignored TERM must escalate to a kill within the bound")
+        .expect("the stand-in is reaped");
+        assert_eq!(
+            status.signal(),
+            Some(nix::sys::signal::Signal::SIGKILL as i32),
+            "the stand-in ignores TERM, so only SIGKILL can take it down"
+        );
+    }
+}

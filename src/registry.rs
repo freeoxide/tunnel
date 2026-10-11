@@ -753,4 +753,64 @@ mod tests {
             "oversized live file with no backup must error, not default"
         );
     }
+
+    #[test]
+    fn registry_bound_refuses_oversized_live_and_backup_at_both_edges() {
+        use crate::state::StateDir;
+        let bound = super::MAX_REGISTRY_BYTES as usize;
+        let mut reg = Registry {
+            next_id: 2,
+            services: vec![dummy_service(1, "x")],
+        };
+        let base = serde_json::to_vec(&reg).expect("serialize base");
+        let name = "p".repeat(1 + (bound - base.len()));
+        reg.services[0].name = name.clone();
+        let at_bound = serde_json::to_vec(&reg).expect("serialize padded registry");
+        assert_eq!(at_bound.len(), bound);
+        let mut past_bound = at_bound.clone();
+        past_bound.push(b' ');
+
+        let state_with = |live: &[u8], bak: Option<&[u8]>| -> (tempfile::TempDir, StateDir) {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = StateDir::new_at(tmp.path().join("ft-state"));
+            state.ensure().expect("ensure");
+            std::fs::write(state.registry_path(), live).expect("write live");
+            if let Some(bak) = bak {
+                std::fs::write(state.registry_path().with_extension("json.bak"), bak)
+                    .expect("write backup");
+            }
+            (tmp, state)
+        };
+
+        let (_keep_a, state) = state_with(&at_bound, None);
+        let reg = Registry::load(&state).expect("an exact-bound registry must load");
+        assert!(
+            reg.name_exists(&name),
+            "the padded service must be visible at the bound"
+        );
+
+        let (_keep_b, state) = state_with(&past_bound, None);
+        let err = Registry::load(&state)
+            .expect_err("one byte past the bound must be corruption, not a load");
+        assert!(
+            format!("{err:#}").contains("corrupted"),
+            "the refusal must name corruption: {err:#}"
+        );
+
+        let (_keep_c, state) = state_with(b"{ this is not json", Some(&past_bound));
+        let err = Registry::load(&state)
+            .expect_err("an oversized backup must be refused, never served over corrupt live");
+        assert!(
+            format!("{err:#}").contains("corrupted"),
+            "the refusal must name corruption: {err:#}"
+        );
+
+        let (_keep_d, state) = state_with(b"{ this is not json", Some(&at_bound));
+        let reg = Registry::load(&state)
+            .expect("an exact-bound backup must recover the corrupt live file");
+        assert!(
+            reg.name_exists(&name),
+            "the backup's service must be served at the bound"
+        );
+    }
 }
