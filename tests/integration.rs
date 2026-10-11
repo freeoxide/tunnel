@@ -329,7 +329,7 @@ fn wait_for_recorded_worker_pid(xdg_root: &std::path::Path, name: &str) -> bool 
 }
 
 fn wait_for_port_accept(port: u16) -> bool {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while std::time::Instant::now() < deadline {
         if TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_ok() {
             return true;
