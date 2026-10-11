@@ -2,10 +2,8 @@
 name = "freeoxide-tunnel"
 version = "0.1.0"
 edition = "2024"
-# Edition 2024 needs Rust 1.85, but the locked dependency tree needs >=1.88:
-# comfy-table 7.2.2 uses let-chains (stabilized in 1.88). Pin the MSRV so a
-# future toolchain or dependency bump cannot silently raise the build floor
-# without CI catching it.
+# MSRV 1.88: comfy-table 7.2.2 uses let-chains (stabilized in 1.88). The pin
+# makes any toolchain or dependency floor raise fail CI instead of shipping.
 rust-version = "1.88"
 description = "Expose local and static services through temporary tunnels."
 repository = "https://github.com/freeoxide/tunnel"
@@ -42,21 +40,16 @@ harness = false
 name = "registry_cycle"
 harness = false
 
-# Codegen stability for benchmarking: with default codegen-units the
-# partitioner can split a hot loop differently between two builds of the SAME
-# code, letting codegen variance masquerade as an algorithmic change. Thin LTO
-# + one codegen unit removes that axis. Inherits the rest of `release`.
+# Codegen stability for benchmarking: default codegen-units can split a hot
+# loop differently between builds of the SAME code; thin LTO + one unit
+# removes that variance axis. Inherits the rest of `release`.
 [profile.bench]
 lto = "thin"
 codegen-units = 1
 
-# Release carries the same codegen pins so `cargo build --release` (the
-# shipped binary, and the CLI wall-clock harness) measures the same code shape
-# the benches do; `strip = "symbols"` trims the binary (hygiene finding
-# hyg-2). Deliberately NO `panic` setting — the foreground flows rely on
-# unwinding to run EntryGuard's Drop cleanup (cmd/start.rs) — and no
-# target-cpu pinning anywhere: baseline machines must not inherit the build
-# host's ISA.
+# Release mirrors the bench codegen pins so the shipped binary measures the
+# same code shape; deliberately NO `panic` setting (foreground flows unwind
+# through EntryGuard's Drop in cmd/start.rs) and no target-cpu pin anywhere.
 [profile.release]
 lto = "thin"
 codegen-units = 1
@@ -76,20 +69,14 @@ pkg-fmt = "zip"
 [dependencies]
 anyhow = "1.0.103"
 axum = "0.8.9"
-# `clock` is deliberately OFF: it pulls `iana-time-zone`, which on macOS drags
-# in `core-foundation-sys` and links the CoreFoundation *framework*. We only
-# ever need a UTC "now" (never the local timezone), which we get from
-# `SystemTime` via `model::now_utc` — see that helper. Keeping `clock` off lets
-# the binary link under a cross-linker (zig) that lacks the Apple SDK
-# frameworks, and trims a transitive dep from the macOS build.
+# `clock` stays OFF: it pulls iana-time-zone → CoreFoundation on macOS, which
+# breaks zig cross-linking; UTC "now" comes from SystemTime via model::now_utc.
 chrono = { version = "0.4.45", default-features = false, features = ["serde", "std"] }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 comfy-table = "7.2.2"
 directories = "6.0.0"
-# Cross-platform advisory file locking for the registry: flock(2) on Unix and
-# LockFileEx on Windows. Replaces the former raw libc::flock so the crate links
-# on Windows (where libc::flock/AsRawFd do not exist) and keeps macOS off the
-# fragile transitive-libc path.
+# Registry advisory locking: flock(2) on Unix, LockFileEx on Windows (raw
+# libc::flock does not exist there).
 fs2 = "0.4"
 open = "5.3.5"
 # Percent-decode the request path in the static-server confinement guard so our
@@ -98,11 +85,8 @@ percent-encoding = "2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 tokio = { version = "1.52.3", features = ["full"] }
-# toride crates are consumed pinned by git rev (not published to crates.io);
-# default-features off keeps the dep surface at `discovery` (which + thiserror
-# + tracing, all already in the tree). The `version` field is cargo-deny's
-# wildcard-bans remedy — a git dep without one reads as `*`; it changes no
-# resolution (the rev pins the source) and must stay in sync with toride's
+# toride is pinned by git rev (unpublished). The `version` field only satisfies
+# cargo-deny's wildcard ban — it changes no resolution and must track toride's
 # own crate version.
 toride-runner = { version = "0.1.0", git = "https://github.com/freeoxide/toride", rev = "186b84e32cb154bb0feeee2b459cee8940c3b305", default-features = false }
 tower-http = { version = "0.7.0", features = ["fs", "trace", "timeout", "limit", "set-header"] }
@@ -114,21 +98,18 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", features = ["process", "signal"] }
 
-# libc is used for raw syscalls: Linux prctl(PR_SET_PDEATHSIG) in cloudflared,
-# and macOS sysctl(KERN_PROCARGS2) for PID-reuse-safe process identity in proc.
-# Gate each to its own platform so the others don't pull it in. (libc is already
-# a transitive dependency of `nix` on Unix, so the macOS entry adds no new
-# download in practice.)
+# libc for raw syscalls: Linux prctl(PR_SET_PDEATHSIG), macOS
+# sysctl(KERN_PROCARGS2) PID identity. Per-platform gates; already transitive
+# via nix on Unix.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2.186"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2.186"
 
-# windows-sys (raw bindings, windows-only) backs the detached-worker feature:
-# Job Objects for whole-tree teardown + the PR_SET_PDEATHSIG equivalent, and
-# OpenProcess/QueryFullProcessImageName/TerminateProcess for PID identity and
-# signalling. Gated to Windows so Unix builds stay free of it.
+# windows-sys backs the detached-worker feature: Job Objects for whole-tree
+# teardown, OpenProcess/QueryFullProcessImageName/TerminateProcess for PID
+# identity/signalling. Windows-only gate keeps Unix builds free of it.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
@@ -152,8 +133,6 @@ tower = { version = "0.5", features = ["util"] }
 # Read response bodies in tests.
 http-body-util = "0.1"
 http = "1"
-# Microbenchmark harness for the perf campaign's benches/. Pinned EXACTLY:
-# the campaign's saved baselines must not silently compare across criterion
-# versions. (0.8.2's `html_reports` feature gates no extra dependencies, so
-# it resolves from the offline cache.)
+# Bench harness, pinned EXACTLY (=0.8.2): saved baselines must not silently
+# compare across criterion versions.
 criterion = { version = "=0.8.2", features = ["html_reports"] }

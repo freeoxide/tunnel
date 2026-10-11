@@ -10,12 +10,8 @@ use crate::error::Result;
 use crate::model::Registry;
 use crate::state::StateDir;
 
-/// Number of trailing lines to show per log file by default.
 const TAIL_LINES: usize = 40;
-/// Poll interval when following log output.
 const FOLLOW_INTERVAL: Duration = Duration::from_millis(500);
-/// Maximum number of bytes read from a log into memory at once; only the
-/// trailing window is held when computing a tail or draining appends.
 const READ_CAP: u64 = 65_536;
 
 /// Print the last ~40 lines of `tunnel.log` then `worker.log`; with `follow`,
@@ -42,8 +38,6 @@ pub async fn run(target: String, follow: bool) -> Result<()> {
     Ok(())
 }
 
-/// The last ~`TAIL_LINES` lines of `path`; only the trailing `READ_CAP` bytes
-/// are read so memory stays bounded. Friendly error if unopenable.
 async fn print_tail(path: &Path, label: &str) -> Result<()> {
     println!("--- {label} ---");
 
@@ -56,8 +50,6 @@ async fn print_tail(path: &Path, label: &str) -> Result<()> {
         Err(e) => bail!("opening log {}: {}", path.display(), e),
     };
 
-    // Seek to the last READ_CAP bytes of a large file so the whole thing is
-    // never held in memory.
     if let Ok(meta) = file.metadata().await
         && meta.len() > READ_CAP
     {
@@ -78,11 +70,7 @@ async fn print_tail(path: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
-/// Poll both logs for appended lines until Ctrl+C (each opened once, seeked
-/// to EOF); a read error silently ends that file's follow only.
 async fn follow_logs(tunnel_path: &Path, worker_path: &Path) -> Result<()> {
-    // A log may not exist yet (e.g. a service that is still starting): open
-    // each best-effort and skip any that are absent.
     let mut tunnel = open_at_end(tunnel_path).await?;
     let mut worker = open_at_end(worker_path).await?;
     // Per-file leftover buffers carried across reads so a line or multi-byte
@@ -107,8 +95,6 @@ async fn follow_logs(tunnel_path: &Path, worker_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Open + seek to end for incremental reads; `None` when the file does not
-/// exist yet (a starting service must not crash `--follow`).
 async fn open_at_end(path: &Path) -> Result<Option<tokio::fs::File>> {
     let mut file = match tokio::fs::File::open(path).await {
         Ok(f) => f,
@@ -119,13 +105,9 @@ async fn open_at_end(path: &Path) -> Result<Option<tokio::fs::File>> {
     Ok(Some(file))
 }
 
-/// Read bytes appended since the last call, print each line. At most
-/// READ_CAP per poll; the `leftover` carry never splits a line or code point.
 async fn drain_appended(file: &mut tokio::fs::File, leftover: &mut Vec<u8>) {
     let mut buf = vec![0u8; READ_CAP as usize];
     loop {
-        // Read into the back of whatever partial bytes we carried over, then
-        // append them in place so the carried prefix stays contiguous.
         let read_start = leftover.len();
         if read_start >= buf.len() {
             // Pathological: a single line longer than READ_CAP with no
@@ -141,8 +123,6 @@ async fn drain_appended(file: &mut tokio::fs::File, leftover: &mut Vec<u8>) {
         };
         leftover.extend_from_slice(&buf[read_start..read_start + n]);
 
-        // Print every whole line; carry whatever follows the last newline.
-        // No newline at all: a partial line still being written — keep carrying.
         if let Some(last_nl) = leftover.iter().rposition(|&b| b == b'\n') {
             let rest = leftover.split_off(last_nl + 1);
             flush_text(leftover);
@@ -150,15 +130,11 @@ async fn drain_appended(file: &mut tokio::fs::File, leftover: &mut Vec<u8>) {
         }
 
         if n < buf.len() - read_start {
-            // Short read means we've caught up to EOF.
             return;
         }
-        // Filled the read window — more may be waiting; loop to drain it.
     }
 }
 
-/// Decode + print lines. `bytes` always ends at a `\n` boundary (callers
-/// carry partial tails), so lossy decoding cannot split a code point.
 fn flush_text(bytes: &[u8]) {
     if bytes.is_empty() {
         return;

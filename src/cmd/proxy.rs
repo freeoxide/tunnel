@@ -1,9 +1,6 @@
 //! The PROXY command: attach a tunnel to a server the operator already runs —
-//! no ft server, just cloudflared pointing straight at the upstream. The
-//! background flow mirrors START's reserve → spawn-worker → poll-for-URL
-//! shape (foreground machinery in `cmd/start.rs`, `dir: None` = proxy). No
-//! `--yes` (no directory); the CLI pre-flights the upstream: a friendly
-//! "nothing is listening" beats a tunnel that 502s every request.
+//! no ft server, just cloudflared pointing at the upstream (`dir: None`).
+//! The CLI pre-flights the upstream so the failure is friendly, not a 502.
 
 use anyhow::ensure;
 
@@ -33,8 +30,6 @@ pub async fn run(port: u16, name: Option<String>, foreground: bool) -> Result<()
     }
 }
 
-/// Background flow: the shared reserve → spawn-worker → poll-for-URL shape;
-/// no port-freeness probe — the port IS the upstream, supposed to be in use.
 async fn run_background(port: u16, name: Option<String>) -> Result<()> {
     let state = StateDir::new()?;
 
@@ -56,8 +51,6 @@ async fn run_background(port: u16, name: Option<String>) -> Result<()> {
         Default::default(),
     )?;
 
-    // `dir: None` spawns a PROXY worker: what it fronts comes from the
-    // reserved entry, and the spawn path substitutes its `--dir` sentinel.
     let worker_pid = match spawn::spawn_worker(id, &name, None, port) {
         Ok(pid) => pid,
         Err(e) => {

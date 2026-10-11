@@ -8,12 +8,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::process::{Child, Command};
 
-/// Grace window after SIGTERM before SIGKILL'ing cloudflared (Unix only; the
-/// Windows teardown force-kills the owned child).
 #[cfg(unix)]
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
-/// The exact message shown when `cloudflared` cannot be found on `PATH`.
 const MISSING_MESSAGE: &str = "\
 cloudflared was not found.
 
@@ -32,17 +29,15 @@ pub fn ensure_installed() -> Result<PathBuf> {
     }
 }
 
-/// Extract the first Quick Tunnel URL from a line: scans `https://`
-/// occurrences left-to-right, taking each host up to the first `/` or `?`;
-/// the first `.trycloudflare.com` host wins — earlier non-tunnel URLs
-/// (e.g. doc links) are skipped.
+/// Extract the first Quick Tunnel URL from a line: scans `https://` left to
+/// right; the first host ending in `.trycloudflare.com` wins (earlier
+/// non-tunnel URLs such as doc links are skipped).
 pub fn extract_url(text: &str) -> Option<String> {
     let mut search_from = 0;
     while let Some(rel) = text[search_from..].find("https://") {
         let start = search_from + rel;
         let rest = &text[start..];
-        // The URL runs until the next whitespace character.
-        let url = rest.split_whitespace().next()?;
+        let url = &rest[..rest.find(char::is_whitespace).unwrap_or(rest.len())];
         // Strip any trailing punctuation that cloudflared occasionally appends.
         let url = url.trim_end_matches(['.', ')', ',', ';', '"', '\'']);
         let host = url
@@ -52,7 +47,6 @@ pub fn extract_url(text: &str) -> Option<String> {
         if host.ends_with(".trycloudflare.com") {
             return Some(url.to_string());
         }
-        // Advance past this `https://` and keep scanning for a later tunnel URL.
         search_from = start + "https://".len();
     }
     None
@@ -130,7 +124,7 @@ pub async fn shutdown(tunnel_pid: Option<u32>, child: &mut Child) {
         let _ = child.start_kill();
     }
 
-    let _ = child.wait().await; // ensure reaped
+    let _ = child.wait().await;
 }
 
 #[cfg(test)]
@@ -178,7 +172,6 @@ mod tests {
 
     #[test]
     fn picks_trycloudflare_among_two_urls() {
-        // Scans left-to-right, returns the first trycloudflare host.
         let line = "your tunnel: https://my-tunnel.trycloudflare.com  docs: https://developers.cloudflare.com/";
         assert_eq!(
             extract_url(line),
@@ -188,7 +181,6 @@ mod tests {
 
     #[test]
     fn skips_non_tunnel_url_before_tunnel_url() {
-        // A non-tunnel https:// before the tunnel URL is skipped.
         let line = "docs: https://developers.cloudflare.com/  tunnel: https://real-tunnel.trycloudflare.com";
         assert_eq!(
             extract_url(line),
@@ -214,18 +206,7 @@ mod tests {
 
     #[test]
     fn empty_input_returns_none() {
-        // Guards the `?` early-return on a whitespace split of empty input.
         assert_eq!(extract_url(""), None);
-    }
-
-    #[test]
-    fn picks_tunnel_when_non_tunnel_url_comes_after() {
-        // The trailing non-tunnel candidate must not distract the scan.
-        let line = "tunnel: https://real-tunnel.trycloudflare.com  docs: https://developers.cloudflare.com/";
-        assert_eq!(
-            extract_url(line),
-            Some("https://real-tunnel.trycloudflare.com".to_string())
-        );
     }
 
     #[test]
@@ -247,8 +228,6 @@ mod tests {
         assert!(!is_tunnel_url("not a url"));
     }
 
-    // --- property test ----------------------------------------------------
-
     use proptest::prelude::*;
 
     proptest! {
@@ -265,8 +244,6 @@ mod tests {
                 let rest = url.strip_prefix("https://").unwrap_or("");
                 let host = rest.split(['/', '?']).next().unwrap_or("");
                 prop_assert!(!host.is_empty() && host.ends_with(".trycloudflare.com"), "bad url: {url}");
-                // The returned URL must re-validate through is_tunnel_url, so a
-                // stored public_url always round-trips through both checks.
                 prop_assert!(is_tunnel_url(&url), "returned url failed is_tunnel_url: {url}");
             }
         }

@@ -1,11 +1,6 @@
-//! Upload-receiver origin ("drop bucket") for `ft drop <dir>`: loopback-only
-//! behind cloudflared. `POST`/`PUT /<name>` or `POST /?filename=<name>`
-//! stores the RAW body — multipart is never parsed; names are
-//! percent-decoded (`+` is a literal plus), rejected never mangled, and a
-//! name collision is a 409. `GET` is public, through the shared
-//! [`crate::server::static_server::confine`] guard; the token gates mutations
-//! only, before the body is read. Write discipline (temp + hard-link
-//! publish, never overwrite) and the caps live at their items.
+//! Loopback-only upload receiver ("drop bucket") for `ft drop <dir>`:
+//! token-gated POST/PUT of raw bodies (never overwriting) plus a public
+//! GET listing, confined to the canonicalised upload root.
 
 use std::fmt::Write as _;
 use std::io::Write;
@@ -29,8 +24,6 @@ use crate::server::static_server::{
     query_param, tokens_match,
 };
 
-/// Hard upper bound on any single request: bounds stalled public clients and
-/// the worker's graceful drain alike.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Default per-upload cap (`--max-size` when omitted).
@@ -52,10 +45,8 @@ const TEMP_NAME_OVERHEAD: usize = 1 + ".part-".len() + 8;
 /// (dot-prefixed), so this keeps the publish path within 255-byte NAME_MAX.
 const MAX_NAME_BYTES: usize = 255 - TEMP_NAME_OVERHEAD;
 
-/// The 0600 token file inside the service's state dir; shown by `ft detail`.
 const TOKEN_FILENAME: &str = "drop-token";
 
-/// Minted tokens are 65 bytes; anything near this bound is not a token.
 const TOKEN_READ_BOUND: u64 = 4096;
 
 /// 32 OS-CSPRNG bytes as 64 hex chars; no weak fallback — the token is the
@@ -70,8 +61,6 @@ pub(crate) fn generate_token() -> std::io::Result<String> {
     Ok(token)
 }
 
-/// Fill `buf` from the OS CSPRNG: /dev/urandom on Unix,
-/// BCryptGenRandom (system-preferred RNG) on Windows.
 fn fill_random(buf: &mut [u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -150,8 +139,6 @@ pub(crate) fn read_token(dir: &Path) -> std::io::Result<Option<String>> {
     Ok(Some(text.trim().to_string()))
 }
 
-/// Validate an upload name: REJECT, never mangle; the `Err` names the rule
-/// for the 400.
 fn sanitize_filename(raw: &str) -> Result<String, String> {
     if raw.is_empty() {
         return Err("the name is empty".to_string());
@@ -220,8 +207,6 @@ impl DropStore {
         Self::open_all(root, token, max_upload, total_cap, MAX_FILE_COUNT)
     }
 
-    /// [`DropStore::open`] with an explicit count cap — testable without ten
-    /// thousand uploads.
     #[cfg(test)]
     fn open_with_file_cap(
         root: &Path,
@@ -301,15 +286,10 @@ fn measure_dir(root: &Path) -> Usage {
     used
 }
 
-/// Failure modes of a store write, mapped to responses by the caller.
 enum StoreError {
-    /// Past the total cap → 507.
     Full,
-    /// Past the file-count cap → 409.
     FullCount,
-    /// A directory entry with this name already exists → 409.
     Exists,
-    /// Disk I/O failed → 500.
     Io(std::io::Error),
 }
 
@@ -386,8 +366,6 @@ fn is_root_path(path: &str) -> bool {
     path == "/" || path.is_empty()
 }
 
-/// Path name or `?filename=` — both at once is a 400; the `Err` is a
-/// (status, body) pair.
 fn upload_name(request: &Request) -> Result<String, (StatusCode, String)> {
     let bad = |msg: &'static str| (StatusCode::BAD_REQUEST, format!("{msg}\n"));
     let path = request.uri().path();
@@ -411,8 +389,6 @@ fn upload_name(request: &Request) -> Result<String, (StatusCode, String)> {
     Ok(decoded.into_owned())
 }
 
-/// Resolve + sanitize the name, read the capped raw body, write under the
-/// store lock (see [`store_write`] for the write discipline).
 async fn upload(store: Arc<DropStore>, request: Request) -> Response {
     let name = match upload_name(&request) {
         Ok(n) => n,
@@ -441,8 +417,6 @@ async fn upload(store: Arc<DropStore>, request: Request) -> Response {
                 .into_response();
         }
     };
-    // Clone so the 201 can name the stored file without a borrow across the
-    // spawn boundary.
     let stored_name = name.clone();
     let written = tokio::task::spawn_blocking(move || store_write(&store, &name, &bytes)).await;
     match written {
@@ -517,12 +491,9 @@ fn store_write(store: &DropStore, name: &str, bytes: &[u8]) -> Result<(), StoreE
         let _ = std::fs::remove_file(&tmp);
         return Err(StoreError::Io(e));
     }
-    // Publish without clobbering, across processes: link(2)/CreateHardLinkW
-    // create `target` only if absent, so never-overwrite rests on no
-    // check-then-act race. A pre-existing entry (even a symlink — the link
-    // lands on the NAME) is a 409.
-    // Hard-link-less filesystems (FAT/exFAT) fail here — a loud 500, never
-    // a silent no-clobber weakening.
+    // link(2)/CreateHardLinkW create `target` only if absent — no-clobber
+    // across processes, no check-then-act race; a pre-existing name (even a
+    // symlink — the link lands on the NAME) is a 409. Hard-link-less (FAT/exFAT) 500.
     let target = store.root.join(name);
     let linked = std::fs::hard_link(&tmp, &target);
     if let Err(e) = linked {
@@ -691,16 +662,12 @@ mod tests {
             .to_vec()
     }
 
-    /// `total_cap` is a parameter so the 507 path is testable without a
-    /// gigabyte of disk.
     fn test_store(total_cap: u64) -> (tempfile::TempDir, Arc<DropStore>) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = DropStore::open(tmp.path(), "tok-abc123".to_string(), 1024, total_cap)
             .expect("open store");
         (tmp, store)
     }
-
-    // --- pure rules ---------------------------------------------------------
 
     #[test]
     fn generate_token_is_hex_unique_and_64_chars() {
@@ -828,8 +795,6 @@ mod tests {
         assert!(!tokens_match("", ""), "empty vs empty must match nothing");
     }
 
-    // --- token file ----------------------------------------------------------
-
     #[test]
     fn token_file_round_trips_and_is_private() {
         #[cfg(unix)]
@@ -866,8 +831,6 @@ mod tests {
             "an over-bound token file must Err, not read"
         );
     }
-
-    // --- the full Router, driven like the static/hook HTTP tests -------------
 
     #[tokio::test]
     async fn upload_with_bearer_token_stores_and_get_serves_back() {
@@ -1581,71 +1544,6 @@ mod tests {
         let _ = shutdown_tx.send(());
         let res = server.await.expect("join serve task");
         assert!(res.is_ok(), "serve_on drained without error: {res:?}");
-    }
-
-    #[test]
-    fn token_helpers_match_the_static_origin_on_a_corpus() {
-        use crate::server::static_server as origin;
-
-        let pairs = [
-            ("sekrit", "sekrit", true),
-            ("sekriT", "sekrit", false),
-            ("sekri", "sekrit", false),
-            ("sekritlonger", "sekrit", false),
-            ("", "sekrit", false),
-            ("sekrit", "", false),
-            ("", "", false),
-        ];
-        for (provided, expected, want) in pairs {
-            assert_eq!(
-                tokens_match(provided, expected),
-                want,
-                "{provided:?} vs {expected:?}"
-            );
-            assert_eq!(
-                origin::tokens_match(provided, expected),
-                tokens_match(provided, expected),
-                "both origins must agree on {provided:?} vs {expected:?}"
-            );
-        }
-
-        let queries = [
-            ("token=a+b", "token", Some("a+b")),
-            ("token=a%2Bb", "token", Some("a+b")),
-            ("token=a%20b", "token", Some("a b")),
-            ("filename=x&token=t", "token", Some("t")),
-            ("token", "token", None),
-            ("other=1", "token", None),
-            ("token=%FF", "token", None),
-        ];
-        for (query, key, want) in queries {
-            assert_eq!(
-                query_param(query, key).as_deref(),
-                want,
-                "{query:?} for {key:?}"
-            );
-            assert_eq!(
-                origin::query_param(query, key).as_deref(),
-                query_param(query, key).as_deref(),
-                "both origins must agree on {query:?}"
-            );
-        }
-
-        let headers = [
-            ("bearer sekrit", Some("sekrit")),
-            ("BEARER sekrit", Some("sekrit")),
-            ("BeArEr sekrit", Some("sekrit")),
-            ("basic sekrit", None),
-            ("bearersekrit", None),
-        ];
-        for (value, want) in headers {
-            assert_eq!(bearer_token(value), want, "{value:?}");
-            assert_eq!(
-                origin::bearer_token(value),
-                bearer_token(value),
-                "both origins must agree on {value:?}"
-            );
-        }
     }
 }
 

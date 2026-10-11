@@ -1,10 +1,6 @@
 //! The HOOK command: an ft-owned webhook receiver/inspector origin (see
-//! `hook_server`) behind a Quick Tunnel. The background flow shares START's
-//! reserve → spawn-worker → poll-for-URL scaffolding; the worker binds the
-//! origin itself, so success is "URL published". The port is ft's own — it
-//! must be FREE (unlike PROXY's listening upstream). The foreground flow
-//! keeps its own body but shares start's reservation/guard/announce helpers;
-//! keep its teardown order in sync with `run_foreground_inner`.
+//! `hook_server`) behind a Quick Tunnel; the port is ft's own and must be
+//! free. Keep the foreground teardown order in sync with start's.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -28,8 +24,6 @@ pub async fn run(
     foreground: bool,
     keep: Option<u16>,
 ) -> Result<()> {
-    // The hook origin is ft's own server, so the port must be FREE — fail up
-    // front; resolved before any state so a rejection leaves zero state.
     let port = match port {
         Some(p) => {
             ensure!(
@@ -52,7 +46,6 @@ pub async fn run(
     }
 }
 
-/// Open (and create the parent dir for) a hook service's request store.
 async fn open_hook_log(
     state: &StateDir,
     name: &str,
@@ -73,7 +66,6 @@ async fn open_hook_log(
     .context("joining the hook request store load task")?
 }
 
-/// Background flow: the shared START scaffolding (the worker binds the origin).
 async fn run_background(port: u16, name: Option<String>, keep: u16) -> Result<()> {
     let state = StateDir::new()?;
 
@@ -95,8 +87,6 @@ async fn run_background(port: u16, name: Option<String>, keep: u16) -> Result<()
         Default::default(),
     )?;
 
-    // `dir: None` + `--keep` spawns a directory-less HOOK worker; its arm
-    // binds the origin and opens the request store.
     let worker_pid = match spawn::spawn_hook_worker(id, &name, port, keep) {
         Ok(pid) => pid,
         Err(e) => {
@@ -109,15 +99,11 @@ async fn run_background(port: u16, name: Option<String>, keep: u16) -> Result<()
     start::poll_for_url(&state, id, &name, worker_pid).await
 }
 
-/// Why the foreground keep-alive loop ended. A hook foreground has no command
-/// child, so unlike `cmd/start.rs`'s enum there is no `CommandExited` arm.
 enum ReaderExit {
     ChildExited,
     Signal,
 }
 
-/// Foreground flow: hook origin + tunnel in THIS process until cloudflared
-/// exits, Ctrl-C, or SIGTERM; mirrors start's teardown order.
 async fn run_foreground(port: u16, name: Option<String>, keep: u16) -> Result<()> {
     use crate::server::static_server;
 
@@ -138,7 +124,6 @@ async fn run_foreground(port: u16, name: Option<String>, keep: u16) -> Result<()
         Default::default(),
     )?;
 
-    // From here, every exit path must release the reserved entry.
     let _entry = start::EntryGuard::new(state.clone(), id);
 
     // Tee cloudflared output to tunnel.log so `ft logs <name>` works for
@@ -169,16 +154,12 @@ async fn run_foreground(port: u16, name: Option<String>, keep: u16) -> Result<()
     let mut child = match cloudflared::spawn(port) {
         Ok(c) => c,
         Err(e) => {
-            // Abort the just-spawned server task; the entry is released by
-            // the guard on return.
             server_handle.abort();
             return Err(e);
         }
     };
     let tunnel_pid = child.id();
 
-    // Mirror cloudflared's combined output to stdout AND tunnel.log, and
-    // publish the public URL on first discovery.
     let found = Arc::new(AtomicBool::new(false));
     let mut tasks = Vec::new();
     if let Some(out) = child.stdout.take() {
@@ -206,8 +187,6 @@ async fn run_foreground(port: u16, name: Option<String>, keep: u16) -> Result<()
         )));
     }
 
-    // Race child.wait() against Ctrl-C/SIGTERM so a cloudflared that dies
-    // tears down instead of hanging.
     #[cfg(unix)]
     let exit_reason = tokio::select! {
         status = child.wait() => {

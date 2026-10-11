@@ -1,21 +1,12 @@
-//! Process introspection and signaling helpers.
-//!
-//! [`pid_matches`]/[`pid_alive`]: cmdline-aware identity that defeats PID
-//! reuse (Linux `/proc/<pid>/cmdline`; macOS `sysctl(KERN_PROCARGS2)`; Windows
-//! image name; other Unix: signal-0 liveness, identity best-effort).
-//! [`process_exists`]: needle-less liveness for foreground services, whose
-//! cmdline lacks the `run-worker` token. Signalling: Unix SIGTERM→grace→
-//! SIGKILL on the process group; Windows `TerminateProcess` — the worker's
-//! KILL_ON_JOB_CLOSE Job Object cascades to the whole tree.
+//! Process introspection and signaling: cmdline-aware PID identity
+//! ([`pid_matches`]/[`pid_alive`]), needle-less liveness ([`process_exists`]),
+//! and group teardown (Unix SIGTERM→SIGKILL; Windows Job Objects).
 
 #[cfg(unix)]
 use nix::sys::signal::{Signal, kill};
 #[cfg(unix)]
 use nix::unistd::Pid;
 use tokio::process::{Child, Command};
-
-// --- run-service command children -------------------------------------------
-// The command child leads its OWN group — killpg reaches the subtree only.
 
 /// Spawn the command child with `PORT=port`; on Unix it leads its own group
 /// ([`own_process_group`]) so [`shutdown_child_command`] takes the subtree down.
@@ -37,15 +28,11 @@ pub(crate) fn spawn_command_child(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    // Without a fresh group no safe group signal could reach the
-    // grandchildren — killpg would target a group the subtree does not own.
     #[cfg(unix)]
     unsafe {
         cmd.pre_exec(own_process_group);
     }
 
-    // On Linux, SIGKILL the child if its spawner dies (even via SIGKILL/OOM);
-    // shared pre-exec hook with `cloudflared::spawn` ([`parent_death_signal`]).
     #[cfg(target_os = "linux")]
     unsafe {
         cmd.pre_exec(parent_death_signal);
@@ -57,8 +44,6 @@ pub(crate) fn spawn_command_child(
     Ok(child)
 }
 
-/// Make the (pre-exec) child a group leader so `killpg(child_pid)` reaches
-/// exactly the subtree; pre-exec is the only safe window before operator code.
 #[cfg(unix)]
 fn own_process_group() -> Result<(), std::io::Error> {
     nix::unistd::setpgid(nix::unistd::Pid::from_raw(0), nix::unistd::Pid::from_raw(0))
@@ -105,13 +90,8 @@ pub(crate) fn command_monitor_placeholder() -> tokio::task::JoinHandle<()> {
 }
 
 /// Tear down the spawned command child (counterpart of [`spawn_wait_monitor`]).
-///
-/// `pid == None`: bounded no-op — abort + await the placeholder; awaiting its
-/// pending future would hang every non-Run teardown. A finished monitor means
-/// the child already exited and was reaped. Unix signals the child's WHOLE
-/// process group (it leads one; the monitor's open `Child` handle pins the
-/// group against pid reuse). Windows terminates by pid — sound for the same
-/// handle-pinning reason — and the Job Object reaps the rest of the tree.
+/// `pid == None`: bounded no-op. A finished monitor means the child was already
+/// reaped. Unix: SIGTERM→grace→SIGKILL the whole group; Windows: TerminateProcess.
 pub(crate) async fn shutdown_child_command(
     pid: Option<u32>,
     monitor: &mut tokio::task::JoinHandle<()>,
@@ -155,8 +135,9 @@ pub(crate) async fn shutdown_child_command(
     }
 }
 
-/// Pid exists AND its cmdline contains `needle` — defeats PID reuse (per-OS
-/// mechanisms in the module docs; other Unix falls back to liveness only).
+/// Pid exists AND its cmdline contains `needle` — defeats PID reuse. Per-OS
+/// readers below (Linux /proc, macOS sysctl, Windows image name); other Unix:
+/// liveness only.
 #[cfg(unix)]
 pub fn pid_matches(pid: u32, needle: &str) -> bool {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -194,14 +175,7 @@ mod windows_proc {
         QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
     };
 
-    /// Rights we need on a target process: enough to query its image name /
-    /// exit code, to wait on it (for liveness), AND to terminate it.
     const ACCESS: u32 = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE;
-
-    /// Win32 `STILL_ACTIVE` — never used for liveness: a real exit with 259
-    /// reads alive forever; liveness is `WaitForSingleObject`.
-    #[allow(dead_code)]
-    const STILL_ACTIVE: u32 = 259;
 
     /// Open `pid` for query+terminate, returning a handle the caller must
     /// `CloseHandle`. `None` if the process is gone or inaccessible.
@@ -219,13 +193,14 @@ mod windows_proc {
             let Some(h) = open(pid) else {
                 return false;
             };
+            // Liveness is WaitForSingleObject only, never the exit code: a
+            // real exit with 259 (STILL_ACTIVE) would read alive forever.
             let r = WaitForSingleObject(h, 0);
             let _ = CloseHandle(h);
             r == WAIT_TIMEOUT
         }
     }
 
-    /// Lowercased image path of `pid` (e.g. `c:\users\...\ft.exe`).
     fn image_path(pid: u32) -> Option<String> {
         unsafe {
             let Some(h) = open(pid) else {
@@ -259,7 +234,6 @@ mod windows_proc {
         pid_matches(pid, "run-worker")
     }
 
-    /// Terminate a single process by pid. Returns true if a termination issued.
     fn terminate(pid: u32) -> bool {
         unsafe {
             let Some(h) = open(pid) else {
@@ -315,10 +289,9 @@ mod windows_proc {
         }
     }
 
-    /// Create a Job Object with KILL_ON_JOB_CLOSE, assign THIS process, and
-    /// return a guard: when the worker exits the OS closes the handle and
-    /// kills the job — the Windows `PR_SET_PDEATHSIG`. `None` (after logging)
-    /// if setup fails: the worker runs but a hard-killed one won't auto-reap.
+    /// Create a KILL_ON_JOB_CLOSE job, assign this process, and return a guard
+    /// whose drop kills the whole tree (the Windows `PR_SET_PDEATHSIG`). `None`
+    /// (after logging) if setup fails — a hard-killed worker then won't auto-reap.
     pub fn create_kill_on_close_job() -> Option<JobGuard> {
         use windows_sys::Win32::System::JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -403,11 +376,9 @@ pub async fn shutdown_process_group(pgid: u32) {
     let _ = kill(Pid::from_raw(raw), Signal::SIGKILL);
 }
 
-/// Best-effort `SIGTERM` of an orphaned cloudflared (its worker is gone —
-/// `PR_SET_PDEATHSIG` does not survive a host reboot). The identity gate
-/// lives HERE, right before the signal: callers decide and signal later (in
-/// prune/sanitize a locked registry save sits between), so a pid recycled in
-/// that window must be re-verified, never signalled on stale say-so.
+/// Identity-gated SIGTERM of an orphaned cloudflared (PDEATHSIG cannot survive
+/// a host reboot). The gate lives HERE: a locked registry save can sit between
+/// a caller's decision and the signal, so a recycled pid must be re-verified.
 #[cfg(unix)]
 pub fn terminate_orphan(pid: u32) {
     if !pid_matches(pid, "cloudflared") {
@@ -426,7 +397,6 @@ pub fn terminate_foreground(pid: u32) {
     let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
 }
 
-/// Read `/proc/<pid>/cmdline` and report whether any argument contains `needle`.
 #[cfg(target_os = "linux")]
 fn cmdline_contains(pid: u32, needle: &str) -> bool {
     let path = std::path::Path::new("/proc")
@@ -442,19 +412,15 @@ fn cmdline_contains(pid: u32, needle: &str) -> bool {
     })
 }
 
-/// Cap on the KERN_PROCARGS2 allocation: over 1 MiB cannot be one of ours,
-/// and the cap bounds a pathological argv/env block.
 #[cfg(target_os = "macos")]
 const MAX_PROCARGS_BYTES: usize = 1024 * 1024;
 
-/// Read another process's cmdline on macOS via `sysctl(KERN_PROCARGS2)`:
-/// layout `[argc:u32][execpath\0][pad][argv...][envv...]` — search ONLY the
-/// argv region, never envv, so the needle cannot match a foreign env var.
-/// Works for same-uid processes without root.
+// KERN_PROCARGS2 blob layout: [argc:u32][execpath\0][pad][argv...][envv...] —
+// search ONLY the argv region, never envv, so a foreign env var cannot match.
+// Works for same-uid processes without root.
 #[cfg(target_os = "macos")]
 fn cmdline_contains(pid: u32, needle: &str) -> bool {
     let mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
-    // First call: discover the required buffer size.
     let mut size: libc::size_t = 0;
     let rc = unsafe {
         libc::sysctl(
@@ -469,11 +435,9 @@ fn cmdline_contains(pid: u32, needle: &str) -> bool {
     if rc != 0 || size == 0 {
         return false;
     }
-    // Cap the allocation: over 1 MiB cannot be one of ours — refuse.
     if size > MAX_PROCARGS_BYTES {
         return false;
     }
-    // Second call: fetch the blob.
     let mut buf = vec![0u8; size];
     let rc = unsafe {
         libc::sysctl(
@@ -491,8 +455,6 @@ fn cmdline_contains(pid: u32, needle: &str) -> bool {
     argv_contains(&buf, needle)
 }
 
-/// Parse a `KERN_PROCARGS2` blob: read argc, skip execpath + padding, walk
-/// exactly `argc` NUL-terminated entries — past that is envv, never searched.
 #[cfg(target_os = "macos")]
 fn argv_contains(blob: &[u8], needle: &str) -> bool {
     if blob.len() < 4 {
@@ -518,7 +480,6 @@ fn argv_contains(blob: &[u8], needle: &str) -> bool {
     let needle_bytes = needle.as_bytes();
     for _ in 0..argc {
         if pos >= blob.len() {
-            // Truncated blob: every present entry was searched — safe to stop.
             return false;
         }
         let entry_end = blob[pos..]
@@ -537,8 +498,6 @@ fn argv_contains(blob: &[u8], needle: &str) -> bool {
     false
 }
 
-/// Plain byte substring search (no allocation). `haystack` contains the entry,
-/// `needle` is ASCII.
 #[cfg(target_os = "macos")]
 fn memmem(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() {
@@ -555,7 +514,6 @@ mod command_child_tests {
     /// Env inheritance has no pure seam — proven through a real child.
     #[tokio::test]
     async fn command_child_receives_port_in_its_environment() {
-        // The listener merely produces a realistic, in-use-looking port.
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
         let port = listener.local_addr().expect("local addr").port();
 
@@ -640,7 +598,6 @@ mod command_child_tests {
         let stdout = child.stdout.take().expect("stdout is piped");
         let mut monitor = spawn_wait_monitor(child);
 
-        // Read the grandchild's pid from the pipe, bounded against hangs.
         use tokio::io::AsyncBufReadExt;
         let grandchild_pid: u32 = {
             let mut lines = tokio::io::BufReader::new(stdout).lines();
@@ -708,8 +665,6 @@ mod command_shutdown_tests {
     async fn finished_monitor_shutdown_completes_immediately() {
         const BOUND: std::time::Duration = std::time::Duration::from_secs(5);
         let mut monitor = tokio::spawn(async {});
-        // Let the trivial task finish so is_finished is the short-circuit
-        // taken (the abort path would also be fine).
         for _ in 0..100 {
             if monitor.is_finished() {
                 break;
@@ -776,7 +731,6 @@ mod tests {
              terminate_orphan/terminate_foreground must refuse non-matching pids"
         );
 
-        // Gate held: clean up the child ourselves (kill + reap, no zombie).
         child.kill().expect("kill sleep child");
         child.wait().expect("reap sleep child");
     }
@@ -808,6 +762,174 @@ mod tests {
         blob.extend_from_slice(b"/ft\0"); // execpath
         blob.extend_from_slice(b"ft run-worker --foreground\0"); // argv[0]
         assert!(argv_contains(&blob, "run-worker"));
+    }
+
+    fn probe_alive(pid: u32) -> bool {
+        if kill(Pid::from_raw(pid as i32), None).is_err() {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                && let Some(close) = stat.rfind(')')
+                && let Some(state) = stat[close + 1..].trim().chars().next()
+            {
+                return state != 'Z';
+            }
+        }
+        true
+    }
+
+    struct GroupDecoy {
+        child: std::process::Child,
+    }
+
+    impl GroupDecoy {
+        fn pid(&self) -> u32 {
+            self.child.id()
+        }
+    }
+
+    impl Drop for GroupDecoy {
+        fn drop(&mut self) {
+            let group = Pid::from_raw(-(self.child.id() as i32));
+            let _ = kill(group, Signal::SIGKILL);
+            let _ = self.child.wait();
+        }
+    }
+
+    fn spawn_group_decoy(script: &str, argv_needle: Option<&str>) -> GroupDecoy {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .stdout(std::process::Stdio::piped());
+        if let Some(needle) = argv_needle {
+            command.arg(needle);
+        }
+        let child = command.process_group(0).spawn().expect("spawn decoy sh");
+        let decoy = GroupDecoy { child };
+        let ready = |pid: u32| match argv_needle {
+            Some(needle) => pid_matches(pid, needle),
+            None => process_exists(pid),
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready(decoy.pid()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "decoy never became probe-ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        decoy
+    }
+
+    async fn wait_for_decoy_exit(child: &mut std::process::Child, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while child.try_wait().expect("try_wait the decoy").is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what} did not die within the bound"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn wait_for_pid_death(pid: u32, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while probe_alive(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what} (pid {pid}) did not die within the bound"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_process_group_kills_only_a_matching_group_and_survives_a_term_ignoring_leader()
+     {
+        const BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+        let mut matching = spawn_group_decoy("sleep 30 & echo $!; wait", Some("run-worker"));
+        let member_pid: u32 = {
+            use std::io::BufRead;
+            let stdout = matching
+                .child
+                .stdout
+                .take()
+                .expect("the decoy stdout must be piped");
+            let mut line = String::new();
+            std::io::BufReader::new(stdout)
+                .read_line(&mut line)
+                .expect("the decoy must print its member pid");
+            line.trim().parse().expect("the member pid must be numeric")
+        };
+        assert!(
+            probe_alive(member_pid),
+            "the group member (pid {member_pid}) must be running before teardown"
+        );
+
+        tokio::time::timeout(BOUND, shutdown_process_group(matching.pid()))
+            .await
+            .expect("the matching group teardown must complete within the bound");
+        wait_for_decoy_exit(&mut matching.child, "the matching group leader").await;
+        wait_for_pid_death(member_pid, "the group member").await;
+
+        let mut foreign = spawn_group_decoy("sleep 30 & echo $!; wait", None);
+        tokio::time::timeout(BOUND, shutdown_process_group(foreign.pid()))
+            .await
+            .expect("a refused teardown must still complete");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            foreign
+                .child
+                .try_wait()
+                .expect("try_wait the foreign leader")
+                .is_none(),
+            "shutdown_process_group signalled a group whose leader lacks the run-worker identity"
+        );
+
+        let mut stubborn = spawn_group_decoy(
+            "trap '' TERM; echo ready; while :; do sleep 30; done",
+            Some("run-worker"),
+        );
+        {
+            use std::io::BufRead;
+            let stdout = stubborn
+                .child
+                .stdout
+                .take()
+                .expect("the stubborn decoy stdout must be piped");
+            let mut line = String::new();
+            std::io::BufReader::new(stdout)
+                .read_line(&mut line)
+                .expect("the stubborn decoy must announce its trap");
+            assert_eq!(line.trim(), "ready");
+        }
+        let escalated = std::time::Instant::now();
+        tokio::time::timeout(BOUND, shutdown_process_group(stubborn.pid()))
+            .await
+            .expect("the TERM-ignoring leader teardown must escalate within the bound");
+        assert!(
+            escalated.elapsed() >= std::time::Duration::from_millis(1400),
+            "a leader ignoring SIGTERM must die to the post-grace escalation, not an instant \
+             TERM kill, took {:?}",
+            escalated.elapsed()
+        );
+        wait_for_decoy_exit(&mut stubborn.child, "the TERM-ignoring leader").await;
+    }
+
+    #[tokio::test]
+    async fn terminate_orphan_and_foreground_stop_identity_matched_decoys() {
+        let mut orphan = spawn_group_decoy("while :; do sleep 30; done", Some("cloudflared"));
+        terminate_orphan(orphan.pid());
+        wait_for_decoy_exit(&mut orphan.child, "the cloudflared-matched decoy").await;
+
+        let mut foreground = spawn_group_decoy("while :; do sleep 30; done", Some("--foreground"));
+        terminate_foreground(foreground.pid());
+        wait_for_decoy_exit(&mut foreground.child, "the --foreground-matched decoy").await;
     }
 }
 

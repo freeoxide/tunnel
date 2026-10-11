@@ -1,10 +1,6 @@
-//! The START command.
-//!
-//! Background: reserve an entry, spawn a detached worker owning the static
-//! server + cloudflared, poll for the public URL (fail fast if the worker
-//! dies first). `--foreground`: server + tunnel run in-process until
-//! cloudflared exits or Ctrl-C. The foreground machinery is shared with the
-//! proxy flow (`dir: None`) and the run flow (`command: Some`).
+//! The START command: reserve an entry, spawn a detached worker owning the
+//! static server + cloudflared, poll for the public URL; `--foreground` runs
+//! the machinery in-process (shared with the proxy and run flows).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -26,11 +22,10 @@ use crate::proc;
 use crate::spawn;
 use crate::state::StateDir;
 
-/// Most bytes read from a log when surfacing a start-failure reason; only
-/// the trailing window is examined.
 const LAST_REASON_CAP: u64 = 16 * 1024;
 /// Bound on draining in-flight requests on Ctrl-C before the server task is
-/// aborted, so a stuck request can't hang the foreground. Shared with hook.
+/// aborted, so a stuck request can't hang the foreground. Shared by the
+/// foreground flows (hook, drop) and the worker.
 pub(crate) const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Entry point for the START command. `dir` defaults to `.`; an empty
@@ -45,8 +40,6 @@ pub async fn run(
 ) -> Result<()> {
     let dir = dir.unwrap_or_else(|| PathBuf::from("."));
     let dir = resolve_dir(&dir)?;
-    // Guard the most foot-gun case: publishing $HOME or the filesystem root
-    // to the public internet (dotfiles are already refused by the server).
     confirm_sensitive(&dir, yes)?;
     // An empty (or whitespace-only) --token is a typo, not a configuration;
     // the stored value stays verbatim (all readers share the registry value).
@@ -64,8 +57,6 @@ pub async fn run(
     }
 }
 
-/// Refuse — or prompt y/N (default No) — when serving a sensitive directory.
-/// Non-interactive runs must pass `yes`.
 fn confirm_sensitive(dir: &Path, yes: bool) -> Result<()> {
     if !is_sensitive_dir(dir) {
         return Ok(());
@@ -98,15 +89,12 @@ fn confirm_sensitive(dir: &Path, yes: bool) -> Result<()> {
     Ok(())
 }
 
-/// True for directories whose wholesale public exposure is almost certainly a
-/// mistake: the filesystem root and well-known system dirs; `$HOME` or any of
-/// its ancestors; anything overlapping ft's own state tree (registry.json,
-/// logs, hook records, drop-token files — none dotfile-hidden). Both sides
-/// are canonicalised so a symlink alias cannot slip past; unresolvable paths
-/// fail CLOSED.
+/// True for dirs whose wholesale public exposure is almost certainly a
+/// mistake: root and well-known system dirs, `$HOME` or any ancestor, and
+/// anything overlapping ft's state tree; unresolvable paths fail CLOSED.
 pub(crate) fn is_sensitive_dir(dir: &Path) -> bool {
     let Ok(dir) = std::fs::canonicalize(dir) else {
-        return true; // fail-closed: can't resolve it -> refuse to publish silently.
+        return true;
     };
 
     // Entries are canonicalised so platform symlinks match (macOS /etc ->
@@ -133,9 +121,8 @@ pub(crate) fn is_sensitive_dir(dir: &Path) -> bool {
     };
 
     // Three-way overlap on purpose: the root itself, a subtree (GETs would
-    // serve the token files), and ancestors (would serve registry.json). A
-    // not-yet-existing root compares lexically; an undeterminable root
-    // fails CLOSED like $HOME.
+    // serve the token files), ancestors (would serve registry.json); an
+    // uncanonicalisable root compares lexically, an unresolvable one fails CLOSED.
     let state_overlapped = match crate::state::StateDir::new() {
         Ok(state) => {
             let root =
@@ -164,7 +151,6 @@ pub(crate) fn resolve_dir(dir: &Path) -> Result<PathBuf> {
     Ok(abs)
 }
 
-/// True if we can read the directory's entries (a proxy for "readable").
 fn is_readable(dir: &Path) -> bool {
     std::fs::read_dir(dir).is_ok()
 }
@@ -221,13 +207,9 @@ async fn run_background(
     poll_for_url(&state, id, &name, worker_pid).await
 }
 
-/// Reserve a name, id, and entry atomically under the registry lock — the
-/// shared reservation of every start flow. `worker_pid: 0` + a fresh
-/// `created_at` put the entry inside `model::START_GRACE`, so a concurrent
-/// `ft kill`/`ft prune` refuses to reap it during the reserve→spawn→record
-/// window; callers resolve the window by removing the entry by id, which
-/// bypasses the grace guard (pid-0 staleness is
-/// `Service::start_in_progress`'s to own).
+/// Reserve name, id, and entry atomically under the registry lock — shared
+/// by every start flow. `worker_pid: 0` + fresh `created_at` hold the entry
+/// inside START_GRACE until the real pid lands; removal by id bypasses it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn reserve_entry(
     state: &StateDir,
@@ -291,10 +273,8 @@ pub(crate) fn record_worker_pid(state: &StateDir, id: u64, worker_pid: u32) -> R
 }
 
 /// Poll the registry for the worker's published public URL, failing fast if
-/// the worker dies or the entry vanishes — the shared tail of the
-/// START/PROXY/HOOK background flows (RUN's loop additionally requires the
-/// origin port). Re-read+parse only on mtime change; the death probe still
-/// runs every poll, so fail-fast latency is unchanged.
+/// the worker dies or the entry vanishes — the shared tail of the background
+/// flows; re-reads are mtime-gated, the death probe runs every poll.
 pub(crate) async fn poll_for_url(
     state: &StateDir,
     id: u64,
@@ -320,8 +300,6 @@ pub(crate) async fn poll_for_url(
             last_mtime = new_mtime;
             Some(Registry::load(state)?.find(&id.to_string()).cloned())
         } else {
-            // Registry unchanged: the worker may still have died silently
-            // between rewrites, so probe the recorded pid directly.
             if !proc::pid_alive(worker_pid) {
                 return fail_start(state, id, name, worker_pid).await;
             }
@@ -339,17 +317,12 @@ pub(crate) async fn poll_for_url(
                 return fail_start(state, id, name, worker_pid).await;
             }
             Some(None) => {
-                // Our entry vanished — concurrent `ft kill` or the worker's
-                // own self-remove; tear down now, not after 30 s of orphan.
                 return fail_start(state, id, name, worker_pid).await;
             }
-            // Still starting, or unchanged registry: poll again.
             _ => {}
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
-    // Timed out: the worker + cloudflared may still be alive, so tear them
-    // down before bailing.
     fail_timeout(state, id, name, worker_pid).await
 }
 
@@ -409,8 +382,6 @@ pub(crate) fn last_line(path: &Path) -> Option<String> {
     let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     if len > LAST_REASON_CAP {
-        // Seek into the trailing window; the first "line" then starts mid-file
-        // and is likely partial, so drop everything up to the first newline.
         file.seek(SeekFrom::Start(len - LAST_REASON_CAP)).ok()?;
     }
     let mut buf = Vec::new();
@@ -447,8 +418,6 @@ impl EntryGuard {
 
 impl Drop for EntryGuard {
     fn drop(&mut self) {
-        // tracing is sync-safe inside Drop; a failed cleanup must be visible
-        // or the entry leaks silently until a later `ft prune`.
         if let Err(e) = Registry::update(&self.state, |reg| {
             reg.remove(self.id);
         }) {
@@ -488,12 +457,6 @@ pub(crate) async fn run_foreground_with_command(
     run_foreground_inner(None, name, port, Some(command), StaticFlags::default()).await
 }
 
-/// The shared foreground machinery behind all three entries: `Some(dir)` =
-/// static server; `None` + `command` = the operator's command as ft's child;
-/// `None` alone = proxy. The entry records our own pid and `foreground:
-/// true`, so `ft kill` signals this single pid, never the group (which
-/// includes the operator's shell); removed on every exit, stale only on a
-/// hard kill (then `ft prune`'s).
 async fn run_foreground_inner(
     dir: Option<&Path>,
     name: Option<String>,
@@ -545,13 +508,13 @@ async fn run_foreground_inner(
 
     cloudflared::ensure_installed()?;
 
-    // --- Reserve a registry entry ------------------------------------------
-    // FOREGROUND entry, worker_pid = THIS process (Windows: the only mode).
     let base = match (dir, command) {
         (Some(d), _) => name::generate_name(d),
         (None, Some(_)) => format!("run-{port}"),
         (None, None) => format!("proxy-{port}"),
     };
+    // The foreground entry records our own pid so `ft kill` signals this
+    // single pid, never the group (which includes the operator's shell).
     let (id, name) = reserve_entry(
         &state,
         kind,
@@ -564,7 +527,6 @@ async fn run_foreground_inner(
         static_flags.clone(),
     )?;
 
-    // From here, every exit path releases the entry via the guard's Drop.
     let _entry = EntryGuard::new(state.clone(), id);
 
     // Tee cloudflared output to tunnel.log so `ft logs <name>` works for
@@ -610,13 +572,9 @@ async fn run_foreground_inner(
         None => None,
     };
 
-    // Run only: spawn the operator's command as THIS process's child — the
-    // origin cloudflared fronts, PORT exported; no static server to unwind.
     let (command_pid, mut command_monitor, command_out) = match command {
         Some(cmd) => {
             let mut child = crate::proc::spawn_command_child(cmd, port)?;
-            // A freshly spawned, unreaped child always reports its pid (see
-            // the matching note in worker.rs).
             let pid = child.id();
             let stdout = child.stdout.take();
             let stderr = child.stderr.take();
@@ -764,8 +722,6 @@ async fn run_foreground_inner(
         task.abort();
     }
 
-    // Bound serve's Ctrl-C drain so a stuck request can't hang the command,
-    // falling back to abort; a proxy foreground has no server to drain.
     if let Some(server) = server_handle.as_mut() {
         // Reborrow so the handle stays usable in the abort fallback below.
         match tokio::time::timeout(SERVER_SHUTDOWN_TIMEOUT, &mut *server).await {
@@ -793,16 +749,12 @@ async fn run_foreground_inner(
     Ok(())
 }
 
-/// Why the foreground keep-alive loop ended — drives cloudflared teardown.
 enum ReaderExit {
     ChildExited,
-    /// The run flow's command child exited — the origin is gone.
     CommandExited,
     Signal,
 }
 
-/// Read `lines` to EOF, printing to stdout AND appending to the log — the
-/// command-child counterpart of [`drain_and_announce`], minus URL extraction.
 async fn drain_to_log<R>(reader: BufReader<R>, log_writer: Arc<tokio::sync::Mutex<tokio::fs::File>>)
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -884,7 +836,6 @@ mod tests {
             .home_dir()
             .to_path_buf();
         assert!(is_sensitive_dir(&home), "$HOME itself must be sensitive");
-        // An ancestor of $HOME publishes every user's home — sensitive too.
         if let Some(parent) = home.parent() {
             assert!(
                 is_sensitive_dir(parent),
@@ -910,7 +861,6 @@ mod tests {
         assert!(!is_sensitive_dir(dir.path()));
     }
 
-    /// Build a `StateDir` rooted at a temp dir, ready for registry operations.
     fn fresh_state() -> (tempfile::TempDir, StateDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::new_at(tmp.path().join("ft-state"));
@@ -968,8 +918,6 @@ mod tests {
 
     #[test]
     fn entry_guard_removes_entry_on_panic() {
-        // Drop must fire even when the owning scope unwinds; catch_unwind
-        // triggers it without aborting the process (fields are UnwindSafe).
         let (_tmp, state) = fresh_state();
         let id = 7;
         seed_entry(&state, id);

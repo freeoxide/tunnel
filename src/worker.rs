@@ -1,11 +1,6 @@
-//! The detached worker (`ft run-worker ...`): fronts the service's local
-//! origin with a cloudflared Quick Tunnel child, records the tunnel URL on
-//! the registry entry, and stays alive until cloudflared exits, a signal
-//! arrives, or the origin ends. What to front comes from the reserved
-//! registry entry's `kind`, not the CLI args; cloudflared connects lazily,
-//! so a dead upstream is not a start-time failure here. All registry writes
-//! go through [`Registry::update`] (an exclusive flock), so the parent's
-//! writes and ours never clobber each other.
+//! The detached worker (`ft run-worker`): serves the local origin, fronts it
+//! with a cloudflared Quick Tunnel, records the URL on the registry entry, and
+//! exits when cloudflared, the origin, the command child, or a signal ends.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -18,7 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 use crate::cloudflared;
-use crate::cmd::start::{is_sensitive_dir, resolve_dir};
+use crate::cmd::start::{SERVER_SHUTDOWN_TIMEOUT, is_sensitive_dir, resolve_dir};
 use crate::error::Result;
 use crate::model::{Registry, ServiceKind};
 use crate::server::drop_server::{self, DropStore};
@@ -29,9 +24,6 @@ use crate::state::StateDir;
 
 const REGISTRY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 const REGISTRY_LOOKUP_INTERVAL: Duration = Duration::from_millis(100);
-/// Drain bound; a stuck request aborts the server task so it can't hang the
-/// worker.
-const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Run the worker to completion. `dir` is the served/upload directory
 /// ([`crate::spawn::PROXY_DIR_SENTINEL`] for the directory-less kinds).
@@ -68,9 +60,7 @@ pub async fn run(
     // Port 0 would bind a kernel-assigned port that mismatches the reserved
     // one (Static) or front an invalid upstream (Proxy).
     if port == 0 {
-        let _ = Registry::update(&state, |reg| {
-            reg.remove(id);
-        });
+        fail_cleanup(&state, id, None, None).await;
         anyhow::bail!("port 0 is reserved; the worker needs an explicit port");
     }
 
@@ -79,18 +69,14 @@ pub async fn run(
     let deadline = std::time::Instant::now() + REGISTRY_LOOKUP_TIMEOUT;
     if !await_entry(&state, id, deadline).await? {
         // Dying worker mustn't leave a stale entry; clear ours by id.
-        let _ = Registry::update(&state, |reg| {
-            reg.remove(id);
-        });
+        fail_cleanup(&state, id, None, None).await;
         anyhow::bail!("registry entry for service id={id} never appeared");
     }
 
     // A miss means the entry vanished between probe and load (a concurrent
     // `ft kill`) — exit rather than serve an untracked tunnel.
     let Some(entry) = Registry::load(&state)?.find(&id.to_string()).cloned() else {
-        let _ = Registry::update(&state, |reg| {
-            reg.remove(id);
-        });
+        fail_cleanup(&state, id, None, None).await;
         anyhow::bail!("registry entry for service id={id} vanished before start");
     };
     let kind = entry.kind;
@@ -128,16 +114,12 @@ pub async fn run(
             let dir = match resolve_dir(&dir) {
                 Ok(d) => d,
                 Err(e) => {
-                    let _ = Registry::update(&state, |reg| {
-                        reg.remove(id);
-                    });
+                    fail_cleanup(&state, id, None, None).await;
                     return Err(e);
                 }
             };
             if is_sensitive_dir(&dir) {
-                let _ = Registry::update(&state, |reg| {
-                    reg.remove(id);
-                });
+                fail_cleanup(&state, id, None, None).await;
                 anyhow::bail!(
                     "refusing to use sensitive directory {} as a drop bucket \
                      from a detached worker (uploads write into it)",
@@ -151,16 +133,12 @@ pub async fn run(
             let dir = match resolve_dir(&dir) {
                 Ok(d) => d,
                 Err(e) => {
-                    let _ = Registry::update(&state, |reg| {
-                        reg.remove(id);
-                    });
+                    fail_cleanup(&state, id, None, None).await;
                     return Err(e);
                 }
             };
             if is_sensitive_dir(&dir) {
-                let _ = Registry::update(&state, |reg| {
-                    reg.remove(id);
-                });
+                fail_cleanup(&state, id, None, None).await;
                 anyhow::bail!(
                     "refusing to publish sensitive directory {} from a detached worker",
                     dir.display()
@@ -198,9 +176,7 @@ pub async fn run(
             let hook_log = match open_request_store(&state, &name, keep).await {
                 Ok(log) => log,
                 Err(e) => {
-                    let _ = Registry::update(&state, |reg| {
-                        reg.remove(id);
-                    });
+                    fail_cleanup(&state, id, None, None).await;
                     return Err(e);
                 }
             };
@@ -215,9 +191,7 @@ pub async fn run(
             let token = match open_drop_token(&state, &name) {
                 Ok(token) => token,
                 Err(e) => {
-                    let _ = Registry::update(&state, |reg| {
-                        reg.remove(id);
-                    });
+                    fail_cleanup(&state, id, None, None).await;
                     return Err(e);
                 }
             };
@@ -226,9 +200,7 @@ pub async fn run(
             {
                 Ok(store) => store,
                 Err(e) => {
-                    let _ = Registry::update(&state, |reg| {
-                        reg.remove(id);
-                    });
+                    fail_cleanup(&state, id, None, None).await;
                     return Err(e)
                         .with_context(|| format!("opening the drop bucket at {}", dir.display()));
                 }
@@ -243,10 +215,13 @@ pub async fn run(
 
     if let Err(e) = cloudflared::ensure_installed() {
         tracing::error!(%e, "cloudflared unavailable");
-        stop_server(kind, shutdown_tx, &mut server_handle).await;
-        let _ = Registry::update(&state, |reg| {
-            reg.remove(id);
-        });
+        fail_cleanup(
+            &state,
+            id,
+            None,
+            Some((kind, shutdown_tx, &mut server_handle)),
+        )
+        .await;
         return Err(e);
     }
 
@@ -256,10 +231,13 @@ pub async fn run(
         ServiceKind::Run => match crate::fsutil::open_private_append_async(&worker_log).await {
             Ok(f) => Some(Arc::new(Mutex::new(f))),
             Err(e) => {
-                stop_server(kind, shutdown_tx, &mut server_handle).await;
-                let _ = Registry::update(&state, |reg| {
-                    reg.remove(id);
-                });
+                fail_cleanup(
+                    &state,
+                    id,
+                    None,
+                    Some((kind, shutdown_tx, &mut server_handle)),
+                )
+                .await;
                 return Err(e)
                     .with_context(|| format!("opening worker log {}", worker_log.display()));
             }
@@ -281,10 +259,13 @@ pub async fn run(
             }
             Err(e) => {
                 tracing::error!(%e, "failed to spawn the command");
-                stop_server(kind, shutdown_tx, &mut server_handle).await;
-                let _ = Registry::update(&state, |reg| {
-                    reg.remove(id);
-                });
+                fail_cleanup(
+                    &state,
+                    id,
+                    None,
+                    Some((kind, shutdown_tx, &mut server_handle)),
+                )
+                .await;
                 return Err(e);
             }
         },
@@ -340,11 +321,13 @@ pub async fn run(
         Err(e) => {
             tracing::error!(%e, "failed to spawn cloudflared");
             // The command must not outlive a tunnel that never came to be.
-            crate::proc::shutdown_child_command(command_pid, &mut command_monitor).await;
-            stop_server(kind, shutdown_tx, &mut server_handle).await;
-            let _ = Registry::update(&state, |reg| {
-                reg.remove(id);
-            });
+            fail_cleanup(
+                &state,
+                id,
+                Some((command_pid, &mut command_monitor)),
+                Some((kind, shutdown_tx, &mut server_handle)),
+            )
+            .await;
             return Err(e);
         }
     };
@@ -360,11 +343,13 @@ pub async fn run(
             // no URL published, prune can never find the orphaned tunnel.
             tracing::error!(%e, "failed to open the tunnel log");
             cloudflared::shutdown(tunnel_pid, &mut child).await;
-            crate::proc::shutdown_child_command(command_pid, &mut command_monitor).await;
-            stop_server(kind, shutdown_tx, &mut server_handle).await;
-            let _ = Registry::update(&state, |reg| {
-                reg.remove(id);
-            });
+            fail_cleanup(
+                &state,
+                id,
+                Some((command_pid, &mut command_monitor)),
+                Some((kind, shutdown_tx, &mut server_handle)),
+            )
+            .await;
             return Err(e).with_context(|| format!("opening tunnel log {}", tunnel_log.display()));
         }
     };
@@ -388,8 +373,6 @@ pub async fn run(
         reader_tasks.push(tokio::spawn(pipe_stream(BufReader::new(err), ctx.clone())));
     }
 
-    // Keep alive until cloudflared exits, the origin ends, the command child
-    // exits, or a signal arrives (placeholders: see no_server/stop_server).
     #[cfg(unix)]
     {
         let exit_reason = tokio::select! {
@@ -470,6 +453,26 @@ pub async fn run(
     Ok(())
 }
 
+type ShutdownTx = tokio::sync::oneshot::Sender<()>;
+type OriginHandle = tokio::task::JoinHandle<crate::error::Result<()>>;
+
+async fn fail_cleanup(
+    state: &StateDir,
+    id: u64,
+    command: Option<(Option<u32>, &mut tokio::task::JoinHandle<()>)>,
+    server: Option<(ServiceKind, ShutdownTx, &mut OriginHandle)>,
+) {
+    let _ = Registry::update(state, |reg| {
+        reg.remove(id);
+    });
+    if let Some((pid, monitor)) = command {
+        crate::proc::shutdown_child_command(pid, monitor).await;
+    }
+    if let Some((kind, shutdown_tx, server_handle)) = server {
+        stop_server(kind, shutdown_tx, server_handle).await;
+    }
+}
+
 /// Why the keep-alive loop ended — drives cloudflared teardown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReaderExit {
@@ -521,8 +524,6 @@ async fn open_request_store(
     .context("joining the hook request store load task")?
 }
 
-/// Missing or unreadable token is fatal: without it the origin cannot
-/// authenticate an upload, so it must never serve a public tunnel.
 fn open_drop_token(state: &StateDir, name: &str) -> Result<String> {
     let dir = state.service_dir(name);
     match drop_server::read_token(&dir) {
@@ -615,8 +616,6 @@ async fn await_entry(state: &StateDir, id: u64, deadline: std::time::Instant) ->
     Ok(false)
 }
 
-/// Shut cloudflared down if it may still be alive (shared with the
-/// foreground flow).
 async fn teardown_on_exit(
     exit_reason: ReaderExit,
     tunnel_pid: Option<u32>,
@@ -668,7 +667,7 @@ where
                     }
                 }
             }
-            Ok(None) => break, // EOF
+            Ok(None) => break,
             Err(e) => {
                 tracing::warn!(%e, "error reading cloudflared output stream");
                 break;
@@ -691,7 +690,7 @@ where
                 let mut f = log_writer.lock().await;
                 let _ = f.write_all(&buf).await;
             }
-            Ok(None) => break, // EOF
+            Ok(None) => break,
             Err(e) => {
                 tracing::warn!(%e, "error reading command output stream");
                 break;
@@ -718,16 +717,13 @@ fn publish_url(ctx: &ReaderCtx, url: String) -> Result<()> {
     })
 }
 
-/// Fire-once init; tower_http traces -> server.log (Static only), worker
-/// traces -> worker.log.
 fn init_tracing(worker_log: &Path, server_log: Option<&Path>) {
     use std::sync::Mutex;
     use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-    // Both filters are hardcoded — EnvFilter::new never consults RUST_LOG,
-    // on purpose: at the tower_http=info floor no per-request spans (all
-    // debug) reach the append-mode, never-rotated server.log, so it records
-    // no request URIs; raising the floor is a source change, on purpose.
+    // EnvFilter::new deliberately ignores RUST_LOG: at tower_http=info no
+    // per-request spans reach the never-rotated server.log, so it records no
+    // request URIs; raising the floor is a source change, on purpose.
     let server_layer = server_log
         .and_then(|path| crate::fsutil::open_private_append(path).ok())
         .map(|f| {
@@ -779,10 +775,7 @@ mod tests {
         }
     }
 
-    /// Throwaway ctx — the log file is never written to here.
     async fn reader_ctx(state: StateDir, id: u64, tunnel_pid: Option<u32>) -> ReaderCtx {
-        // ensure_service_dir creates the parent of tunnel.log so the open
-        // below succeeds.
         state
             .ensure_service_dir("test-svc")
             .expect("ensure service dir");
@@ -1005,6 +998,69 @@ mod tests {
         assert!(
             tokio::net::TcpStream::connect(addr).await.is_err(),
             "the drop origin must stop accepting after the drain"
+        );
+    }
+}
+
+#[cfg(test)]
+mod drop_token_and_teardown_tests {
+    use super::*;
+
+    #[test]
+    fn open_drop_token_returns_the_stored_secret_and_refuses_an_empty_one() {
+        let tmp = tempfile::tempdir().expect("state dir");
+        let state = StateDir::new_at(tmp.path().to_path_buf());
+        state
+            .ensure_service_dir("drop-svc")
+            .expect("ensure service dir");
+        let token_path = state.service_dir("drop-svc").join("drop-token");
+        std::fs::write(&token_path, b"sekrit\n").expect("store the token");
+        assert_eq!(
+            open_drop_token(&state, "drop-svc").expect("the stored secret is served"),
+            "sekrit"
+        );
+        std::fs::write(&token_path, b"").expect("truncate the token");
+        let err = open_drop_token(&state, "drop-svc").expect_err("an empty token must be refused");
+        assert!(
+            err.to_string().contains("unauthenticated upload endpoint"),
+            "the refusal must name the unauthenticated endpoint: {err:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_exit_escalates_past_an_ignored_term_to_take_the_tunnel_down() {
+        use std::os::unix::process::ExitStatusExt;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("trap '' TERM; echo ready; while :; do sleep 30; done")
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the TERM-ignoring tunnel stand-in");
+        let tunnel_pid = child.id().expect("stand-in pid");
+        let mut out = BufReader::new(child.stdout.take().expect("piped stdout"));
+        let mut ready = String::new();
+        out.read_line(&mut ready)
+            .await
+            .expect("read the readiness line");
+        assert_eq!(
+            ready.trim(),
+            "ready",
+            "teardown may only start once the TERM trap is installed"
+        );
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            teardown_on_exit(ReaderExit::Signal, Some(tunnel_pid), &mut child).await;
+            child.wait().await
+        })
+        .await
+        .expect("the ignored TERM must escalate to a kill within the bound")
+        .expect("the stand-in is reaped");
+        assert_eq!(
+            status.signal(),
+            Some(nix::sys::signal::Signal::SIGKILL as i32),
+            "the stand-in ignores TERM, so only SIGKILL can take it down"
         );
     }
 }

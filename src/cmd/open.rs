@@ -30,7 +30,6 @@ pub async fn run(target: String) -> Result<()> {
         );
     }
 
-    // Printed unconditionally — usable even with no browser.
     println!("{url}");
 
     match open::that(url) {

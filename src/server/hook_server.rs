@@ -1,10 +1,6 @@
-//! Webhook receiver/inspector origin: an ft-owned loopback origin behind
-//! cloudflared that records every request — method, path, query, allowlisted
-//! headers, size-capped body — into a private JSON store and answers 200.
-//! `GET /__inspect` (HTML) and `GET /__inspect.json` (JSON) render the
-//! records newest-first; the inspection endpoints themselves are never
-//! recorded. Header capture is an ALLOWLIST so credential-bearing headers
-//! can never reach the store or the public inspection view.
+//! Webhook receiver/inspector origin behind cloudflared: records every
+//! request (allowlisted headers, capped body) to a private JSON store,
+//! answers 200; `GET /__inspect`(/`.json`) renders newest-first, unrecorded.
 
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
@@ -27,7 +23,6 @@ use tower_http::timeout::TimeoutLayer;
 
 use crate::server::static_server::{escape_html, html_page};
 
-/// Bounds slow clients and the graceful drain, like the static server's.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Recorded-body cap; enforced twice (the limit layer's 413 and the
@@ -58,7 +53,6 @@ const RECORDED_HEADERS: &[&str] = &[
     "user-agent",
     "x-forwarded-for",
     "x-forwarded-proto",
-    // Vendor event-routing headers — they identify the delivery.
     "x-github-delivery",
     "x-github-event",
     "x-gitlab-event",
@@ -134,23 +128,19 @@ struct Window {
     file_len: u64,
 }
 
-/// Worst-case JSON expansion of one body byte (control bytes escape to a
-/// 6-byte `\u00XX`). NUL bodies are valid UTF-8 and legitimate, so the read
-/// bound MUST budget the expansion — an escape-unaware bound wipes such
-/// stores on reload: remotely triggerable record loss.
+/// Worst-case JSON expansion of one body byte (`\u00XX` = 6). NUL bodies are
+/// legitimate UTF-8, so the read bound MUST budget this — an escape-unaware
+/// bound wipes such stores on reload: remotely triggerable record loss.
 const JSON_ESCAPE_FACTOR: usize = 6;
 
-/// hyper's whole-wire request-head budget under axum's default builder (8
-/// KiB + 4 KiB × 100 headers). No cap of ours sits below it — capture
-/// truncates neither path/query nor header values — so the read bound must
-/// assume heads this large; if hyper's default grows, this must grow with
-/// it.
+/// hyper's whole-wire head budget (8 KiB + 4 KiB × 100 headers — hyper's
+/// DEFAULT_MAX_BUFFER_SIZE, proto/h1/io.rs); capture truncates no head
+/// material, so the read bound needs it; it must grow with hyper's default.
 const HYPER_HEAD_BUDGET: usize = 417_792;
 
-/// Per-record head allowance: [`HYPER_HEAD_BUDGET`] × 2 — the http crate
-/// admits raw `"`/`\` in head material and serde_json expands each such byte
-/// 1→2 — plus 2 KiB of JSON structure. A smaller allowance would misclassify
-/// legitimate stores on reload and wipe them.
+/// Per-record head allowance: [`HYPER_HEAD_BUDGET`] × 2 — http admits raw
+/// `"`/`\` in heads and serde expands each 1→2 — plus 2 KiB structure;
+/// smaller would wipe legitimate stores on reload.
 const STORE_RECORD_OVERHEAD: usize = HYPER_HEAD_BUDGET * 2 + 2 * 1024;
 
 const MIN_TAIL_PAD: usize = 64 * 1024;
@@ -267,9 +257,7 @@ impl HookLog {
             w.file_len - 1 - w.live_end > bytes.len() as u64
         });
         if !fits {
-            while self.requests.len() > self.keep {
-                self.requests.pop_back();
-            }
+            self.truncate_to_keep();
             return self.reserve();
         }
         let evict = self.requests.len() > self.keep;
@@ -290,15 +278,11 @@ impl HookLog {
                 Ok(())
             })(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                while self.requests.len() > self.keep {
-                    self.requests.pop_back();
-                }
+                self.truncate_to_keep();
                 return self.reserve();
             }
             Err(e) => {
-                while self.requests.len() > self.keep {
-                    self.requests.pop_back();
-                }
+                self.truncate_to_keep();
                 self.window = None;
                 return Err(e);
             }
@@ -310,14 +294,18 @@ impl HookLog {
             }
             Err(e) => {
                 self.window = None;
-                while self.requests.len() > self.keep {
-                    self.requests.pop_back();
-                }
+                self.truncate_to_keep();
                 match self.reserve() {
                     Ok(()) => Ok(()),
                     Err(_) => Err(e),
                 }
             }
+        }
+    }
+
+    fn truncate_to_keep(&mut self) {
+        while self.requests.len() > self.keep {
+            self.requests.pop_back();
         }
     }
 
@@ -648,7 +636,6 @@ async fn record(State(log): State<Arc<Mutex<HookLog>>>, request: Request) -> Res
         }
     };
     let received_at = crate::model::now_utc();
-    // Blocking fs work off the async threads (request-path discipline).
     let persisted = tokio::task::spawn_blocking(move || {
         let mut log = lock(&log);
         let seq = log.next_seq();
@@ -1002,7 +989,6 @@ mod tests {
     fn load_treats_an_oversized_store_as_corruption() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("requests.json");
-        // Sparse file — the metadata check refuses it unread.
         std::fs::File::create(&path)
             .and_then(|f| f.set_len(absolute_read_bound() + 1))
             .expect("plant a sparse over-ceiling store");
@@ -1149,7 +1135,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let blocker = tmp.path().join("blocker");
         std::fs::write(&blocker, b"intact").expect("write blocker file");
-        let store = blocker.join("requests.json"); // parent is a FILE -> ENOTDIR
+        let store = blocker.join("requests.json");
 
         let err =
             HookLog::load(store, 5).expect_err("a non-NotFound read error must fail the load");
@@ -1566,8 +1552,6 @@ mod tests {
         assert_eq!(log.len(), 0, "a non-matching tail must wipe");
     }
 
-    // --- the full Router, driven like the static server's HTTP tests --------
-
     #[tokio::test]
     async fn recorded_requests_answer_200_and_land_in_the_store() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1812,6 +1796,44 @@ mod tests {
         assert!(
             html.contains("no requests recorded yet"),
             "empty store must say so: {html}"
+        );
+    }
+
+    #[test]
+    fn hook_store_eviction_removes_the_oldest_record_from_disk() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("requests.json");
+        let mut log = HookLog::load(path.clone(), 2).expect("load");
+        for (seq, body) in [
+            (1u64, "oldest-secret"),
+            (2, "middle-secret"),
+            (3, "newest-secret"),
+        ] {
+            let head = parts("POST", "/hooks", &[]);
+            log.record(RecordedRequest::capture(
+                seq,
+                recv_stamp(),
+                &head,
+                body.as_bytes(),
+            ))
+            .expect("record");
+        }
+        let raw = std::fs::read(&path).expect("read the raw store bytes");
+        let store = String::from_utf8_lossy(&raw);
+        assert!(
+            !store.contains("oldest-secret"),
+            "the evicted body must not linger on disk: {store}"
+        );
+        assert!(store.contains("middle-secret"));
+        assert!(store.contains("newest-secret"));
+        let mut reloaded = HookLog::load(path, 2).expect("reload");
+        let snap = reloaded.snapshot();
+        let bodies: Vec<&str> = snap.iter().map(|r| r.body.as_str()).collect();
+        assert_eq!(bodies, vec!["newest-secret", "middle-secret"]);
+        assert_eq!(
+            reloaded.next_seq(),
+            4,
+            "seqs must continue past the evicted records"
         );
     }
 }

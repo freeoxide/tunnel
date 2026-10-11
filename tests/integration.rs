@@ -1,16 +1,16 @@
-//! End-to-end tests for the `ft` binary, driven as a black box: no lib
-//! target, so tests spawn the freshly-built binary via `CARGO_BIN_EXE_ft`
-//! and pin `XDG_STATE_HOME` to a private tempdir (set on the subprocess
-//! only, never the test process's env). Cloudflared/network paths are out of
-//! scope — only paths that stop before the cloudflared lookup run here; the
-//! origin behaviour itself is covered by the server unit tests.
+//! End-to-end black-box tests for the `ft` binary via `CARGO_BIN_EXE_ft`,
+//! each pinned to a private `XDG_STATE_HOME` tempdir; cloudflared-bound
+//! paths are out of scope (origin behaviour lives in the server unit tests).
 
 #![cfg(unix)] // proc::pid_alive uses a Unix-only cmdline identity probe.
 
 use std::fs;
-use std::net::{Ipv4Addr, TcpListener};
+use std::io::Write;
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 use tempfile::TempDir;
 
@@ -121,7 +121,6 @@ impl DecoyWorker {
 
 impl Drop for DecoyWorker {
     fn drop(&mut self) {
-        // wait() reaps so the pid cannot linger as a zombie.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -230,11 +229,141 @@ fn time_wait_loopback_port() -> u16 {
     let port = listener.local_addr().expect("local addr").port();
     let client = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).expect("connect");
     let accepted = listener.accept().expect("accept").0;
-    // Drop order is the point: the close must be ACTIVE on the server endpoint.
     drop(listener);
     drop(accepted);
     drop(client);
     port
+}
+
+const PUBLISHING_CLOUDFLARED: &str =
+    "#!/bin/sh\necho https://fake-e2e-words.trycloudflare.com\nexec sleep 300\n";
+const DYING_CLOUDFLARED: &str = "#!/bin/sh\necho fake cloudflared failed\nexit 1\n";
+const DELAYED_PUBLISHING_CLOUDFLARED: &str =
+    "#!/bin/sh\nsleep 4\necho https://fake-e2e-words.trycloudflare.com\nexec sleep 300\n";
+
+fn install_fake_cloudflared(bin_dir: &std::path::Path, script: &str) {
+    fs::create_dir_all(bin_dir).unwrap();
+    let fake = bin_dir.join("cloudflared");
+    fs::write(&fake, script).unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(bin_dir, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+fn path_env_prepending(bin_dir: &std::path::Path) -> String {
+    format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+fn process_alive_zombie_aware(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        match stat
+            .rfind(')')
+            .and_then(|close| stat[close + 1..].trim_start().chars().next())
+        {
+            None | Some('Z') => false,
+            Some(_) => true,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill -0 {pid}"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+}
+
+fn wait_for_process_death(pid: u32) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if !process_alive_zombie_aware(pid) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    !process_alive_zombie_aware(pid)
+}
+
+fn wait_for_registry_entry(xdg_root: &std::path::Path, needle: &str) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let seeded = fs::read_to_string(registry_path(xdg_root))
+            .map(|body| body.contains(needle))
+            .unwrap_or(false);
+        if seeded {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    false
+}
+
+fn wait_for_recorded_worker_pid(xdg_root: &std::path::Path, name: &str) -> bool {
+    let needle = format!("\"{name}\"");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let recorded = fs::read_to_string(registry_path(xdg_root))
+            .ok()
+            .and_then(|body| {
+                body.find(&needle)
+                    .and_then(|at| json_u64_field(&body[at..], "worker_pid"))
+            })
+            .is_some_and(|pid| pid > 0);
+        if recorded {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    false
+}
+
+fn wait_for_port_accept(port: u16) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        if TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_ok() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}
+
+fn wait_for_port_refusal(port: u16) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_err() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_err()
+}
+
+fn json_u64_field(body: &str, field: &str) -> Option<u64> {
+    let needle = format!("\"{field}\":");
+    let rest = &body[body.find(&needle)? + needle.len()..];
+    let digits = &rest[..rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len())];
+    digits.parse().ok()
+}
+
+fn json_str_field(body: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\":\"");
+    let start = body.find(&needle)? + needle.len();
+    let end = start + body[start..].find('"')?;
+    Some(body[start..end].to_string())
 }
 
 /// Files AND directories, recursively: `StateDir::ensure` creates an empty
@@ -256,8 +385,6 @@ fn tree_paths(root: &std::path::Path) -> Vec<PathBuf> {
     paths
 }
 
-/// Seeding a `created_at` inside START_GRACE (60 s) needs NOW; integration
-/// tests cannot use chrono (no lib target), hence the hand-rolled conversion.
 fn now_rfc3339() -> String {
     fn civil_from_days(days: i64) -> (i64, u32, u32) {
         let z = days + 719_468;
@@ -430,8 +557,6 @@ fn detail_round_trips_a_seeded_entry() {
         "name target did not resolve to the entry: {out_by_name}"
     );
 }
-
-// --- `ft proxy` (pre-flight + seeded-fixture lifecycle; no cloudflared) ---
 
 #[test]
 fn proxy_dead_upstream_fails_friendly_and_leaves_no_state() {
@@ -629,32 +754,6 @@ fn kill_removes_a_stale_proxy_entry_like_a_static_one() {
 }
 
 #[test]
-fn prune_reaps_a_stale_proxy_entry_and_persists() {
-    let dir = TempDir::new().unwrap();
-    let reg = seed_registry(
-        dir.path(),
-        &proxy_registry_json(4_000_000, "2026-07-21T00:00:00Z", None),
-    );
-
-    let (ok, out) = run_ft(dir.path(), &["prune"]);
-    assert!(ok, "`ft prune` on a proxy registry failed: {out}");
-    assert!(
-        out.contains("Pruned 1 stale service"),
-        "expected prune to report one reaped proxy service, got: {out}"
-    );
-    assert!(
-        out.contains("seed-proxy"),
-        "expected the pruned proxy service's name, got: {out}"
-    );
-
-    let after = fs::read_to_string(&reg).unwrap();
-    assert!(
-        !after.contains("seed-proxy"),
-        "prune should have removed the stale proxy entry, but registry is: {after}"
-    );
-}
-
-#[test]
 fn kill_refuses_a_fresh_proxy_reservation_within_the_start_grace() {
     let dir = TempDir::new().unwrap();
     let reg = seed_registry(dir.path(), &proxy_registry_json(0, &now_rfc3339(), None));
@@ -740,8 +839,6 @@ fn prune_keeps_a_fresh_proxy_reservation_and_reaps_an_expired_one() {
         "prune must keep the fresh and drop the expired reservation, registry: {after}"
     );
 }
-
-// --- `ft run` (usage, occupied-port pre-flight, seeded fixtures; no cloudflared)
 
 #[test]
 fn run_help_documents_the_command() {
@@ -946,8 +1043,6 @@ fn run_fixture_renders_in_ls_and_detail() {
         "kill should have removed the run entry, but registry is: {after}"
     );
 }
-
-// --- `ft drop` (usage, pre-flights, seeded fixtures; no cloudflared) --------
 
 #[test]
 fn drop_help_documents_the_command() {
@@ -1220,8 +1315,6 @@ fn drop_fixture_renders_in_ls_detail_and_kill() {
     );
 }
 
-// --- `ft doctor` (read-only diagnosis; no cloudflared needed) ---------------
-
 #[test]
 fn doctor_on_a_missing_registry_exits_zero_with_no_service_checks() {
     let dir = TempDir::new().unwrap();
@@ -1373,8 +1466,6 @@ fn doctor_flags_a_stale_run_service_whose_command_is_still_running() {
         "doctor must not mutate the registry, got: {after}"
     );
 }
-
-// --- `ft sanitize` (the cleanup counterpart; no cloudflared needed) ----------
 
 #[test]
 fn sanitize_on_a_missing_registry_reports_nothing_and_creates_no_state() {
@@ -1543,8 +1634,6 @@ fn sanitize_keeps_a_fresh_reservation_and_reaps_an_expired_one() {
     );
 }
 
-// --- `ft hook` (usage, occupied-port pre-flight, seeded fixtures; no cloudflared)
-
 #[test]
 fn hook_help_documents_the_command() {
     let dir = TempDir::new().unwrap();
@@ -1702,8 +1791,6 @@ fn hook_fixture_renders_in_ls_and_detail() {
         "kill should have removed the hook entry, but registry is: {after}"
     );
 }
-
-// --- static-origin flags on `ft <dir>` (CLI surface, registry persistence) ---
 
 #[test]
 fn start_help_documents_the_static_origin_flags() {
@@ -1974,5 +2061,557 @@ fn static_flags_persist_through_a_full_registry_rewrite() {
     assert!(
         !after.contains("expired-reservation"),
         "the expired reservation must be gone, registry: {after}"
+    );
+}
+
+#[test]
+fn start_fails_fast_when_cloudflared_dies_first_and_publishes_when_the_url_lands() {
+    let dir = TempDir::new().unwrap();
+    let site_a = dir.path().join("site-a");
+    let site_b = dir.path().join("site-b");
+    fs::create_dir_all(&site_a).unwrap();
+    fs::create_dir_all(&site_b).unwrap();
+    let bin_dir = dir.path().join("bin");
+    install_fake_cloudflared(&bin_dir, DYING_CLOUDFLARED);
+    let path_env = path_env_prepending(&bin_dir);
+    let site_a_arg = site_a.to_string_lossy().into_owned();
+
+    let fail_started = std::time::Instant::now();
+    let (ok_fail, out_fail) = run_ft_with_env(dir.path(), &[&site_a_arg], &[("PATH", &path_env)]);
+    let fail_elapsed = fail_started.elapsed();
+    assert!(
+        !ok_fail,
+        "a cloudflared dying before the URL must fail the start, got: {out_fail}"
+    );
+    assert!(
+        out_fail.contains("exited before the tunnel came up"),
+        "expected the fail-fast message, got: {out_fail}"
+    );
+    assert!(
+        out_fail.contains("fake cloudflared failed"),
+        "expected the fake's last log line surfaced as the inline reason, got: {out_fail}"
+    );
+    assert!(
+        fail_elapsed < std::time::Duration::from_secs(10),
+        "the dead-worker failure must be fail-fast, not a poll timeout, took {fail_elapsed:?}"
+    );
+    let after_fail = fs::read_to_string(registry_path(dir.path())).unwrap_or_default();
+    assert!(
+        !after_fail.contains("site-a"),
+        "the failed start must tear its reservation down, registry: {after_fail}"
+    );
+
+    install_fake_cloudflared(&bin_dir, DELAYED_PUBLISHING_CLOUDFLARED);
+    seed_registry(dir.path(), &registry_json(4_000_000, false, None));
+    let site_b_arg = site_b.to_string_lossy().into_owned();
+    let start_child = Command::new(ft_bin())
+        .arg(&site_b_arg)
+        .env("XDG_STATE_HOME", dir.path())
+        .env("RUST_LOG", "")
+        .env("PATH", &path_env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning the delayed start");
+    assert!(
+        wait_for_recorded_worker_pid(dir.path(), "site-b"),
+        "the start must reserve its entry and record the worker pid"
+    );
+    let (ok_prune, out_prune) = run_ft(dir.path(), &["prune"]);
+    let start_output = start_child
+        .wait_with_output()
+        .expect("waiting for the delayed start");
+    let ok_start = start_output.status.success();
+    let mut out_start = String::from_utf8_lossy(&start_output.stdout).into_owned();
+    out_start.push_str(&String::from_utf8_lossy(&start_output.stderr));
+    let registry_at_start = fs::read_to_string(registry_path(dir.path())).unwrap_or_default();
+    let worker_pid = json_u64_field(&registry_at_start, "worker_pid").unwrap_or(0);
+    let worker_live_at_start =
+        process_alive_zombie_aware(u32::try_from(worker_pid).unwrap_or(u32::MAX));
+    let (ok_kill, out_kill) = run_ft(dir.path(), &["kill", "site-b"]);
+
+    assert!(
+        ok_prune && out_prune.contains("Pruned 1 stale service"),
+        "a concurrent registry rewrite (prune) must not disturb the start, got: {out_prune}"
+    );
+    assert!(
+        ok_start,
+        "a publishing cloudflared must start the service, got: {out_start}"
+    );
+    assert!(
+        out_start.contains("Started site-b"),
+        "expected the service name line, got: {out_start}"
+    );
+    assert!(
+        out_start.contains("Public:  https://fake-e2e-words.trycloudflare.com"),
+        "expected the discovered public URL in the start output, got: {out_start}"
+    );
+    assert!(
+        registry_at_start.contains("\"kind\":\"static\"")
+            && registry_at_start.contains("https://fake-e2e-words.trycloudflare.com"),
+        "expected the entry with its public URL, registry: {registry_at_start}"
+    );
+    assert!(
+        worker_pid > 1,
+        "the entry must record a real worker pid, registry: {registry_at_start}"
+    );
+    assert!(
+        worker_live_at_start,
+        "the recorded worker pid {worker_pid} must belong to a live process at start time"
+    );
+    assert!(ok_kill, "`ft kill site-b` failed: {out_kill}");
+    let after_kill = fs::read_to_string(registry_path(dir.path())).unwrap();
+    assert!(
+        after_kill.contains("\"services\":[]"),
+        "kill must empty the registry, got: {after_kill}"
+    );
+    assert!(
+        wait_for_process_death(u32::try_from(worker_pid).unwrap_or(u32::MAX)),
+        "worker pid {worker_pid} must be dead after `ft kill`"
+    );
+}
+
+#[test]
+fn run_publishes_the_tunnel_once_the_origin_accepts_and_kill_stops_the_whole_tree() {
+    let dir = TempDir::new().unwrap();
+    let bin_dir = dir.path().join("bin");
+    seed_registry(dir.path(), &registry_json(4_000_000, false, None));
+    install_fake_cloudflared(&bin_dir, DELAYED_PUBLISHING_CLOUDFLARED);
+    let path_env = path_env_prepending(&bin_dir);
+    let port = dead_loopback_port();
+    let port_arg = port.to_string();
+
+    let run_child = Command::new(ft_bin())
+        .args(["run", "--port", &port_arg, "--", "sleep", "30"])
+        .env("XDG_STATE_HOME", dir.path())
+        .env("RUST_LOG", "")
+        .env("PATH", &path_env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning the delayed run");
+    assert!(
+        wait_for_registry_entry(dir.path(), "\"kind\":\"run\""),
+        "the run must reserve its entry"
+    );
+    let origin = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).expect("bind the origin port");
+    assert!(
+        wait_for_port_accept(port),
+        "the origin must be accepting before the URL lands"
+    );
+    let (ok_prune, out_prune) = run_ft(dir.path(), &["prune"]);
+    let run_output = run_child
+        .wait_with_output()
+        .expect("waiting for the delayed run");
+    let ok = run_output.status.success();
+    let mut out = String::from_utf8_lossy(&run_output.stdout).into_owned();
+    out.push_str(&String::from_utf8_lossy(&run_output.stderr));
+    let registry_at_start = fs::read_to_string(registry_path(dir.path())).unwrap_or_default();
+    let worker_pid = json_u64_field(&registry_at_start, "worker_pid").unwrap_or(0);
+    let command_pid = json_u64_field(&registry_at_start, "command_pid").unwrap_or(0);
+    let tunnel_pid = json_u64_field(&registry_at_start, "tunnel_pid").unwrap_or(0);
+    let name = json_str_field(&registry_at_start, "name").unwrap_or_default();
+    let worker_live_at_start =
+        process_alive_zombie_aware(u32::try_from(worker_pid).unwrap_or(u32::MAX));
+    let (ok_kill, out_kill) = run_ft(dir.path(), &["kill", &name]);
+
+    assert!(
+        ok_prune && out_prune.contains("Pruned 1 stale service"),
+        "a concurrent registry rewrite (prune) must not disturb the run, got: {out_prune}"
+    );
+    assert!(
+        ok,
+        "the run must succeed once the origin accepts, got: {out}"
+    );
+    assert!(
+        out.contains("https://fake-e2e-words.trycloudflare.com"),
+        "expected the fake tunnel URL in the run output, got: {out}"
+    );
+    assert!(
+        registry_at_start.contains("\"kind\":\"run\"")
+            && registry_at_start.contains("https://fake-e2e-words.trycloudflare.com"),
+        "expected a run-kind entry with its public URL, registry: {registry_at_start}"
+    );
+    assert!(
+        worker_pid > 1,
+        "the entry must record the worker pid, registry: {registry_at_start}"
+    );
+    assert!(
+        worker_live_at_start,
+        "the recorded worker pid {worker_pid} must belong to a live process at start time"
+    );
+    assert!(
+        command_pid > 0,
+        "the entry must record the spawned command pid, registry: {registry_at_start}"
+    );
+    assert!(
+        tunnel_pid > 0,
+        "the entry must record the tunnel pid, registry: {registry_at_start}"
+    );
+    assert!(ok_kill, "`ft kill {name}` failed: {out_kill}");
+    let after_kill = fs::read_to_string(registry_path(dir.path())).unwrap();
+    assert!(
+        after_kill.contains("\"services\":[]"),
+        "kill must empty the registry, got: {after_kill}"
+    );
+    assert!(
+        wait_for_process_death(u32::try_from(worker_pid).unwrap_or(u32::MAX)),
+        "worker pid {worker_pid} must be dead after `ft kill`"
+    );
+    drop(origin);
+    assert!(
+        wait_for_port_refusal(port),
+        "the command's origin port must stop accepting after `ft kill`"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn start_answering_no_to_the_sensitive_prompt_aborts_without_publishing() {
+    let dir = TempDir::new().unwrap();
+    let bin_dir = dir.path().join("bin");
+    install_fake_cloudflared(&bin_dir, PUBLISHING_CLOUDFLARED);
+    let path_env = path_env_prepending(&bin_dir);
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let ft_arg = ft_bin().to_string_lossy().into_owned();
+    let home_arg = home.to_string_lossy().into_owned();
+
+    let mut script = Command::new("script");
+    if cfg!(target_os = "macos") {
+        script.args(["-q", "/dev/null"]).arg(&ft_arg).arg(&home_arg);
+    } else {
+        script
+            .arg("-qec")
+            .arg(format!("'{ft_arg}' '{home_arg}'"))
+            .arg("/dev/null");
+    }
+    let mut child = script
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", dir.path())
+        .env("RUST_LOG", "")
+        .env("PATH", &path_env)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning the pty session");
+    let mut stdin = child.stdin.take().expect("the pty session's stdin");
+    let _ = stdin.write_all(b"n\n");
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .expect("waiting for the pty session");
+    let mut pty_out = String::from_utf8_lossy(&output.stdout).into_owned();
+    pty_out.push_str(&String::from_utf8_lossy(&output.stderr));
+
+    let seeded = fs::read_to_string(registry_path(dir.path())).unwrap_or_default();
+    if let Some(name) = json_str_field(&seeded, "name") {
+        let _ = run_ft(dir.path(), &["kill", &name]);
+    }
+
+    assert!(
+        !output.status.success(),
+        "answering n to the sensitive prompt must abort the start, got: {pty_out}"
+    );
+    assert!(
+        pty_out.contains("Proceed? [y/N]"),
+        "the pty must deliver the interactive prompt, got: {pty_out}"
+    );
+    assert!(
+        pty_out.contains("aborted"),
+        "expected the abort notice, got: {pty_out}"
+    );
+    assert!(
+        !registry_path(dir.path()).exists(),
+        "an aborted start must not create a registry"
+    );
+}
+
+#[test]
+fn open_refuses_a_tampered_public_url() {
+    let dir = TempDir::new().unwrap();
+    seed_registry(
+        dir.path(),
+        &registry_json(4_000_000, false, Some("https://evil.example.com")),
+    );
+
+    let (ok, out) = run_ft(dir.path(), &["open", "seed-svc"]);
+    assert!(!ok, "a tampered public URL must fail `ft open`, got: {out}");
+    assert!(
+        out.contains("malformed public URL"),
+        "expected the malformed-URL refusal, got: {out}"
+    );
+    assert!(
+        !out.contains("evil.example.com"),
+        "the tampered URL must never be printed as opened, got: {out}"
+    );
+}
+
+#[test]
+fn logs_prints_each_tail_with_the_missing_notice_and_follows_appends() {
+    use std::io::BufRead;
+
+    let dir = TempDir::new().unwrap();
+    seed_registry(dir.path(), &registry_json(4_000_000, false, None));
+    let svc = dir.path().join("freeoxide/tunnel/services/seed-svc");
+    fs::create_dir_all(&svc).unwrap();
+    let mut tunnel_body = String::from("tunnel-first-line-marker\n");
+    let mut line_no = 0;
+    while tunnel_body.len() < 100 * 1024 {
+        line_no += 1;
+        tunnel_body.push_str(&format!("tunnel-line-{line_no:06}\n"));
+    }
+    tunnel_body.push_str("tunnel-final-line-marker\n");
+    fs::write(svc.join("tunnel.log"), &tunnel_body).unwrap();
+
+    let (ok, out) = run_ft(dir.path(), &["logs", "seed-svc"]);
+    assert!(ok, "`ft logs seed-svc` failed: {out}");
+    assert!(
+        out.contains("--- tunnel ---"),
+        "expected the tunnel section header, got: {out}"
+    );
+    assert!(
+        out.contains("tunnel-final-line-marker"),
+        "expected the log's last line tailed, got: {out}"
+    );
+    assert!(
+        !out.contains("tunnel-first-line-marker"),
+        "a 100 KiB log's first line must fall outside the tail window, got: {out}"
+    );
+    assert!(
+        out.contains("(no worker.log yet)"),
+        "expected the missing worker.log notice, got: {out}"
+    );
+
+    fs::create_dir_all(svc.join("worker.log")).unwrap();
+    let (ok_dir, out_dir) = run_ft(dir.path(), &["logs", "seed-svc"]);
+    assert!(
+        !ok_dir,
+        "a directory at the worker.log path must fail `ft logs`, got: {out_dir}"
+    );
+    assert!(
+        out_dir.contains("reading log file"),
+        "expected the read failure surfaced, got: {out_dir}"
+    );
+    assert!(
+        !out_dir.contains("(no worker.log yet)"),
+        "a directory must not be confused with an absent log, got: {out_dir}"
+    );
+    fs::remove_dir(svc.join("worker.log")).unwrap();
+
+    let mut child = Command::new(ft_bin())
+        .args(["logs", "seed-svc", "-f"])
+        .env("XDG_STATE_HOME", dir.path())
+        .env("RUST_LOG", "")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning `ft logs seed-svc -f`");
+    let stdout = child.stdout.take().expect("the followed logs stdout");
+    let seen = Arc::new(Mutex::new(String::new()));
+    let reader_seen = Arc::clone(&seen);
+    let reader = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            match line {
+                Ok(l) => reader_seen.lock().unwrap().push_str(&l),
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut reached_follow = false;
+    let tail_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < tail_deadline {
+        if seen.lock().unwrap().contains("(no worker.log yet)") {
+            reached_follow = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let mut tunnel_log = fs::OpenOptions::new()
+        .append(true)
+        .open(svc.join("tunnel.log"))
+        .unwrap();
+    tunnel_log.write_all(b"a-late-appended-line\n").unwrap();
+    drop(tunnel_log);
+
+    let mut followed = false;
+    let follow_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < follow_deadline {
+        if seen.lock().unwrap().contains("a-late-appended-line") {
+            followed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader.join();
+
+    assert!(
+        reached_follow,
+        "the followed child never finished its initial tails, stdout so far: {}",
+        seen.lock().unwrap()
+    );
+    assert!(
+        followed,
+        "an appended tunnel.log line must arrive on the followed stdout, stdout so far: {}",
+        seen.lock().unwrap()
+    );
+}
+
+fn wait_for_cmdline_token(pid: u32, token: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut last_seen = String::from("`ps` has not completed a poll yet");
+    while std::time::Instant::now() < deadline {
+        let poll = Command::new("ps")
+            .arg("-o")
+            .arg("command=")
+            .arg("-p")
+            .arg(pid.to_string())
+            .output();
+        match poll {
+            Ok(out) => {
+                let command = String::from_utf8_lossy(&out.stdout).into_owned();
+                if command.contains(token) {
+                    return;
+                }
+                last_seen = format!("`ps` reports {command:?}");
+            }
+            Err(e) => last_seen = format!("`ps` itself failed to run: {e}"),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("decoy never became probe-ready for pid {pid}: {last_seen}");
+}
+
+struct RunWorkerGroupDecoy {
+    child: std::process::Child,
+}
+
+impl RunWorkerGroupDecoy {
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Drop for RunWorkerGroupDecoy {
+    fn drop(&mut self) {
+        let pgid = self.child.id();
+        let _ = Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill -9 -{pgid}"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_run_worker_group() -> RunWorkerGroupDecoy {
+    use std::os::unix::process::CommandExt;
+    let child = Command::new("sh")
+        .args(["-c", "while :; do sleep 30; done", "run-worker"])
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning decoy run-worker group");
+    let decoy = RunWorkerGroupDecoy { child };
+    wait_for_cmdline_token(decoy.pid(), "run-worker");
+    decoy
+}
+
+fn wait_for_decoy_exit(child: &mut std::process::Child) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if child.try_wait().expect("try_wait the decoy").is_some() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    child.try_wait().expect("try_wait the decoy").is_some()
+}
+
+#[test]
+fn kill_and_sanitize_tear_down_a_live_run_worker_group() {
+    let dir_a = TempDir::new().unwrap();
+    let mut decoy_a = spawn_run_worker_group();
+    seed_registry(
+        dir_a.path(),
+        &registry_json(decoy_a.pid(), false, Some("https://x.trycloudflare.com")),
+    );
+
+    let (ok_kill, out_kill) = run_ft(dir_a.path(), &["kill", "seed-svc"]);
+    let kill_reaped = wait_for_decoy_exit(&mut decoy_a.child);
+    let after_kill = fs::read_to_string(registry_path(dir_a.path())).unwrap_or_default();
+
+    assert!(ok_kill, "`ft kill seed-svc` failed: {out_kill}");
+    assert!(
+        out_kill.contains("Stopped seed-svc."),
+        "expected the live worker's stopped message, got: {out_kill}"
+    );
+    assert!(
+        kill_reaped,
+        "`ft kill` must tear down the live run-worker group (pid {})",
+        decoy_a.pid()
+    );
+    assert!(
+        !after_kill.contains("seed-svc"),
+        "kill must remove the entry, registry: {after_kill}"
+    );
+
+    let dir_b = TempDir::new().unwrap();
+    let mut decoy_b = spawn_run_worker_group();
+    let port = dead_loopback_port();
+    let body = format!(
+        r#"{{
+  "next_id": 2,
+  "services": [
+    {{
+      "id": 1,
+      "name": "seed-run",
+      "kind": "run",
+      "dir": null,
+      "port": {port},
+      "local_url": "http://127.0.0.1:{port}",
+      "public_url": "https://x.trycloudflare.com",
+      "worker_pid": {worker_pid},
+      "tunnel_pid": null,
+      "created_at": "2026-07-21T00:00:00Z",
+      "state_dir": "/tmp/seed-run-state",
+      "foreground": false
+    }}
+  ]
+}}"#,
+        worker_pid = decoy_b.pid()
+    );
+    seed_registry(dir_b.path(), &body);
+
+    let (ok_sanitize, out_sanitize) = run_ft(dir_b.path(), &["sanitize"]);
+    let sanitize_reaped = wait_for_decoy_exit(&mut decoy_b.child);
+    let after_sanitize = fs::read_to_string(registry_path(dir_b.path())).unwrap_or_default();
+
+    assert!(ok_sanitize, "`ft sanitize` failed: {out_sanitize}");
+    assert!(
+        out_sanitize.contains(&format!("- seed-run (upstream 127.0.0.1:{port} is dead")),
+        "expected the zombie bullet naming the dead upstream, got: {out_sanitize}"
+    );
+    assert!(
+        sanitize_reaped,
+        "`ft sanitize` must tear down the live run-worker group (pid {})",
+        decoy_b.pid()
+    );
+    assert!(
+        !after_sanitize.contains("seed-run"),
+        "sanitize must remove the zombie entry, registry: {after_sanitize}"
     );
 }

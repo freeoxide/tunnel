@@ -61,11 +61,9 @@ impl ServiceKind {
     }
 }
 
-/// Static-origin flags (`ft <dir> --spa/--cors/--token`), carried on the
-/// entry so the detached worker re-applies them — NOT the worker argv, which
-/// would put the `token` secret in `ps` output. Meaningless for non-Static
-/// kinds (the CLI only accepts them on the implicit START). Normative
-/// semantics: `static_server`'s module docs.
+/// Static-origin flags (`ft <dir> --spa/--cors/--token`), persisted on the entry
+/// for the detached worker to re-apply — NOT the worker argv, which would put
+/// the `token` in `ps`. Applied by `static_server::router_with`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StaticFlags {
@@ -126,11 +124,9 @@ pub struct Service {
     pub foreground: bool,
 }
 
-/// How long a pid-0 reserved entry is protected from `ft kill`/`ft prune` —
-/// during the reserve→spawn→record window there is nothing safe to signal
-/// (reaping would orphan the just-spawned worker); every live start resolves
-/// the window in milliseconds, so 60 s cleanly separates it from an abandoned
-/// reservation (parent died mid-start).
+/// How long a pid-0 reserved entry is protected from `ft kill`/`ft prune`:
+/// reaping inside the reserve→spawn→record window would orphan the just-spawned
+/// worker. Live starts resolve in ms; 60 s bounds an abandoned reservation.
 pub const START_GRACE: Duration = Duration::from_secs(60);
 
 impl Service {
@@ -243,8 +239,6 @@ mod tests {
 
     #[test]
     fn legacy_entry_without_kind_deserializes_as_static() {
-        // A pre-proxy registry entry carries no `kind` and a plain `dir`;
-        // it must keep deserializing as a Static service, unchanged.
         let json = service_json(r#""dir": "/tmp/dir","#);
         let s: Service = serde_json::from_str(&json).expect("legacy entry must parse");
         assert_eq!(s.kind, ServiceKind::Static);
@@ -253,7 +247,6 @@ mod tests {
 
     #[test]
     fn explicit_kind_tags_deserialize() {
-        // Every on-disk kind tag round-trips; proxy/run/hook carry `dir: null`.
         let json = service_json(r#""kind": "static", "dir": "/tmp/dir","#);
         let s: Service = serde_json::from_str(&json).expect("explicit static must parse");
         assert_eq!(s.kind, ServiceKind::Static);
@@ -281,8 +274,6 @@ mod tests {
 
     #[test]
     fn proxy_entry_may_omit_dir_entirely() {
-        // `dir` is serde-defaulted, so a hand-written proxy entry without a
-        // `dir` key is accepted (and reads back as None).
         let json = service_json(r#""kind": "proxy","#);
         let s: Service = serde_json::from_str(&json).expect("dir-less proxy must parse");
         assert_eq!(s.kind, ServiceKind::Proxy);
@@ -291,8 +282,6 @@ mod tests {
 
     #[test]
     fn proxy_service_round_trips_through_json() {
-        // A proxy service (dir: None) must survive a serialize → deserialize
-        // cycle field-for-field, including the `kind` tag and null `dir`.
         let s = Service {
             kind: ServiceKind::Proxy,
             dir: None,
@@ -305,7 +294,6 @@ mod tests {
 
     #[test]
     fn run_service_round_trips_through_json() {
-        // dir: None plus the command child's recorded pid must round-trip.
         let s = Service {
             kind: ServiceKind::Run,
             dir: None,
@@ -319,7 +307,6 @@ mod tests {
 
     #[test]
     fn hook_service_round_trips_through_json() {
-        // A hook service (dir: None, no command child) must round-trip.
         let s = Service {
             kind: ServiceKind::Hook,
             dir: None,
@@ -332,8 +319,6 @@ mod tests {
 
     #[test]
     fn drop_service_round_trips_through_json() {
-        // dir: Some (the upload target). The token is NOT registry state — it
-        // lives in the service's private token file.
         let s = Service {
             kind: ServiceKind::Drop,
             dir: Some(PathBuf::from("/tmp/inbox")),
@@ -346,8 +331,6 @@ mod tests {
 
     #[test]
     fn omitted_command_pid_deserializes_as_none() {
-        // serde-defaulted: pre-run registries and non-run entries read as
-        // "no command child", never fail the parse.
         let json = service_json(r#""kind": "proxy", "dir": null,"#);
         let s: Service = serde_json::from_str(&json).expect("entry without command_pid");
         assert_eq!(s.command_pid, None);
@@ -355,8 +338,6 @@ mod tests {
 
     #[test]
     fn omitted_static_flags_deserialize_as_all_off() {
-        // serde-defaulted: pre-flag registries read as all flags off, never
-        // fail the parse.
         let json = service_json(r#""kind": "static", "dir": "/tmp/dir","#);
         let s: Service = serde_json::from_str(&json).expect("entry without static_flags");
         assert_eq!(s.static_flags, StaticFlags::default());
@@ -367,8 +348,6 @@ mod tests {
 
     #[test]
     fn static_flags_round_trip_through_json() {
-        // The flags ARE the persistence story: the detached worker re-applies
-        // exactly these values (token included) from the reloaded entry.
         let s = Service {
             static_flags: StaticFlags {
                 spa: true,
@@ -384,8 +363,6 @@ mod tests {
 
     #[test]
     fn explicit_static_flags_json_deserializes() {
-        // The on-disk shape a flagged start reserves; partial objects work too
-        // (container-level serde default).
         let json = service_json(
             r#""kind": "static", "dir": "/tmp/dir",
             "static_flags": {"spa": true, "cors": false, "token": "s"},"#,
@@ -405,8 +382,6 @@ mod tests {
 
     #[test]
     fn kind_as_str_matches_serde_tags() {
-        // `as_str` is the human/CLI rendering and must agree with the on-disk
-        // serde tag for each variant.
         assert_eq!(ServiceKind::Static.as_str(), "static");
         assert_eq!(ServiceKind::Proxy.as_str(), "proxy");
         assert_eq!(ServiceKind::Run.as_str(), "run");
@@ -432,8 +407,6 @@ mod tests {
 
     #[test]
     fn status_starting_when_worker_pid_zero() {
-        // Even with a public_url present, a zero worker_pid reads as Starting
-        // (no filesystem probe involved).
         assert_eq!(
             service(0, Some("https://example.trycloudflare.com"), false).status(),
             ServiceStatus::Starting
@@ -455,8 +428,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn status_foreground_running_when_alive() {
-        // A FOREGROUND service whose worker_pid is this process: process_exists
-        // (signal-0) reads true, and with a public_url it is Running.
         let me = std::process::id();
         assert_eq!(
             service(me, Some("https://example.trycloudflare.com"), true).status(),
@@ -474,8 +445,6 @@ mod tests {
             ServiceStatus::Stale
         );
     }
-
-    // --- the reserve→spawn→record protection window --------------------------
 
     #[test]
     fn start_in_progress_true_for_fresh_reservation() {

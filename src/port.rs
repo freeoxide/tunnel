@@ -5,8 +5,6 @@ use anyhow::Context;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-/// Loopback connect-probe bound: the local kernel answers almost instantly,
-/// so this only bounds pathological stacks; nothing is read from the socket.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Bind `127.0.0.1:0` for an OS-picked port. Inherent TOCTOU: if it is taken
@@ -21,14 +19,8 @@ pub fn allocate_free_port() -> Result<u16> {
 }
 
 /// True if the port appears free on localhost: connect; "refused" = free,
-/// anything else (accepted, timeout, unreachable) = occupied.
-///
-/// Connect-based on purpose: a just-stopped server's port sits in TIME_WAIT
-/// where a plain bind fails EADDRINUSE though nothing serves — nothing
-/// ACCEPTS either, so the probe reads it free and a dev server (which sets
-/// SO_REUSEADDR itself) can rebind. SO_REUSEADDR as the probe was rejected:
-/// on Windows it permits binding over a LIVE listener (hijack hazard). Port
-/// 0 stays free so the worker's dedicated "reserved" bail is what fires.
+/// anything else = occupied. Connect-based so TIME_WAIT ports read free for a
+/// rebinding SO_REUSEADDR server; on Windows that flag binds over LIVE listeners.
 pub fn is_port_free(port: u16) -> bool {
     if port == 0 {
         return true;
@@ -73,8 +65,6 @@ mod tests {
         let port = listener.local_addr().expect("local_addr").port();
         let client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
         let accepted = listener.accept().expect("accept").0;
-        // Drop order is the point: the server's active close while the client
-        // is still open drives the server endpoint into TIME_WAIT.
         drop(listener);
         drop(accepted);
         drop(client);

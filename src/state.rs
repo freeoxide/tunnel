@@ -62,7 +62,6 @@ impl StateDir {
     /// Create the tree, owner-only (0700) — registry/logs must not be
     /// others-readable; pre-existing dirs are re-sealed.
     pub fn ensure(&self) -> Result<()> {
-        // Plain recursive create on Windows: the profile-dir ACL suffices.
         crate::fsutil::ensure_private_dir(self.services_dir())
             .with_context(|| format!("creating state directory {}", self.root.display()))?;
         #[cfg(unix)]
@@ -79,15 +78,12 @@ impl StateDir {
     /// and return it. Holds that service's `worker.log`/`server.log`/`tunnel.log`.
     pub fn ensure_service_dir(&self, name: &str) -> Result<PathBuf> {
         let dir = self.service_dir(name);
-        // Owner-only (0700) on Unix; plain create on Windows.
         crate::fsutil::ensure_private_dir(&dir)
             .with_context(|| format!("creating service directory for '{name}'"))?;
         Ok(dir)
     }
 }
 
-/// The XDG state base (`$XDG_STATE_HOME`, else `~/.local/state`); a relative
-/// value is made absolute so the tree lives at a stable location.
 fn state_base() -> Result<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_STATE_HOME").filter(|s| !s.is_empty()) {
         let p = PathBuf::from(xdg);
@@ -127,7 +123,6 @@ mod tests {
 
     #[test]
     fn safe_component_neutralizes_traversal() {
-        // `.` and `/` both become `-`; leading dashes are not trimmed.
         assert_eq!(safe_component("../etc"), "---etc");
     }
 
