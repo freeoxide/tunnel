@@ -2294,7 +2294,7 @@ fn start_answering_no_to_the_sensitive_prompt_aborts_without_publishing() {
     } else {
         script
             .arg("-qec")
-            .arg(format!("'{}' '{}'", ft_arg, home_arg))
+            .arg(format!("'{ft_arg}' '{home_arg}'"))
             .arg("/dev/null");
     }
     let mut child = script

@@ -892,9 +892,22 @@ mod tests {
         );
 
         let mut stubborn = spawn_group_decoy(
-            "trap '' TERM; while :; do sleep 30; done",
+            "trap '' TERM; echo ready; while :; do sleep 30; done",
             Some("run-worker"),
         );
+        {
+            use std::io::BufRead;
+            let stdout = stubborn
+                .child
+                .stdout
+                .take()
+                .expect("the stubborn decoy stdout must be piped");
+            let mut line = String::new();
+            std::io::BufReader::new(stdout)
+                .read_line(&mut line)
+                .expect("the stubborn decoy must announce its trap");
+            assert_eq!(line.trim(), "ready");
+        }
         let escalated = std::time::Instant::now();
         tokio::time::timeout(BOUND, shutdown_process_group(stubborn.pid()))
             .await
