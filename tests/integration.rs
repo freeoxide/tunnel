@@ -2173,7 +2173,7 @@ fn start_fails_fast_when_cloudflared_dies_first_and_publishes_when_the_url_lands
 }
 
 #[test]
-fn run_publishes_the_tunnel_once_the_command_listens_and_kill_stops_the_whole_tree() {
+fn run_publishes_the_tunnel_once_the_origin_accepts_and_kill_stops_the_whole_tree() {
     let dir = TempDir::new().unwrap();
     let bin_dir = dir.path().join("bin");
     seed_registry(dir.path(), &registry_json(4_000_000, false, None));
@@ -2183,18 +2183,7 @@ fn run_publishes_the_tunnel_once_the_command_listens_and_kill_stops_the_whole_tr
     let port_arg = port.to_string();
 
     let run_child = Command::new(ft_bin())
-        .args([
-            "run",
-            "--port",
-            &port_arg,
-            "--",
-            "python3",
-            "-m",
-            "http.server",
-            &port_arg,
-            "--bind",
-            "127.0.0.1",
-        ])
+        .args(["run", "--port", &port_arg, "--", "sleep", "30"])
         .env("XDG_STATE_HOME", dir.path())
         .env("RUST_LOG", "")
         .env("PATH", &path_env)
@@ -2207,9 +2196,10 @@ fn run_publishes_the_tunnel_once_the_command_listens_and_kill_stops_the_whole_tr
         wait_for_registry_entry(dir.path(), "\"kind\":\"run\""),
         "the run must reserve its entry"
     );
+    let origin = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).expect("bind the origin port");
     assert!(
         wait_for_port_accept(port),
-        "the command must be listening on its port before the URL lands"
+        "the origin must be accepting before the URL lands"
     );
     let (ok_prune, out_prune) = run_ft(dir.path(), &["prune"]);
     let run_output = run_child
@@ -2233,7 +2223,7 @@ fn run_publishes_the_tunnel_once_the_command_listens_and_kill_stops_the_whole_tr
     );
     assert!(
         ok,
-        "the run must succeed once the command listens on its port, got: {out}"
+        "the run must succeed once the origin accepts, got: {out}"
     );
     assert!(
         out.contains("https://fake-e2e-words.trycloudflare.com"),
@@ -2270,6 +2260,7 @@ fn run_publishes_the_tunnel_once_the_command_listens_and_kill_stops_the_whole_tr
         wait_for_process_death(u32::try_from(worker_pid).unwrap_or(u32::MAX)),
         "worker pid {worker_pid} must be dead after `ft kill`"
     );
+    drop(origin);
     assert!(
         wait_for_port_refusal(port),
         "the command's origin port must stop accepting after `ft kill`"
