@@ -24,13 +24,9 @@ fn classify(reg: &mut Registry) -> Reconciliation {
                 !proc::pid_alive(s.worker_pid)
             }
         } else {
-            // Reserved but never recorded: kept inside the start grace
-            // (reaping mid-window would orphan the worker), pruned after.
             !s.start_in_progress()
         };
         if is_stale {
-            // Best-effort reap of an orphaned cloudflared, gated on cmdline
-            // identity so a recycled PID is never signalled (the call is in run()).
             if let Some(tpid) = s.tunnel_pid
                 && proc::pid_matches(tpid, "cloudflared")
             {
@@ -41,8 +37,6 @@ fn classify(reg: &mut Registry) -> Reconciliation {
             keep.push(s);
         }
     }
-    // Write the kept set back so `Registry::update` saves the reconciled
-    // registry (the stale ones were consumed and never re-added).
     reg.services = keep;
     Reconciliation {
         stale_names,
@@ -75,9 +69,6 @@ pub async fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    //! [`classify`] is pure w.r.t. signalling — the rules are asserted against
-    //! a seeded registry without sending signals.
-
     use super::*;
     use crate::model::Service;
     use chrono::TimeDelta;
@@ -133,8 +124,6 @@ mod tests {
 
     #[test]
     fn background_self_pid_without_run_worker_is_stale() {
-        // Our own process's cmdline lacks `run-worker`, so pid_alive is false
-        // -> a background entry pointing at us is stale (PID-reuse safe).
         let mut reg = Registry::default();
         let mut s = dummy_service(1, "bg");
         s.worker_pid = live_self_pid();
@@ -149,7 +138,7 @@ mod tests {
         let mut reg = Registry::default();
         let mut s = dummy_service(1, "bg-orphan");
         s.worker_pid = live_self_pid();
-        s.tunnel_pid = Some(4_242_424); // a pid that is definitely not cloudflared
+        s.tunnel_pid = Some(4_242_424);
         reg.services.push(s);
         let rec = classify(&mut reg);
         assert_eq!(rec.stale_names, vec!["bg-orphan".to_string()]);
@@ -158,8 +147,6 @@ mod tests {
 
     #[test]
     fn foreground_self_pid_without_flag_is_stale() {
-        // The test binary's cmdline lacks `--foreground`, so the identity
-        // probe reads false — a foreign pid at a foreground slot is pruned.
         let mut reg = Registry::default();
         let mut s = dummy_service(1, "fg");
         s.foreground = true;
@@ -174,7 +161,7 @@ mod tests {
         let mut reg = Registry::default();
         let mut s = dummy_service(1, "fg-dead");
         s.foreground = true;
-        s.worker_pid = 999_999; // almost certainly not running
+        s.worker_pid = 999_999;
         reg.services.push(s);
         let rec = classify(&mut reg);
         assert_eq!(rec.stale_names, vec!["fg-dead".to_string()]);

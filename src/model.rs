@@ -1,5 +1,3 @@
-//! Core data model: services, their lifecycle, and the on-disk registry.
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -218,8 +216,6 @@ mod tests {
         }
     }
 
-    /// A minimal JSON service body covering every non-defaulted field, used
-    /// to pin the serde contract (`kind` tag names, `dir` nullability).
     fn service_json(extra: &str) -> String {
         format!(
             r#"{{
@@ -438,8 +434,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn status_foreground_stale_when_pid_gone() {
-        // A foreground service whose pid no longer exists reads Stale. 4_000_000
-        // is far outside any real pid namespace on a test host.
         assert_eq!(
             service(4_000_000, None, true).status(),
             ServiceStatus::Stale
@@ -448,15 +442,11 @@ mod tests {
 
     #[test]
     fn start_in_progress_true_for_fresh_reservation() {
-        // A just-reserved entry (pid not yet recorded) is inside the protected
-        // window: reaping it now would orphan the just-spawned worker.
         assert!(service(0, None, false).start_in_progress());
     }
 
     #[test]
     fn start_in_progress_false_once_grace_expires() {
-        // An unrecorded pid past START_GRACE is an abandoned reservation (the
-        // parent died mid-start) — no longer protected.
         let mut s = service(0, None, false);
         s.created_at = now_utc()
             - (TimeDelta::from_std(START_GRACE).expect("grace fits") + TimeDelta::seconds(1));
@@ -465,8 +455,6 @@ mod tests {
 
     #[test]
     fn start_in_progress_false_once_pid_recorded() {
-        // The window ends the moment the real pid lands, regardless of age —
-        // a recorded pid gets the normal liveness semantics instead.
         assert!(!service(123_456, None, false).start_in_progress());
     }
 }

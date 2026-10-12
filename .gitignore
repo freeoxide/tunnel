@@ -34,5 +34,8 @@ target
 # ZCode proflow orchestration state (session scratch, never committed)
 /.z-proflow/
 
+# ZCode flashflow orchestration state (session scratch, never committed)
+.z-flashflow/
+
 # Python bytecode from the bench harness (benches/sanitize_median.py)
 __pycache__/

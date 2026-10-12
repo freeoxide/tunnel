@@ -25,16 +25,12 @@ use crate::server::static_server::{escape_html, html_page};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Recorded-body cap; enforced twice (the limit layer's 413 and the
-/// capture's own truncation) — see [`record`] for why both.
 const MAX_REQUEST_BODY: usize = 64 * 1024;
 
 /// Default retention; `ft hook --keep <n>` overrides (1..=1000). u16 because
 /// that is what the worker argv carries.
 pub(crate) const DEFAULT_KEEP: u16 = 200;
 
-/// Max accepted `--keep`; the read ceiling is computed at this max so it
-/// never depends on the loading keep ([`HookLog::load`] clamps to it).
 const MAX_KEEP: usize = 1000;
 
 /// The per-service store, a sibling of the logs so `ft logs` stays coherent.
@@ -44,8 +40,6 @@ const INSPECT_PATH: &str = "/__inspect";
 
 const JSON_PATH: &str = "/__inspect.json";
 
-/// An ALLOWLIST, not a denylist: only known-debugging headers are copied, so
-/// a future credential-bearing header cannot leak by being forgotten.
 const RECORDED_HEADERS: &[&str] = &[
     "accept",
     "content-length",
@@ -128,25 +122,14 @@ struct Window {
     file_len: u64,
 }
 
-/// Worst-case JSON expansion of one body byte (`\u00XX` = 6). NUL bodies are
-/// legitimate UTF-8, so the read bound MUST budget this — an escape-unaware
-/// bound wipes such stores on reload: remotely triggerable record loss.
 const JSON_ESCAPE_FACTOR: usize = 6;
 
-/// hyper's whole-wire head budget (8 KiB + 4 KiB × 100 headers — hyper's
-/// DEFAULT_MAX_BUFFER_SIZE, proto/h1/io.rs); capture truncates no head
-/// material, so the read bound needs it; it must grow with hyper's default.
 const HYPER_HEAD_BUDGET: usize = 417_792;
 
-/// Per-record head allowance: [`HYPER_HEAD_BUDGET`] × 2 — http admits raw
-/// `"`/`\` in heads and serde expands each 1→2 — plus 2 KiB structure;
-/// smaller would wipe legitimate stores on reload.
 const STORE_RECORD_OVERHEAD: usize = HYPER_HEAD_BUDGET * 2 + 2 * 1024;
 
 const MIN_TAIL_PAD: usize = 64 * 1024;
 
-/// Upper bound on a store this server could have written at `keep` records;
-/// saturating, u64 for [`read_store_blob`]'s `File::take`.
 fn store_read_bound(keep: usize) -> u64 {
     let per_record = (MAX_REQUEST_BODY * JSON_ESCAPE_FACTOR + STORE_RECORD_OVERHEAD) as u64;
     (keep as u64).saturating_mul(per_record)
@@ -157,8 +140,6 @@ fn absolute_read_bound() -> u64 {
     live + live / 2 + MIN_TAIL_PAD as u64 + 2
 }
 
-/// Read at most `bound + 1` bytes (the +1 tells at-the-bound from past-it);
-/// bounding the READ, not just the parse, so no stray huge file is slurped.
 fn read_store_blob(path: &Path, bound: u64, len_hint: u64) -> std::io::Result<Vec<u8>> {
     let file = File::open(path)?;
     let mut bytes = Vec::with_capacity(len_hint.min(bound.saturating_add(1)) as usize);
@@ -177,7 +158,6 @@ impl HookLog {
         let ceiling = absolute_read_bound();
         let mut window = None;
         let mut requests = match std::fs::metadata(&path) {
-            // Past the ceiling by metadata: refuse without reading a giant.
             Ok(m) if m.len() > ceiling => {
                 tracing::warn!(
                     path = %path.display(),
@@ -196,8 +176,6 @@ impl HookLog {
                         );
                         Vec::new()
                     }
-                    // Fatter than the loading keep allows but under the ceiling:
-                    // legitimate (written under a higher keep) — truncate below.
                     Ok(bytes) if !bytes.iter().all(u8::is_ascii_whitespace) => {
                         match serde_json::from_slice::<Vec<RecordedRequest>>(&bytes) {
                             Ok(parsed) => {
@@ -230,8 +208,6 @@ impl HookLog {
         requests.reverse();
         requests.sort_by_key(|r| std::cmp::Reverse(r.seq));
         requests.truncate(keep);
-        // Saturate: `+ 1` at a hand-edited u64::MAX would panic in debug and
-        // wrap in release, stamping the next record as the OLDEST.
         let next_seq = requests
             .first()
             .map(|r| r.seq.saturating_add(1))
@@ -309,8 +285,6 @@ impl HookLog {
         }
     }
 
-    /// Saturates like load (see the comment there); at saturation duplicate
-    /// seqs are unavoidable, but the stable sort keeps the order well-defined.
     fn next_seq(&mut self) -> u64 {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
@@ -324,7 +298,6 @@ impl HookLog {
         )
     }
 
-    /// Point-in-time copy, bounded by `keep` × the body cap.
     #[cfg(test)]
     fn snapshot(&mut self) -> Vec<RecordedRequest> {
         self.requests.iter().cloned().collect()
@@ -591,8 +564,6 @@ fn evict_at(
     Ok(())
 }
 
-/// Recover from poisoning: in-memory state stays valid across a panic
-/// (insert + truncate are infallible), so recording continues.
 fn lock(log: &Mutex<HookLog>) -> MutexGuard<'_, HookLog> {
     log.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -601,8 +572,6 @@ fn lock(log: &Mutex<HookLog>) -> MutexGuard<'_, HookLog> {
 /// IS the log — a trace would duplicate it into worker.log.
 pub fn router(log: Arc<Mutex<HookLog>>) -> Router {
     Router::new()
-        // The inspection routes are matched BEFORE the recording fallback, so
-        // they (and only they) never land in the store.
         .route(JSON_PATH, get(inspect_json))
         .route(INSPECT_PATH, get(inspect_html))
         .fallback(record)
@@ -618,8 +587,6 @@ pub fn router(log: Arc<Mutex<HookLog>>) -> Router {
         ))
 }
 
-/// Fallback handler: record, answer 200; a persist failure is a 500 so the
-/// sender can retry — never a silent "acknowledged but unwritten".
 async fn record(State(log): State<Arc<Mutex<HookLog>>>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
     // Second cap enforcement: the layer pre-rejects a DECLARED oversize
@@ -679,8 +646,6 @@ async fn inspect_html(State(log): State<Arc<Mutex<HookLog>>>) -> Html<String> {
     Html(html)
 }
 
-/// Every request-derived string passes through [`escape_html`] — webhook
-/// bodies are attacker-controlled by definition.
 fn render_inspection(requests: &[RecordedRequest]) -> String {
     let title = format!("Recorded requests — {}", requests.len());
     let mut body = String::from("<ul>\n");
@@ -752,8 +717,6 @@ async fn inspect_json(State(log): State<Arc<Mutex<HookLog>>>) -> Response {
 
 #[cfg(test)]
 mod tests {
-    //! Capture rules as pure units, then the full Router via tower::oneshot.
-
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
@@ -778,8 +741,6 @@ mod tests {
         crate::model::now_utc()
     }
 
-    /// Build a `Parts` head for [`RecordedRequest::capture`] without a full
-    /// request round-trip.
     fn parts(method: &str, uri: &str, headers: &[(&str, &str)]) -> Parts {
         let mut builder = Request::builder().method(method).uri(uri);
         for (name, value) in headers {
@@ -864,9 +825,6 @@ mod tests {
         );
     }
 
-    /// [`HYPER_HEAD_BUDGET`] mirrors hyper-1.10.1's DEFAULT_MAX_BUFFER_SIZE
-    /// (src/proto/h1/io.rs: 8 KiB + 4 KiB × 100, from DEFAULT_MAX_HEADERS =
-    /// 100); drifting low makes load() wipe legitimate stores as oversized.
     #[test]
     fn hyper_head_budget_is_pinned_to_hyper_1_10_wire_defaults() {
         let recomputed = 8 * 1024 + 4 * 1024 * 100;

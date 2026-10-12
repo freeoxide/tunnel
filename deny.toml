@@ -1,14 +1,8 @@
-# cargo-deny configuration. Run locally with: cargo deny check
-# (install: cargo install cargo-deny). The CI `supply-chain` job runs this.
-
 [advisories]
-# Fail on any crate with a known vulnerability. The DB is refreshed by the
-# weekly CI run, so new CVEs surface without a PR.
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
 
 [licenses]
-# Permissive licenses only; add an entry here if a new dependency needs one.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -26,16 +20,10 @@ allow = [
 confidence-threshold = 0.8
 
 [bans]
-# Warn (don't fail) on duplicate versions — common in a tokio/hyper graph and
-# often unactionable from a leaf crate.
 multiple-versions = "warn"
 wildcards = "deny"
 
 [sources]
-# crates.io, plus exactly one rev-pinned git source: the toride workspace
-# (freeoxide/toride), consumed for shared process/fs infrastructure. Every
-# toride dependency in Cargo.toml must pin a `rev` — a moving branch ref is
-# a supply-chain hole the rev pin exists to close.
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]

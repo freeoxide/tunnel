@@ -1,5 +1,3 @@
-//! Local port allocation helpers.
-
 use crate::error::Result;
 use anyhow::Context;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -59,8 +57,6 @@ mod tests {
 
     #[test]
     fn a_port_left_in_time_wait_by_a_just_stopped_server_reads_free() {
-        // Server closes first (active close), then the client — the port sits
-        // in TIME_WAIT with no listener; a restart must be allowed.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("local_addr").port();
         let client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");

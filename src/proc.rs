@@ -1,7 +1,3 @@
-//! Process introspection and signaling: cmdline-aware PID identity
-//! ([`pid_matches`]/[`pid_alive`]), needle-less liveness ([`process_exists`]),
-//! and group teardown (Unix SIGTERM→SIGKILL; Windows Job Objects).
-
 #[cfg(unix)]
 use nix::sys::signal::{Signal, kill};
 #[cfg(unix)]
@@ -16,8 +12,6 @@ pub(crate) fn spawn_command_child(
 ) -> crate::error::Result<Child> {
     use anyhow::Context;
 
-    // clap already refuses an empty `--` tail at the CLI layer; this is the
-    // defense-in-depth for direct internal callers.
     let Some((bin, args)) = command.split_first() else {
         anyhow::bail!("cannot spawn an empty command");
     };
@@ -78,8 +72,6 @@ pub(crate) fn spawn_wait_monitor(mut child: Child) -> tokio::task::JoinHandle<()
     })
 }
 
-/// Grace before a SIGTERM'd command child is SIGKILL'd (Unix). Slightly longer
-/// than cloudflared's: dev servers often flush state on TERM.
 #[cfg(unix)]
 const CHILD_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
@@ -117,8 +109,6 @@ pub(crate) async fn shutdown_child_command(
             let _ = kill(group, Signal::SIGKILL);
             let _ = (&mut *monitor).await;
         }
-        // On the Ok arm the timeout's await already reaped the child via the
-        // monitor — the handle is consumed and must NOT be polled again.
     }
     #[cfg(windows)]
     {
@@ -126,7 +116,6 @@ pub(crate) async fn shutdown_child_command(
         monitor.abort();
         let _ = monitor.await;
     }
-    // No terminate primitive on an unsupported target; still reap the monitor.
     #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
@@ -166,9 +155,8 @@ pub fn process_exists(pid: u32) -> bool {
 }
 
 #[cfg(windows)]
-#[allow(clippy::question_mark)] // these fns return bool, so `?` is not applicable
+#[allow(clippy::question_mark)]
 mod windows_proc {
-    //! Windows process primitives backed by `windows-sys`.
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_TIMEOUT};
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
@@ -177,8 +165,6 @@ mod windows_proc {
 
     const ACCESS: u32 = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE;
 
-    /// Open `pid` for query+terminate, returning a handle the caller must
-    /// `CloseHandle`. `None` if the process is gone or inaccessible.
     fn open(pid: u32) -> Option<HANDLE> {
         // SAFETY: `OpenProcess` only queries kernel state. Every call site
         // closes the returned handle before returning.
@@ -223,8 +209,6 @@ mod windows_proc {
         let want = match needle {
             "run-worker" | "--foreground" => "ft.exe",
             "cloudflared" => "cloudflared.exe",
-            // An unrecognized needle refuses rather than degrading to a
-            // liveness probe — no debug_assert!, cargo test runs this path.
             _ => return false,
         };
         image_path(pid).map(|p| p.ends_with(want)).unwrap_or(false)
@@ -334,8 +318,6 @@ mod windows_proc {
     }
 }
 
-// `terminate_child` stays private: its only caller is in this module, and an
-// unreferenced `pub use` warns on Windows (invisible to Linux gates).
 #[cfg(windows)]
 pub use windows_proc::{
     create_kill_on_close_job, pid_alive, pid_matches, process_exists, shutdown_process_group,
@@ -351,8 +333,6 @@ pub async fn shutdown_process_group(pgid: u32) {
     if pgid == 0 {
         return;
     }
-    // Recycled-pid guard: the pgid is the worker pid; a recycled leader lacks
-    // `run-worker` in its cmdline, so refuse to signal the wrong group.
     if !pid_matches(pgid, "run-worker") {
         tracing::debug!(
             "shutdown_process_group: pgid {} no longer matches run-worker; refusing to signal (recycled-pid guard)",
@@ -511,7 +491,6 @@ mod command_child_tests {
     use super::*;
     use std::ffi::OsString;
 
-    /// Env inheritance has no pure seam — proven through a real child.
     #[tokio::test]
     async fn command_child_receives_port_in_its_environment() {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
@@ -558,8 +537,6 @@ mod command_child_tests {
         );
     }
 
-    /// Signal 0 succeeds even for an unreaped zombie (a reparented
-    /// grandchild); on Linux /proc state `Z` reads dead instead.
     fn probe_alive(pid: u32) -> bool {
         if kill(Pid::from_raw(pid as i32), None).is_err() {
             return false;
@@ -578,8 +555,6 @@ mod command_child_tests {
         true
     }
 
-    /// The `npm run dev` -> vite shape: the child shell backgrounds `sleep`,
-    /// prints its pid, and waits; teardown must reach BOTH processes.
     #[tokio::test]
     async fn shutdown_child_command_kills_the_whole_group_including_a_grandchild() {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
@@ -631,14 +606,10 @@ mod command_child_tests {
     }
 }
 
-/// Placeholder-path tests — reachable on every target (static/proxy workers
-/// and non-run foreground take the same call, including on Windows).
 #[cfg(test)]
 mod command_shutdown_tests {
     use super::*;
 
-    /// An unconditional await on the placeholder would hang every non-Run
-    /// teardown; the timeout bound makes a regression fail, not hang.
     #[tokio::test]
     async fn pidless_placeholder_shutdown_completes_immediately() {
         const BOUND: std::time::Duration = std::time::Duration::from_secs(5);
@@ -659,8 +630,6 @@ mod command_shutdown_tests {
         );
     }
 
-    /// 4_000_000 is outside any real pid namespace, so any signal fails
-    /// harmlessly; pins the is_finished short-circuit with a live pid.
     #[tokio::test]
     async fn finished_monitor_shutdown_completes_immediately() {
         const BOUND: std::time::Duration = std::time::Duration::from_secs(5);
@@ -704,12 +673,9 @@ mod tests {
             .file_name()
             .and_then(|n| n.to_str())
             .expect("exe file name");
-        // The exec path is the first argv entry, so the name always appears.
         assert!(cmdline_contains(std::process::id(), needle));
     }
 
-    /// A live foreign process (cmdline matches neither needle) must be left
-    /// running; on non-needle-aware platforms the gate intentionally passes.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn terminate_helpers_refuse_a_foreign_pid() {
@@ -738,14 +704,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_argv_contains_ignores_environment() {
-        // Build a synthetic blob: [argc=2][execpath\0][pad][argv[0]\0][argv[1]\0][envv\0...]
         let mut blob = Vec::new();
-        blob.extend_from_slice(&2u32.to_le_bytes()); // argc = 2
-        blob.extend_from_slice(b"/usr/local/bin/cloudflared\0"); // execpath
-        blob.push(0); // alignment padding NUL
-        blob.extend_from_slice(b"/usr/local/bin/cloudflared\0"); // argv[0]
-        blob.extend_from_slice(b"tunnel\0"); // argv[1]
-        // Environment: contains "run-worker" to prove the parser stops before it.
+        blob.extend_from_slice(&2u32.to_le_bytes());
+        blob.extend_from_slice(b"/usr/local/bin/cloudflared\0");
+        blob.push(0);
+        blob.extend_from_slice(b"/usr/local/bin/cloudflared\0");
+        blob.extend_from_slice(b"tunnel\0");
         blob.extend_from_slice(b"FOO=run-worker\0");
         blob.extend_from_slice(b"BAR=baz\0");
 
@@ -758,9 +722,9 @@ mod tests {
     #[test]
     fn macos_argv_contains_substring_in_argv() {
         let mut blob = Vec::new();
-        blob.extend_from_slice(&1u32.to_le_bytes()); // argc = 1
-        blob.extend_from_slice(b"/ft\0"); // execpath
-        blob.extend_from_slice(b"ft run-worker --foreground\0"); // argv[0]
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        blob.extend_from_slice(b"/ft\0");
+        blob.extend_from_slice(b"ft run-worker --foreground\0");
         assert!(argv_contains(&blob, "run-worker"));
     }
 
@@ -935,9 +899,6 @@ mod tests {
 
 #[cfg(all(test, windows))]
 mod windows_tests {
-    //! Windows FFI: liveness, image-name identity, KILL_ON_JOB_CLOSE (runs on
-    //! the windows-latest CI matrix).
-
     use super::*;
 
     #[test]
@@ -955,12 +916,10 @@ mod windows_tests {
         assert!(!pid_matches(std::process::id(), "totally-bogus-needle"));
     }
 
-    /// The whole-tree kill cannot be proven in-process (it would kill this
-    /// test); what is pinned is setup + clean guard drop.
     #[test]
     fn create_kill_on_close_job_succeeds_and_drops() {
         let guard = create_kill_on_close_job();
         assert!(guard.is_some(), "kill-on-close job creation failed");
-        drop(guard); // must not panic / double-close
+        drop(guard);
     }
 }

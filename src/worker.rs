@@ -1,7 +1,3 @@
-//! The detached worker (`ft run-worker`): serves the local origin, fronts it
-//! with a cloudflared Quick Tunnel, records the URL on the registry entry, and
-//! exits when cloudflared, the origin, the command child, or a signal ends.
-
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -47,8 +43,6 @@ pub async fn run(
         );
     }
 
-    // Windows: a KILL_ON_JOB_CLOSE Job Object — worker exit kills the whole
-    // tree (the PR_SET_PDEATHSIG equivalent; no-op on Unix).
     #[cfg(windows)]
     let _job_guard = crate::proc::create_kill_on_close_job();
 
@@ -64,11 +58,8 @@ pub async fn run(
         anyhow::bail!("port 0 is reserved; the worker needs an explicit port");
     }
 
-    // The parent's save may not have landed yet — poll for the entry by id,
-    // not name: a reused name would bind us to the wrong (fresh) service.
     let deadline = std::time::Instant::now() + REGISTRY_LOOKUP_TIMEOUT;
     if !await_entry(&state, id, deadline).await? {
-        // Dying worker mustn't leave a stale entry; clear ours by id.
         fail_cleanup(&state, id, None, None).await;
         anyhow::bail!("registry entry for service id={id} never appeared");
     }
@@ -80,8 +71,6 @@ pub async fn run(
         anyhow::bail!("registry entry for service id={id} vanished before start");
     };
     let kind = entry.kind;
-    // Flags persisted on the entry, not argv — argv would duplicate state and
-    // leak the token into `ps`.
     let static_flags = entry.static_flags;
 
     // server.log opens only for a Static worker (only it emits tower_http
@@ -109,8 +98,6 @@ pub async fn run(
             None
         }
         ServiceKind::Drop => {
-            // Reads AND writes its directory — checked like Static, refusal
-            // unconditional (a writable target is strictly more dangerous).
             let dir = match resolve_dir(&dir) {
                 Ok(d) => d,
                 Err(e) => {
@@ -320,7 +307,6 @@ pub async fn run(
         Ok(c) => c,
         Err(e) => {
             tracing::error!(%e, "failed to spawn cloudflared");
-            // The command must not outlive a tunnel that never came to be.
             fail_cleanup(
                 &state,
                 id,
@@ -473,21 +459,14 @@ async fn fail_cleanup(
     }
 }
 
-/// Why the keep-alive loop ended — drives cloudflared teardown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReaderExit {
-    /// cloudflared itself exited; it was reaped by the select's `wait()`.
     ChildExited,
-    /// The local origin server task ended (static, hook, and drop workers).
     ServerEnded,
-    /// The Run command child exited — the origin is gone; follow it down.
     CommandExited,
-    /// SIGTERM/SIGINT (or Ctrl-C on Windows) arrived.
     Signal,
 }
 
-/// Bind fail-fast: a failure removes the reserved entry so the parent's poll
-/// sees it instead of waiting out the timeout.
 async fn bind_loopback_fail_fast(
     state: &StateDir,
     id: u64,
@@ -537,8 +516,6 @@ fn open_drop_token(state: &StateDir, name: &str) -> Result<String> {
     }
 }
 
-/// Serve task + graceful-shutdown channel: firing the sender drains
-/// in-flight requests instead of aborting mid-flight.
 fn serve_origin(
     router: axum::Router,
     listener: tokio::net::TcpListener,
@@ -556,14 +533,10 @@ fn serve_origin(
     (shutdown_tx, server_handle)
 }
 
-/// `ChildExited` already reaped cloudflared in the select; every other
-/// reason must signal.
 fn teardown_should_signal(exit_reason: &ReaderExit) -> bool {
     !matches!(exit_reason, ReaderExit::ChildExited)
 }
 
-/// Never-completing placeholder for the server slot (no server of one's
-/// own); stop_server aborts it instead of burning the drain timeout.
 fn no_server() -> (
     tokio::sync::oneshot::Sender<()>,
     tokio::task::JoinHandle<crate::error::Result<()>>,
@@ -575,8 +548,6 @@ fn no_server() -> (
     )
 }
 
-/// Static/Hook/Drop: graceful drain bounded by [`SERVER_SHUTDOWN_TIMEOUT`]
-/// (abort on overrun). Proxy/Run: the placeholder is aborted outright.
 async fn stop_server(
     kind: ServiceKind,
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
@@ -604,8 +575,6 @@ async fn stop_server(
     }
 }
 
-/// Read-only poll — an update() here would contend with the parent's
-/// pid-record and every concurrent `ft` command.
 async fn await_entry(state: &StateDir, id: u64, deadline: std::time::Instant) -> Result<bool> {
     while std::time::Instant::now() < deadline {
         if Registry::load(state)?.find(&id.to_string()).is_some() {
@@ -629,9 +598,7 @@ async fn teardown_on_exit(
 
 #[derive(Clone)]
 struct ReaderCtx {
-    /// Registry key — unique & stable, unlike `name` (reusable after a kill).
     id: u64,
-    /// Display only — used in log messages, never as a registry key.
     name: String,
     state: StateDir,
     tunnel_pid: Option<u32>,
@@ -639,7 +606,6 @@ struct ReaderCtx {
     log_writer: Arc<Mutex<tokio::fs::File>>,
 }
 
-/// Tee cloudflared output to tunnel.log; publish the first URL found.
 async fn pipe_stream<R>(reader: BufReader<R>, ctx: ReaderCtx)
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -648,8 +614,6 @@ where
     loop {
         match lines.next_line().await {
             Ok(Some(line)) => {
-                // One lock take + write per line: append mode makes each
-                // write atomic, and no flush stops the two readers contending.
                 let mut buf = line.as_bytes().to_vec();
                 buf.push(b'\n');
                 {
@@ -676,7 +640,6 @@ where
     }
 }
 
-/// Tee the command's output into worker.log (nothing is extracted from it).
 async fn pipe_command_stream<R>(reader: BufReader<R>, log_writer: Arc<Mutex<tokio::fs::File>>)
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -699,8 +662,6 @@ where
     }
 }
 
-/// By id, under the exclusive lock — a stale worker must not clobber a
-/// re-used name's entry.
 fn publish_url(ctx: &ReaderCtx, url: String) -> Result<()> {
     let id = ctx.id;
     let name = &ctx.name;
@@ -755,7 +716,6 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::tempdir;
 
-    /// Mirrors `dummy_service` in registry.rs.
     fn seed_service(id: u64, name: &str) -> Service {
         Service {
             id,
@@ -839,7 +799,7 @@ mod tests {
 
         let reg = Registry::load(&state).expect("load");
         let svc = reg.find("9").expect("entry present");
-        assert_eq!(svc.tunnel_pid, Some(1111)); // unchanged
+        assert_eq!(svc.tunnel_pid, Some(1111));
         assert_eq!(
             svc.public_url.as_deref(),
             Some("https://xyz.trycloudflare.com")
@@ -883,8 +843,6 @@ mod tests {
         let state = StateDir::new_at(tmp.path().to_path_buf());
         state.ensure().expect("ensure state dir");
 
-        // A different id + a one-interval deadline runs the body once before
-        // timing out (a past deadline would skip it, making this vacuous).
         Registry::update(&state, |reg| {
             reg.services.push(seed_service(11, "alpha"));
         })
@@ -935,8 +893,6 @@ mod tests {
 
     #[tokio::test]
     async fn stop_server_aborts_a_run_placeholder_without_waiting_out_the_timeout() {
-        // A kind guard that forgot Run would add the full timeout to every
-        // run exit.
         let (shutdown_tx, mut server_handle) = no_server();
         let started = std::time::Instant::now();
         stop_server(ServiceKind::Run, shutdown_tx, &mut server_handle).await;

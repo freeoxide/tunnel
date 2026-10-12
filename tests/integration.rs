@@ -1,7 +1,3 @@
-//! End-to-end black-box tests for the `ft` binary via `CARGO_BIN_EXE_ft`,
-//! each pinned to a private `XDG_STATE_HOME` tempdir; cloudflared-bound
-//! paths are out of scope (origin behaviour lives in the server unit tests).
-
 #![cfg(unix)] // proc::pid_alive uses a Unix-only cmdline identity probe.
 
 use std::fs;
@@ -81,8 +77,6 @@ fn proxy_registry_json(worker_pid: u32, created_at: &str, public_url: Option<&st
     )
 }
 
-/// The pid must come from [`spawn_foreground_worker`]: sanitize probes foreground
-/// liveness via the `--foreground` cmdline token, so a bare own-pid fixture reads stale.
 fn foreground_proxy_json(pid: u32, port: u16) -> String {
     format!(
         r#"{{
@@ -107,8 +101,6 @@ fn foreground_proxy_json(pid: u32, port: u16) -> String {
     )
 }
 
-/// Dropping the guard kills and reaps the decoy shell; its in-flight `sleep 30`
-/// child can orphan for up to 30 s (killing the shell does not reach children).
 struct DecoyWorker {
     child: std::process::Child,
 }
@@ -126,8 +118,6 @@ impl Drop for DecoyWorker {
     }
 }
 
-/// Readiness barrier: the cmdline the probe reads can lag the fork (platform
-/// quirk); losing that race makes the probe correctly read the decoy as stale.
 fn wait_for_foreground_token(pid: u32) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let mut last_seen = String::from("`ps` has not completed a poll yet");
@@ -153,9 +143,6 @@ fn wait_for_foreground_token(pid: u32) {
     panic!("decoy never became probe-ready for pid {pid}: {last_seen}");
 }
 
-/// A decoy whose cmdline carries `--foreground` (the identity probe's needle);
-/// the guard reaps it on drop. The `-c` body must stay an endless LOOP — shells
-/// tail-exec a final `-c` command, replacing argv and dropping the token.
 fn spawn_foreground_worker() -> DecoyWorker {
     // Build the guard BEFORE the barrier: if the barrier panics, unwinding
     // reaps the decoy — a bare `Child`'s Drop is a no-op and would leak the loop.
@@ -181,8 +168,6 @@ fn seed_registry(xdg_root: &std::path::Path, body: &str) -> PathBuf {
 fn run_ft(xdg_root: &std::path::Path, args: &[&str]) -> (bool, String) {
     let output = Command::new(ft_bin())
         .args(args)
-        // Child-only env: mutating the test process's env would be `unsafe`
-        // in edition 2024.
         .env("XDG_STATE_HOME", xdg_root)
         // Hermeticity: a stray RUST_LOG would pollute the asserted-on stdout.
         .env("RUST_LOG", "")
@@ -211,8 +196,6 @@ fn run_ft_with_env(
     (output.status.success(), combined)
 }
 
-/// Bind an ephemeral listener, drop it. Another process could re-grab the port
-/// before `ft` probes it — accepted risk.
 fn dead_loopback_port() -> u16 {
     let listener =
         TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral loopback listener");
@@ -221,8 +204,6 @@ fn dead_loopback_port() -> u16 {
     port
 }
 
-/// Close the server side first (listener, then accepted stream, while the
-/// client is open): the active close leaves the port in FIN_WAIT/TIME_WAIT.
 fn time_wait_loopback_port() -> u16 {
     let listener =
         TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral loopback listener");
@@ -366,8 +347,6 @@ fn json_str_field(body: &str, field: &str) -> Option<String> {
     Some(body[start..end].to_string())
 }
 
-/// Files AND directories, recursively: `StateDir::ensure` creates an empty
-/// root + `services/`, so a files-only walk could not pin "zero state".
 fn tree_paths(root: &std::path::Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -425,12 +404,8 @@ fn ls_on_empty_registry_reports_no_services() {
 
 #[test]
 fn prune_reaps_stale_entry_and_persists() {
-    // 4_000_000 is far outside any real pid namespace, so the worker reads dead.
     let dir = TempDir::new().unwrap();
-    let reg = seed_registry(
-        dir.path(),
-        &registry_json(4_000_000, /* foreground */ false, None),
-    );
+    let reg = seed_registry(dir.path(), &registry_json(4_000_000, false, None));
 
     let (ok, out) = run_ft(dir.path(), &["prune"]);
     assert!(ok, "`ft prune` failed: {out}");
@@ -462,8 +437,6 @@ fn prune_reaps_stale_entry_and_persists() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn ls_reports_status_through_real_proc_probe() {
-    // The live `sleep` child's cmdline lacks the `run-worker` needle, so the
-    // cmdline-aware probe reads it as foreign (PID-reused) -> "stale".
     let dir = TempDir::new().unwrap();
     let mut sleep = Command::new("sleep")
         .arg("30")
@@ -528,11 +501,7 @@ fn detail_round_trips_a_seeded_entry() {
     let dir = TempDir::new().unwrap();
     seed_registry(
         dir.path(),
-        &registry_json(
-            4_000_000,
-            /* foreground */ false,
-            Some("https://x.trycloudflare.com"),
-        ),
+        &registry_json(4_000_000, false, Some("https://x.trycloudflare.com")),
     );
 
     let (ok_by_id, out_by_id) = run_ft(dir.path(), &["detail", "1"]);
@@ -1234,7 +1203,6 @@ fn start_refuses_fts_own_state_dir_noninteractively() {
 #[test]
 fn drop_fixture_renders_in_ls_detail_and_kill() {
     let dir = TempDir::new().unwrap();
-    // state_dir anchors in the tempdir: `ft detail` reads the token file from it.
     let state_dir = dir.path().join("seed-drop-state");
     fs::create_dir_all(&state_dir).unwrap();
     fs::write(state_dir.join("drop-token"), "tok-seeded-abc\n").unwrap();
@@ -1836,8 +1804,6 @@ fn token_flags_read_the_ft_token_env() {
         "the drop origin must surface the env-fed token refusal, got: {out}"
     );
 
-    // argv beats env (clap precedence): the whitespace-only --token wins over
-    // a valid FT_TOKEN.
     for args in [
         vec![&site, "--token", "  "],
         vec!["drop", &inbox, "--token", "  "],

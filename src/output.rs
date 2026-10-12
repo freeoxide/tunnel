@@ -1,6 +1,3 @@
-//! Terminal output for `ft`: fixed-format blocks live here; sequential
-//! printing stays in the commands. Shapes are CLI contract.
-
 use crate::cmd::doctor::{Check, CheckStatus};
 use crate::model::{Service, ServiceKind};
 use chrono::{Datelike, Timelike};
@@ -13,8 +10,8 @@ pub fn reset_sigpipe() {
     #[cfg(unix)]
     {
         use nix::sys::signal::{SigHandler, Signal, signal};
-        // Before any ft task or printing exists; sigaction is process-wide
-        // and thread-safe, so tokio's already-running workers are no concern.
+        // SAFETY: sigaction is process-wide and thread-safe, so already-running
+        // tokio workers are no concern; this runs before any ft task or printing.
         let _ = unsafe { signal(Signal::SIGPIPE, SigHandler::SigDfl) };
     }
 }
@@ -31,8 +28,6 @@ fn fmt_started(service: &Service) -> String {
     )
 }
 
-/// The public URL, or `(pending)` while the worker has not discovered one.
-/// Borrowed: both call sites (println, Cell::new) stringify exactly once.
 fn url_or_pending(service: &Service) -> &str {
     service.public_url.as_deref().unwrap_or("(pending)")
 }
@@ -168,13 +163,9 @@ pub fn print_detail(service: &Service) {
     println!("Logs:");
     println!("  {}", service.state_dir.join("worker.log").display());
     if service.kind == ServiceKind::Static {
-        // Only a Static worker runs (and traces requests into) a server. A
-        // run's command output lands in worker.log instead.
         println!("  {}", service.state_dir.join("server.log").display());
     }
     if service.kind == ServiceKind::Hook {
-        // The request record the /__inspect views serve; a logs-section
-        // sibling so the operator finds it with the other artifacts.
         println!("  {}", service.state_dir.join("requests.json").display());
     }
     println!("  {}", service.state_dir.join("tunnel.log").display());

@@ -1,15 +1,9 @@
-//! Detached worker spawning: re-invokes the binary as `ft run-worker` in a
-//! new session so the worker (and cloudflared) survive the parent exiting;
-//! stdout/stderr append to `worker.log`.
-
 use std::ffi::OsString;
 use std::path::Path;
 
 use crate::error::Result;
 use crate::state::StateDir;
 
-/// Handshake env value: the worker refuses to run without it, so a direct
-/// `ft run-worker` cannot bypass START's validation. Needs to be set, not guessed.
 fn worker_token() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -24,8 +18,6 @@ fn worker_token() -> String {
 /// invocation fails closed on the unresolvable path.
 pub(crate) const PROXY_DIR_SENTINEL: &str = "/ft-proxy-has-no-directory";
 
-/// The run-worker argv prefix. The Drop token does NOT ride the argv (`ps`
-/// visibility) — the worker reads it from the private token file.
 fn run_worker_args(
     id: u64,
     name: &str,
@@ -94,8 +86,6 @@ pub fn spawn_worker_with_command(
     spawn_worker_full(id, name, dir, port, command, None, None)
 }
 
-/// Platform-neutral spawn setup (log handles, exe, argv, FT_WORKER_TOKEN,
-/// stdio) — shared so the platform variants cannot drift.
 fn worker_command(
     id: u64,
     name: &str,
@@ -132,8 +122,6 @@ fn worker_command(
     Ok(cmd)
 }
 
-/// The single spawn path: wrappers pin their unused optionals so historical
-/// argv shapes stay byte-identical (hook adds only --keep, drop --max-size).
 #[cfg(unix)]
 fn spawn_worker_full(
     id: u64,
@@ -165,18 +153,13 @@ fn spawn_worker_full(
         .spawn()
         .with_context(|| format!("spawning worker for service '{name}'"))?;
 
-    // Intentionally no wait and no kill_on_drop: the worker must outlive this
-    // process. On Unix a freshly spawned child always has a pid.
     let pid = child.id();
 
-    // Drop without reaping: the child keeps running in its own session.
     std::mem::forget(child);
 
     Ok(pid)
 }
 
-/// Windows: detached, own group, no console; the worker's Job Object
-/// ([`crate::worker::run`]) cascades its kill to the tree.
 #[cfg(windows)]
 fn spawn_worker_full(
     id: u64,
@@ -201,8 +184,6 @@ fn spawn_worker_full(
         .spawn()
         .with_context(|| format!("spawning worker for service '{name}'"))?
         .id();
-    // The std::process::Child handle drops here without `kill_on_drop`, so the
-    // detached worker keeps running; only its pid is recorded in the registry.
     Ok(pid)
 }
 
@@ -265,8 +246,6 @@ mod tests {
 
     #[test]
     fn run_worker_carries_the_child_command_after_a_separator() {
-        // The separator is load-bearing: flag-looking child args must reach
-        // the child verbatim, not run-worker's own clap definition.
         let args = run_worker_args(
             11,
             "dev",
@@ -320,8 +299,6 @@ mod tests {
 
     #[test]
     fn drop_worker_carries_its_directory_and_cap_before_the_separator() {
-        // The REAL upload target (unlike the directory-less kinds) and the
-        // cap flag before `--`; the access token appears NOWHERE in the argv.
         let args = run_worker_args(
             13,
             "share",

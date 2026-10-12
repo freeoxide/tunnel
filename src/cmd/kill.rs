@@ -1,5 +1,3 @@
-//! The `kill` command: stop a service and remove it from the registry.
-
 use crate::error::Result;
 use crate::model::{Registry, Service};
 use crate::output;
@@ -47,7 +45,7 @@ pub async fn run(target: String) -> Result<()> {
         bail!("no service matches '{target}'");
     }
 
-    // Remove atomically under the lock; find is re-checked inside plan_kill
+    // find is re-checked inside plan_kill
     // in case the target vanished since the unlocked read.
     let service = match Registry::update(&state, |reg| plan_kill(reg, &target))? {
         Some(KillPlan::Remove(service)) => service,
@@ -82,7 +80,7 @@ pub async fn run(target: String) -> Result<()> {
         }
         TeardownKind::BackgroundGroup => {
             // cloudflared lives in the worker's group, so the group kill
-            // reaches both; signal only when a member is confirmed ours.
+            // reaches both.
             let worker_alive = proc::pid_matches(service.worker_pid, "run-worker");
             let cloudflared_alive = service
                 .tunnel_pid

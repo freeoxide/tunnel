@@ -1,5 +1,4 @@
 //! The PROXY command: attach a tunnel to a server the operator already runs —
-//! no ft server, just cloudflared pointing at the upstream (`dir: None`).
 //! The CLI pre-flights the upstream so the failure is friendly, not a 502.
 
 use anyhow::ensure;
@@ -22,8 +21,6 @@ pub async fn run(port: u16, name: Option<String>, foreground: bool) -> Result<()
     );
 
     if foreground {
-        // `dir: None` selects proxy semantics; no re-probe by design — the
-        // pre-flight above already covered the port.
         start::run_foreground(None, name, Some(port)).await
     } else {
         run_background(port, name).await
@@ -33,8 +30,6 @@ pub async fn run(port: u16, name: Option<String>, foreground: bool) -> Result<()
 async fn run_background(port: u16, name: Option<String>) -> Result<()> {
     let state = StateDir::new()?;
 
-    // Looked up before reserving anything, so a missing binary fails without
-    // leaving a half-started entry to clean up.
     cloudflared::ensure_installed()?;
 
     state.ensure()?;

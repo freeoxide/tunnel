@@ -1,7 +1,3 @@
-//! CLI definition for `ft` (clap derive). No subcommand = the implicit START
-//! against a positional `dir`; the static-origin flags live on the top level
-//! only — `ft proxy` structurally takes none (parse-level guarantee).
-
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -61,7 +57,6 @@ pub struct Cli {
     pub token: Option<String>,
 }
 
-/// Explicit subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// List all known services.
@@ -260,12 +255,8 @@ mod tests {
     use super::{Cli, Command};
     use clap::Parser as _;
 
-    /// clap reads the one process env; this serializes the FT_TOKEN removal
-    /// in `parse` with every parse, so parallel test threads cannot race it.
     static FT_TOKEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Parse `ft <args>`. FT_TOKEN is cleared first — an ambient value would
-    /// fill the env-backed `--token` fields and flip the token-absence asserts.
     fn parse(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
         let _guard = FT_TOKEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the test binary's only env mutation, and every clap parse

@@ -1,6 +1,3 @@
-//! cloudflared discovery + lifecycle: locate the (never vendored) binary on
-//! PATH, parse the tunnel URL from its log output, spawn it with piped stdio.
-
 use crate::error::Result;
 use anyhow::{Context, bail};
 use std::path::PathBuf;
@@ -38,7 +35,6 @@ pub fn extract_url(text: &str) -> Option<String> {
         let start = search_from + rel;
         let rest = &text[start..];
         let url = &rest[..rest.find(char::is_whitespace).unwrap_or(rest.len())];
-        // Strip any trailing punctuation that cloudflared occasionally appends.
         let url = url.trim_end_matches(['.', ')', ',', ';', '"', '\'']);
         let host = url
             .strip_prefix("https://")
@@ -82,8 +78,6 @@ pub fn spawn(port: u16) -> Result<Child> {
     // worker's group kill reaches it directly (even if the worker already
     // died), and terminal Ctrl-C reaches it in the foreground. NO setsid().
 
-    // On Linux, PDEATHSIG SIGKILLs cloudflared if the worker dies (even via
-    // SIGKILL/OOM) — no orphaned tunnel. See [`crate::proc::parent_death_signal`].
     #[cfg(target_os = "linux")]
     unsafe {
         cmd.pre_exec(crate::proc::parent_death_signal);
@@ -119,7 +113,6 @@ pub async fn shutdown(tunnel_pid: Option<u32>, child: &mut Child) {
     }
     #[cfg(not(unix))]
     {
-        // No signal path on Windows; the owned handle is the kill vector.
         let _ = tunnel_pid;
         let _ = child.start_kill();
     }
@@ -190,7 +183,6 @@ mod tests {
 
     #[test]
     fn keeps_path_and_query_in_returned_url() {
-        // `ft open` hands the URL verbatim to the browser: path + query stay.
         let line = "your tunnel: https://x.trycloudflare.com/foo?bar=1";
         assert_eq!(
             extract_url(line),
@@ -200,7 +192,6 @@ mod tests {
 
     #[test]
     fn uppercase_https_is_rejected() {
-        // cloudflared always emits lowercase; prose must not match.
         assert_eq!(extract_url("HTTPS://x.trycloudflare.com"), None);
     }
 
@@ -221,9 +212,7 @@ mod tests {
     fn is_tunnel_url_rejects_non_https_and_spoofs() {
         assert!(!is_tunnel_url("http://foo.trycloudflare.com"));
         assert!(!is_tunnel_url("ftp://foo.trycloudflare.com"));
-        // No leading dot: not a subdomain of trycloudflare.com.
         assert!(!is_tunnel_url("https://eviltrycloudflare.com"));
-        // Suffix trick: host taken before any '/'.
         assert!(!is_tunnel_url("https://foo.trycloudflare.com.evil.example"));
         assert!(!is_tunnel_url("not a url"));
     }
@@ -231,8 +220,6 @@ mod tests {
     use proptest::prelude::*;
 
     proptest! {
-        /// Anything extract_url returns is a well-formed Quick Tunnel URL
-        /// that round-trips through `is_tunnel_url`.
         #[test]
         fn extract_url_only_yields_tunnel_urls(
             prefix in "[a-zA-Z0-9 .,|:!?/<>\"'-]{0,40}",
@@ -248,8 +235,6 @@ mod tests {
             }
         }
 
-        /// A non-tunnel `https://host` AFTER the tunnel URL does not
-        /// distract the scan-past loop.
         #[test]
         fn picks_tunnel_when_non_tunnel_follows(
             prefix in "[a-zA-Z0-9 .,|:!?/<>\"'-]{0,20}",

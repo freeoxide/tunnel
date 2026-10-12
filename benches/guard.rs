@@ -1,5 +1,3 @@
-// Cargo builds bench targets with `--cfg test` but no `--test`, so the
-// mirrored #[test] fns compile dead and their imports dangle into warnings.
 #![allow(dead_code, unused_imports)]
 
 // Bin-only crate — a bench cannot link it, so this mirrors the src/main.rs
@@ -59,8 +57,6 @@ fn bench(c: &mut Criterion) {
         .canonicalize()
         .expect("canonicalize the fixture root");
     let router = server::static_server::router_with(root, model::StaticFlags::default());
-    // ONE runtime for every iteration (and for the sanity GET below): thread
-    // spawn and reactor setup are not part of the measured work.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -97,8 +93,6 @@ fn bench(c: &mut Criterion) {
                     .await
                     .expect("oneshot is infallible");
                 let status = resp.status();
-                // Drain the body inside the timer: a GET is not done until
-                // the last byte is out.
                 let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
                     .await
                     .expect("read the benched body");

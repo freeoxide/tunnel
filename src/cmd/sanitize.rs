@@ -55,8 +55,6 @@ fn worker_alive(svc: &Service) -> Option<bool> {
 fn plan(svc: &Service, worker_alive: Option<bool>, port_dead: Option<bool>) -> Action {
     match worker_alive {
         Some(false) => return Action::PruneStale,
-        // A pid-0 reservation: fresh = a start in progress (reaping would
-        // orphan the worker), expired = abandoned.
         None => {
             return if svc.start_in_progress() {
                 Action::Keep
@@ -67,20 +65,15 @@ fn plan(svc: &Service, worker_alive: Option<bool>, port_dead: Option<bool>) -> A
         Some(true) => {}
     }
 
-    // Live worker whose URL has not landed yet (still Starting): the port may
-    // not even be bound, so it is left alone.
     if svc.public_url.is_none() {
         return Action::Keep;
     }
 
-    // Reached only when Running; only a DEAD double-probe counts.
     match port_dead {
         Some(true) if svc.foreground => Action::SkipForeground,
         Some(true) => Action::RemoveZombie {
             reason: match svc.kind {
-                // A Run's origin is the command ft spawned — same story.
                 ServiceKind::Proxy | ServiceKind::Run => ZombieReason::UpstreamDead,
-                // Hook/Drop host in-process like Static — the same anomaly.
                 ServiceKind::Static | ServiceKind::Hook | ServiceKind::Drop => {
                     ZombieReason::InProcessServerDead
                 }
@@ -174,13 +167,10 @@ pub async fn run() -> Result<()> {
 
     let removed = Registry::update(&state, |reg| apply(reg, &candidates))?;
 
-    // Every signal below is cmdline-identity-gated (no recycled-pid kills).
     let mut bullets = Vec::new();
     for (svc, action) in &removed {
         match action {
             Action::PruneStale => {
-                // Best-effort reap of an orphaned cloudflared (a host reboot
-                // beats PDEATHSIG), gated on the `cloudflared` cmdline identity.
                 if let Some(tpid) = svc.tunnel_pid
                     && proc::pid_matches(tpid, "cloudflared")
                 {
@@ -189,14 +179,10 @@ pub async fn run() -> Result<()> {
                 bullets.push((svc.name.clone(), stale_reason(svc)));
             }
             Action::RemoveZombie { reason } => {
-                // Foreground zombies were classified SkipForeground above;
-                // the assert guards the shell-safety invariant.
                 debug_assert!(
                     !svc.foreground,
                     "foreground zombie reached teardown — sanitize must skip it"
                 );
-                // Signal the group only when a member is confirmed ours —
-                // cloudflared lives in the worker's group, so the kill reaches both.
                 let worker_ours = proc::pid_matches(svc.worker_pid, "run-worker");
                 let cloudflared_ours = svc
                     .tunnel_pid
@@ -217,10 +203,6 @@ pub async fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    //! [`plan`] is a decision table over injected inputs, [`apply`] pure over
-    //! a seeded registry. [`worker_alive`] probes real /proc state: the test
-    //! binary's own pid is alive but lacks both needles (the recycled case).
-
     use super::*;
     use chrono::TimeDelta;
     use std::path::PathBuf;
@@ -246,8 +228,6 @@ mod tests {
 
     #[test]
     fn foreground_self_pid_without_the_flag_reads_dead() {
-        // Alive but lacking `--foreground` on the cmdline — the PID-reuse
-        // guard reads Some(false), not the Running process_exists would report.
         let mut svc = service(ServiceKind::Static, true);
         svc.worker_pid = std::process::id();
         assert_eq!(worker_alive(&svc), Some(false));
@@ -255,7 +235,6 @@ mod tests {
 
     #[test]
     fn background_self_pid_without_run_worker_reads_dead() {
-        // Same guard: the test cmdline lacks the `run-worker` token.
         let mut svc = service(ServiceKind::Static, false);
         svc.worker_pid = std::process::id();
         assert_eq!(worker_alive(&svc), Some(false));
@@ -367,8 +346,6 @@ mod tests {
 
     #[test]
     fn dead_double_probed_foreground_is_skipped() {
-        // Shell safety: a foreground zombie is never removed — group-
-        // signalling it would kill the operator's shell.
         let svc = service(ServiceKind::Proxy, true);
         assert!(matches!(
             plan(&svc, Some(true), Some(true)),
@@ -522,7 +499,7 @@ mod tests {
     #[test]
     fn apply_leaves_an_entry_that_vanished() {
         let judged = service(ServiceKind::Static, false);
-        let mut reg = Registry::default(); // empty
+        let mut reg = Registry::default();
         let candidates = [Judgment {
             svc: judged,
             action: Action::PruneStale,

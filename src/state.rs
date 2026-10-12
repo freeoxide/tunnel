@@ -99,12 +99,8 @@ fn state_base() -> Result<PathBuf> {
     Ok(home.join(".local").join("state"))
 }
 
-/// One safe path segment via [`dash_sanitize`]: outside `[A-Za-z0-9_-]`
-/// becomes `-` (no traversal possible); all-dashes -> `"service"`.
 fn safe_component(name: &str) -> String {
     let s = crate::name::dash_sanitize(name);
-    // All-dashes (which also covers the empty string — `all` is vacuously
-    // true there) means no usable identity -> fallback.
     if s.chars().all(|c| c == '-') {
         "service".to_string()
     } else {
@@ -143,7 +139,6 @@ mod tests {
 
     #[test]
     fn safe_component_does_not_trim_dashes() {
-        // Trimming would collide "-a" with "a"; both must stay distinct.
         assert_eq!(safe_component("-a"), "-a");
         assert_eq!(safe_component("a-"), "a-");
         assert_eq!(safe_component("a"), "a");
