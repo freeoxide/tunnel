@@ -55,8 +55,6 @@ pub async fn run(
         None => port::allocate_free_port()?,
     };
 
-    // Resolved TRIMMED ONCE, HERE — the single binding every consumer sees
-    // (file, printed credential, comparison): no 401 on a pasted twin.
     let token = resolve_token(token)?;
     let max_size = max_size.unwrap_or(drop_server::DEFAULT_MAX_SIZE);
 
@@ -87,16 +85,12 @@ async fn run_background(
 ) -> Result<()> {
     let state = StateDir::new()?;
 
-    // Looked up BEFORE reserving anything, so a missing binary fails without
-    // leaving a half-started entry to clean up.
     cloudflared::ensure_installed()?;
 
     state.ensure()?;
 
     let (id, name, service_dir) = reserve_entry(&state, &dir, port, name, 0, false)?;
 
-    // Written AFTER the reserve (lifetime bounded by the entry's) and BEFORE
-    // the worker spawn (it reads the token at startup, fail-fast without it).
     if let Err(e) = drop_server::store_token(&service_dir, &token) {
         remove_reservation(&state, id);
         return Err(e)
@@ -110,15 +104,12 @@ async fn run_background(
             return Err(e);
         }
     };
-    // Keyed by id: the name may be reused after a kill.
     Registry::update(&state, |reg| {
         if let Some(svc) = reg.find_mut(&id.to_string()) {
             svc.worker_pid = worker_pid;
         }
     })?;
 
-    // Poll for the tunnel URL (mtime-gated re-reads; the worker rewrites
-    // registry.json only when it discovers the URL or self-removes).
     let registry_path = state.registry_path();
     let mut last_mtime = std::fs::metadata(&registry_path)
         .and_then(|m| m.modified())
@@ -129,26 +120,19 @@ async fn run_background(
             break;
         }
 
-        // Cheap stat first; re-read+parse only when the file changed.
         let new_mtime = std::fs::metadata(&registry_path)
             .and_then(|m| m.modified())
             .ok();
-        // `None` = did NOT re-read this poll (mtime unchanged); `Some(None)` =
-        // re-read and our entry is gone (vanished).
         let snapshot: Option<Option<Service>> = if new_mtime != last_mtime {
             last_mtime = new_mtime;
             match Registry::load(&state) {
                 Ok(reg) => Some(reg.find(&id.to_string()).cloned()),
                 Err(e) => {
-                    // Registry unreadable mid-poll: tear the live worker down
-                    // first (bailing bare would orphan it), then surface the cause.
                     teardown(&state, id, worker_pid, "registry read error").await;
                     return Err(e).context("re-reading the registry during the drop start poll");
                 }
             }
         } else {
-            // Registry unchanged: probe the worker directly to preserve
-            // fail-fast (it may have died silently between rewrites).
             if !proc::pid_alive(worker_pid) {
                 return fail_start(&state, id, &name, worker_pid).await;
             }
@@ -157,20 +141,14 @@ async fn run_background(
 
         match snapshot {
             Some(Some(svc)) if svc.public_url.is_some() => {
-                // No extra origin probe (unlike RUN): the worker bound the
-                // origin before spawning cloudflared — URL implies origin.
                 output::print_started(&svc);
                 output::print_drop_token(&token, svc.public_url.as_deref().unwrap_or(""));
                 return Ok(());
             }
             Some(Some(svc)) if !proc::pid_alive(svc.worker_pid) => {
-                // Worker died before publishing — surface the reason inline
-                // (the entry is removed; `ft logs` won't exist afterwards).
                 return fail_start(&state, id, &name, worker_pid).await;
             }
             Some(None) => {
-                // Entry vanished — concurrent `ft kill` or the worker's own
-                // self-remove; tear down, don't poll 30 s with a live orphan.
                 return fail_start(&state, id, &name, worker_pid).await;
             }
             _ => {}
@@ -212,8 +190,6 @@ fn reserve_entry(
             id,
             name: name.clone(),
             kind: ServiceKind::Drop,
-            // The upload TARGET — carried like Static's served dir (the
-            // worker re-resolves and re-checks it).
             dir: Some(dir.to_path_buf()),
             port,
             local_url: format!("http://127.0.0.1:{port}"),
@@ -262,8 +238,6 @@ async fn run_foreground(
 
     cloudflared::ensure_installed()?;
 
-    // Reserve a FOREGROUND entry, worker_pid = THIS process (visible to
-    // ls/detail/logs/open on every platform).
     let (id, name, service_dir) =
         reserve_entry(&state, &dir, port, name, std::process::id(), true)?;
 
@@ -272,8 +246,6 @@ async fn run_foreground(
     drop_server::store_token(&service_dir, &token)
         .with_context(|| format!("storing the drop token in {}", service_dir.display()))?;
 
-    // Tee cloudflared output to tunnel.log so `ft logs <name>` works for
-    // foreground tunnels (which otherwise only print to the terminal).
     let tunnel_log = state.tunnel_log(&name);
     let log_writer = Arc::new(Mutex::new(
         crate::fsutil::open_private_append_async(&tunnel_log)
@@ -287,8 +259,6 @@ async fn run_foreground(
     let mut sig_term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("installing SIGTERM handler")?;
 
-    // ft's own drop server in THIS process; `serve` installs its own Ctrl-C
-    // drain, bounded below. A store that cannot open fails inside the guard.
     let store = DropStore::open(&dir, token.clone(), max_size, drop_server::MAX_TOTAL_STORE)
         .with_context(|| format!("opening the drop bucket at {}", dir.display()))?;
     let router = drop_server::router(store);
@@ -379,8 +349,6 @@ async fn run_foreground(
         task.abort();
     }
 
-    // `serve`'s own Ctrl-C handler has already begun draining; bound it so a
-    // stuck request can't hang the foreground command, falling back to abort.
     match tokio::time::timeout(SERVER_SHUTDOWN_TIMEOUT, &mut server_handle).await {
         Ok(_) => {}
         Err(_) => {
@@ -397,9 +365,6 @@ async fn run_foreground(
 
 #[cfg(test)]
 mod tests {
-    //! The one-bucket-one-owner pre-flight as a pure decision over a seeded
-    //! registry (canonicalization exercised with real tempdirs).
-
     use super::*;
     use std::path::PathBuf;
 
@@ -487,8 +452,6 @@ mod tests {
         std::fs::create_dir_all(&real).expect("mkdir");
         let reg = registry_of(vec![drop_service(1, "first", Some(real.clone()))]);
 
-        // A `..`-spelled alias (the intermediate dir must exist for realpath
-        // to walk it, as on a real command line).
         std::fs::create_dir_all(tmp.path().join("other")).expect("mkdir other");
         let dotted = tmp.path().join("other").join("..").join("real");
         assert_eq!(
@@ -497,8 +460,6 @@ mod tests {
             "a ..-spelled alias must resolve to the same bucket"
         );
 
-        // A symlinked alias (unix only; Windows aliases are junctions with
-        // different creation semantics).
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(&real, tmp.path().join("alias")).expect("symlink");
@@ -532,8 +493,6 @@ mod tests {
 
     #[test]
     fn unresolvable_existing_dir_is_no_conflict() {
-        // An entry whose dir cannot be proven equal does not conflict; the
-        // worker's own resolve_dir check refuses such a bucket at startup.
         let tmp = tempfile::tempdir().expect("tempdir");
         let bucket = tmp.path().join("bucket");
         std::fs::create_dir_all(&bucket).expect("mkdir");
@@ -546,8 +505,6 @@ mod tests {
 
     #[test]
     fn unresolvable_requested_dir_is_no_conflict() {
-        // A requested dir that cannot canonicalize is refused earlier by
-        // resolve_dir in run(); the helper itself stays total.
         let reg = registry_of(vec![drop_service(1, "first", None)]);
         assert_eq!(
             find_drop_dir_conflict(&reg, std::path::Path::new("/no/such/dir")),

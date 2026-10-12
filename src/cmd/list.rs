@@ -1,5 +1,3 @@
-//! The `ls` command: list all known services.
-
 use crate::error::Result;
 use crate::model::Registry;
 use crate::output;

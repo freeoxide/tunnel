@@ -300,8 +300,6 @@ pub(crate) fn push_escaped_html(out: &mut String, s: &str) {
     }
 }
 
-// Any decoded segment starting with `.` — refused EARLIER than ServeDir's
-// own `..` check; shared by `confine` and `spa_fallback` (no drift).
 fn has_dot_segment(decoded: &str) -> bool {
     decoded
         .trim_start_matches('/')
@@ -382,9 +380,6 @@ fn escapes_root(path: &Path, root: &Path) -> bool {
     }
 }
 
-/// SPA fallback (`--spa`): rewrite a genuinely-non-existent, dot-free 404 to
-/// the root `index.html`. Sits OUTSIDE [`confine`] and re-checks — refusal
-/// 404s keep their meaning (no symlink laundered into a 200).
 async fn spa_fallback(State(root): State<PathBuf>, request: Request, next: Next) -> Response {
     let method = request.method().clone();
     let raw = request.uri().path().to_owned();
@@ -533,8 +528,6 @@ fn plain_router(dir: PathBuf) -> Router {
 
 #[cfg(test)]
 mod confinement_tests {
-    //! Logic-only checks; the full HTTP confinement lives in
-    //! `http_confinement_tests`.
     use super::has_dot_segment;
     use std::path::Path;
 
@@ -751,7 +744,6 @@ mod http_confinement_tests {
         );
     }
 
-    // Junctions are Windows' symlink analogue (canonicalize resolves them).
     #[cfg(windows)]
     #[tokio::test]
     async fn junction_escape_outside_root_is_blocked() {

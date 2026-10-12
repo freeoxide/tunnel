@@ -6,7 +6,6 @@ on:
   pull_request:
     branches: [main]
   schedule:
-    # Weekly supply-chain re-scan (advisory DBs move; catch new CVEs).
     - cron: "17 6 * * 1"
 
 jobs:
@@ -27,8 +26,7 @@ jobs:
       fail-fast: false
       matrix:
         # macOS/Windows legs compile the target-gated proc.rs PID-identity and
-        # detached-worker paths. The MSRV pin (1.88 — comfy-table 7.2.2 uses
-        # let-chains stabilized in 1.88) catches accidental toolchain raises.
+        # detached-worker paths; the MSRV pin catches accidental toolchain raises.
         os: [ubuntu-latest, macos-latest, windows-latest]
         toolchain: [stable, "1.88"]
     runs-on: ${{ matrix.os }}
@@ -46,9 +44,6 @@ jobs:
           toolchain: ${{ matrix.toolchain }}
           components: clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      # Installs sccache and wires up the GHA cache backend (exports
-      # ACTIONS_CACHE_URL / ACTIONS_RUNTIME_TOKEN for later steps); saves the
-      # compiled-artifact cache in its post step.
       - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Clippy (--locked, --all-features, -D warnings)
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
@@ -65,9 +60,6 @@ jobs:
   supply-chain:
     name: cargo-deny + cargo-audit
     runs-on: ubuntu-latest
-    # Hard gate: deny.toml encodes the intended policy (advisories deny, yanked
-    # deny, licenses allowlisted, sources crates.io-only). A CVE or yanked crate
-    # entering the lockfile MUST fail CI rather than ship in a release.
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable

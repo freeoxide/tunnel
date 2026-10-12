@@ -50,7 +50,6 @@ impl CheckStatus {
 pub struct Check {
     /// What was checked (`cloudflared`, `registry`, `worker <name>`, …).
     pub name: String,
-    /// Outcome severity.
     pub status: CheckStatus,
     /// Human-readable one-line result (the line's payload after the colon).
     pub detail: String,
@@ -59,14 +58,11 @@ pub struct Check {
     pub hint: Option<String>,
 }
 
-/// Entry point for the DOCTOR command.
 pub async fn run() -> Result<()> {
     let state = StateDir::new()?;
 
     let mut checks = vec![cloudflared_check()];
 
-    // A missing registry file is the ordinary fresh-install state (load
-    // falls back to empty); an unloadable one IS the finding.
     match Registry::load(&state) {
         Ok(reg) => {
             let probes: Vec<_> = reg
@@ -78,8 +74,6 @@ pub async fn run() -> Result<()> {
             for (svc, probe) in reg.services.iter().zip(probes) {
                 let (status, origin, command) = match probe.await {
                     Ok(triple) => triple,
-                    // Origin and command drop together: the Run dead-origin
-                    // arm words a lone `None` command as "no pid recorded".
                     Err(_) => (svc.status(), None, None),
                 };
                 checks.extend(service_checks(svc, status, origin, command));
@@ -182,8 +176,6 @@ fn service_checks(
 ) -> Vec<Check> {
     let mut checks = Vec::new();
 
-    // `Service::status` handles every pid subtlety (pid 0, foreground vs
-    // background, PID-reuse safety); doctor only interprets its verdict.
     match (status, svc.worker_pid) {
         (ServiceStatus::Stale, _) => checks.push(Check {
             name: format!("worker {}", svc.name),
@@ -196,8 +188,6 @@ fn service_checks(
             )),
         }),
         (ServiceStatus::Starting, 0) => {
-            // A pid-0 reservation: fresh ones are ordinary mid-start state;
-            // one past the grace is abandoned (`ft prune` splits the same way).
             if svc.start_in_progress() {
                 checks.push(Check {
                     name: format!("worker {}", svc.name),
@@ -235,9 +225,6 @@ fn service_checks(
         }),
     }
 
-    // Only a Stale worker can orphan anything — a live worker owns its child.
-    // The pid is existence-probed only, so the wording may not attribute the
-    // pid or port outright: a recycled pid must not become a false orphan.
     if status == ServiceStatus::Stale
         && let Some(probe) = command
         && probe.alive
@@ -272,8 +259,6 @@ fn service_checks(
         });
     }
 
-    // THE doctor check: a Proxy fronts an operator-owned port whose death is
-    // invisible to everything else ft prints; ft-hosted kinds: anomaly only.
     if let Some(alive) = origin {
         if alive {
             checks.push(Check {
@@ -299,8 +284,6 @@ fn service_checks(
                         svc.name
                     )),
                 }),
-                // A run service 502s exactly like a proxy; the recorded
-                // command pid tells WHICH story (never bound / exited / etc).
                 ServiceKind::Run => {
                     let (state, hint) = match command {
                         Some(p) if p.alive => (
@@ -335,8 +318,6 @@ fn service_checks(
                         hint: Some(hint),
                     });
                 }
-                // Hook/Drop host in-process like Static — anomaly, not
-                // certainty; command_probe is Run-gated (these are probe-free).
                 ServiceKind::Static | ServiceKind::Hook | ServiceKind::Drop => checks.push(Check {
                     name: format!("origin {}", svc.name),
                     status: CheckStatus::Warn,
@@ -385,10 +366,6 @@ fn service_checks(
 
 #[cfg(test)]
 mod tests {
-    //! [`service_checks`] is pure given `(status, origin, command)`, asserted
-    //! without the real state dir. Fixtures: 4_000_000 is outside any real pid
-    //! namespace; own pid + `foreground: true` + a public URL reads Running.
-
     use super::*;
     use chrono::TimeDelta;
     use std::path::PathBuf;
@@ -437,8 +414,6 @@ mod tests {
 
     #[test]
     fn origin_alive_rejects_a_dead_port() {
-        // Bind then drop the listener: nothing else grabs that exact
-        // ephemeral port in between.
         let port = {
             let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
                 .expect("bind loopback listener");
@@ -586,7 +561,6 @@ mod tests {
 
     #[test]
     fn live_worker_with_answering_origin_and_state_dir_is_all_ok() {
-        // A real tempdir, since the existence check hits the fs.
         let mut svc = running_service(ServiceKind::Proxy);
         let dir = tempfile::tempdir().expect("create temp state dir");
         svc.state_dir = dir.path().to_path_buf();
@@ -606,8 +580,6 @@ mod tests {
 
     #[test]
     fn missing_state_dir_is_a_minor_warn() {
-        // A never-created path inside our own tempdir: guaranteed-absent,
-        // unlike a hard-coded /tmp path a shared machine might have.
         let dir = tempfile::tempdir().expect("create temp state dir");
         let mut svc = running_service(ServiceKind::Proxy);
         svc.state_dir = dir.path().join("never-created");
@@ -656,8 +628,6 @@ mod tests {
             "the finding must name the pid and the port, got: {}",
             command.detail
         );
-        // The port answer is evidence, not proof — the wording must not
-        // claim orphanhood outright nor drop the recycled reading.
         assert!(
             !command.detail.contains("an orphaned process"),
             "the detail must not claim orphanhood outright: {}",
@@ -857,8 +827,6 @@ mod tests {
 
     #[test]
     fn hand_edited_run_entry_with_a_dir_is_classified_unchanged() {
-        // Registry::validate tolerates a hand-edited Run entry with a `dir`
-        // (unlike proxy-with-dir): doctor classifies it identically.
         let mut svc = stale_run(Some(4242));
         svc.dir = Some(PathBuf::from("/tmp/hand-edited"));
         let checks = service_checks(
@@ -884,8 +852,6 @@ mod tests {
 
     #[tokio::test]
     async fn command_probe_skips_non_run_kinds_unrecorded_and_zero_pids() {
-        // A command_pid on a Proxy is hand-edited nonsense; pid 0 would probe
-        // the CALLER's own group. All arms return before any syscall.
         let mut proxy = service(ServiceKind::Proxy);
         proxy.command_pid = Some(4242);
         assert!(

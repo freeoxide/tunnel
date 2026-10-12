@@ -1,13 +1,5 @@
 name: release
 
-# Release artifacts for a pushed tag. Triggering on a `v*` tag produces the
-# cross-compiled binaries, checksums, and the bundled installers that are then
-# attached to the GitHub Release for that tag.
-#
-# Publishing to crates.io is a SEPARATE, deliberate, human action: see the
-# `publish` job below. It is gated on a protected environment + secret and does
-# NOT run on tag push. Never auto-publish — the published crate version is, by
-# design, the result of a reviewed decision, not a CI side effect.
 on:
   push:
     tags:
@@ -18,14 +10,10 @@ on:
         description: "Tag to attach artifacts to (must already exist)"
         required: true
 
-# Avoid two release runs racing for the same tag (e.g. tag retag or a
-# workflow_dispatch firing alongside the push). Newer run wins.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: true
 
-# Default (read-only) token for every job; the `release` job below escalates to
-# `contents: write` only where it actually uploads release assets.
 permissions:
   contents: read
 
@@ -36,28 +24,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # MVP cross-compile matrix. Asset names match the binstall metadata
-        # exactly: freeoxide-tunnel-<target>.tgz on unix,
-        # freeoxide-tunnel-<target>.zip on windows, with ft / ft.exe at the
-        # archive root.
+        # Asset names must match Cargo.toml [package.metadata.binstall] exactly:
+        # freeoxide-tunnel-<target>.tgz/.zip with ft / ft.exe at the archive root.
         include:
-          # --- Linux / musl: static binaries, glibc-independent. ---
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
             archive: tgz
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-latest
             archive: tgz
-          # --- macOS: universal binaries via separate targets. arm64 builds
-          # natively on the Apple Silicon runner; x86_64 cross-compiles. ---
           - target: x86_64-apple-darwin
             runner: macos-latest
             archive: tgz
           - target: aarch64-apple-darwin
             runner: macos-latest
             archive: tgz
-          # --- Windows / MSVC: native and cross-arch via the x64/arm64
-          # MSVC toolchains on windows runners. ---
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             archive: zip
@@ -76,16 +57,9 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
-      # musl cross-linker. The dep tree (tokio/axum/tower-http with the enabled
-      # feature set) is pure Rust and links no C. x86_64 keeps musl-gcc from
-      # musl-tools (also C-capable if a future -sys dep lands). aarch64 has NO
-      # musl cross gcc in Ubuntu repos — `gcc-aarch64-linux-musl` does not
-      # exist, so that apt install always failed — and instead links with
-      # rust-lld shipped inside the Rust toolchain, which produces a fully
-      # static aarch64 musl binary for a pure-Rust dep tree (verified:
-      # ELF e_machine AArch64, no PT_INTERP/NEEDED entries). If a future
-      # dependency adds C, the aarch64 job needs a real C cross toolchain
-      # (cross or zig); rust-lld cannot compile C.
+      # aarch64 musl links with rust-lld because no aarch64 musl cross gcc exists
+      # in distro repos; valid only while the dep tree stays pure Rust — rust-lld
+      # cannot compile C, so a future -sys dep needs a real cross toolchain.
       - name: Install musl toolchain (x86_64 musl only)
         if: runner.os == 'Linux' && matrix.target == 'x86_64-unknown-linux-musl'
         run: |
@@ -135,18 +109,12 @@ jobs:
         with:
           name: asset-${{ matrix.target }}
           if-no-files-found: error
-          # Both the archive and its .sha256 sidecar ride this artifact.
           path: |
             freeoxide-tunnel-${{ matrix.target }}.tgz
             freeoxide-tunnel-${{ matrix.target }}.tgz.sha256
             freeoxide-tunnel-${{ matrix.target }}.zip
             freeoxide-tunnel-${{ matrix.target }}.zip.sha256
 
-  # Supply-chain gate before any asset is uploaded. release.yml builds whatever
-  # is in Cargo.lock at tag time, so a tag push must not be able to ship a binary
-  # built from a known-vulnerable or yanked tree. deny.toml already encodes the
-  # policy (advisories deny, yanked deny, licenses allowlisted, crates.io-only);
-  # this just enforces it on the publishable artifacts, not only on PR CI.
   supply-chain:
     name: cargo-deny + cargo-audit
     runs-on: ubuntu-latest
@@ -165,7 +133,6 @@ jobs:
     name: assemble release
     runs-on: ubuntu-latest
     needs: [build, supply-chain]
-    # Only this job uploads Release assets, so only it needs the write token.
     permissions:
       contents: write
     steps:
@@ -178,29 +145,22 @@ jobs:
           merge-multiple: true
           path: dist
 
-      # install.sh / install.ps1 live at the repo root (committed by the
-      # installer slice); copy them into dist/ so the checksum assembly and
-      # the Release upload glob a single directory.
       - name: Stage installers
         run: |
           cp install.sh dist/install.sh
           cp install.ps1 dist/install.ps1
 
-      # Combined checksum file in the format install.sh / install.ps1 parse:
-      # one line per asset: "<hash>  <filename>" (two spaces, basename only).
-      # We rebuild it from the per-asset .sha256 sidecars so the list and the
-      # sidecars can never disagree.
+      # Format install.sh / install.ps1 parse: one line per asset,
+      # "<hash>  <filename>" (two spaces, basename only).
       - name: Assemble SHA256SUMS
         working-directory: dist
         run: |
           : > SHA256SUMS
           for sidecar in *.sha256; do
-            # Skip SHA256SUMS.sha256 itself if it were to exist; there is none.
             asset="${sidecar%.sha256}"
             hash="$(cat "$sidecar" | awk '{print $1}')"
             printf '%s  %s\n' "$hash" "$asset" >> SHA256SUMS
           done
-          # Stable ordering independent of glob iteration order.
           sort -k2 SHA256SUMS -o SHA256SUMS
           echo "=== SHA256SUMS ==="
           cat SHA256SUMS
@@ -212,8 +172,6 @@ jobs:
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          # Match the tag that triggered us (push event) or the explicit
-          # workflow_dispatch input.
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           generate_release_notes: true
           fail_on_unmatched_files: true
@@ -225,25 +183,17 @@ jobs:
             dist/SHA256SUMS
             dist/freeoxide-tunnel-*.sha256
 
-  # Installer lint gate. These run on every release and BLOCK the run. The
-  # installer is a user's first contact point (fetched via curl|sh / irm|iex)
-  # and has no prior validation, so a parse failure or shellcheck error must
-  # never ship attached to a GitHub Release.
   lint-scripts:
     name: lint install scripts
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      # Blocking syntax gate: -n parses without executing, so a structurally
-      # broken installer can never be uploaded regardless of shellcheck.
       - name: sh -n install.sh
         run: sh -n install.sh
 
       - name: shellcheck install.sh
         run: |
-          # shellcheck is in apt; fall back to taiki-e/install-action if the
-          # distro package is unavailable.
           if ! command -v shellcheck >/dev/null 2>&1; then
             sudo apt-get update && sudo apt-get install -y shellcheck
           fi
@@ -255,8 +205,6 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      # Parse-only: compiling the script as a ScriptBlock surfaces syntax errors
-      # without executing anything. -NoProfile keeps CI reproducible.
       - name: Parse-check install.ps1
         shell: pwsh
         run: |
@@ -265,12 +213,6 @@ jobs:
           [void][ScriptBlock]::Create($content)
           Write-Output "install.ps1 parses cleanly"
 
-  # ─── crates.io publishing ─────────────────────────────────────────────
-  # MANUAL ONLY. Publishing is a deliberate, reviewed, human action: it ships a
-  # version to crates.io that cannot be unpublished or overwritten. This job is
-  # reachable ONLY via workflow_dispatch, and is further gated behind a protected
-  # `publish` environment whose `CARGO_REGISTRY_TOKEN` secret a maintainer must
-  # approve. It never runs on a tag push — tagging a release does not publish.
   publish:
     name: publish to crates.io (manual)
     if: github.event_name == 'workflow_dispatch'

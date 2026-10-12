@@ -17,9 +17,8 @@ categories = ["command-line-utilities", "development-tools"]
 name = "ft"
 path = "src/main.rs"
 
-# Criterion-driven benches (benches/*.rs). `harness = false` hands main to
-# criterion's own runner; the bench ids the perf campaign parses (e.g.
-# `listing/render_1000_plain`) are contractual, so keep them stable.
+# Bench ids the perf campaign parses (e.g. `listing/render_1000_plain`) are
+# contractual; keep them stable.
 [[bench]]
 name = "listing"
 harness = false
@@ -40,9 +39,6 @@ harness = false
 name = "registry_cycle"
 harness = false
 
-# Codegen stability for benchmarking: default codegen-units can split a hot
-# loop differently between builds of the SAME code; thin LTO + one unit
-# removes that variance axis. Inherits the rest of `release`.
 [profile.bench]
 lto = "thin"
 codegen-units = 1
@@ -55,9 +51,6 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 
-# cargo-binstall asset layout. The resulting archives are
-# `freeoxide-tunnel-<target>.tgz` on Unix and `freeoxide-tunnel-<target>.zip` on
-# Windows, each holding `ft` (or `ft.exe`) at the archive root.
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ archive-suffix }"
 bin-dir = "{ bin }{ binary-ext }"
@@ -93,44 +86,30 @@ tower-http = { version = "0.7.0", features = ["fs", "trace", "timeout", "limit",
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
-# nix is used on all Unix targets (setsid detach, kill(-pgid) teardown, signal
-# handling) but is unavailable on Windows, so it is target-gated.
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", features = ["process", "signal"] }
 
-# libc for raw syscalls: Linux prctl(PR_SET_PDEATHSIG), macOS
-# sysctl(KERN_PROCARGS2) PID identity. Per-platform gates; already transitive
-# via nix on Unix.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2.186"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2.186"
 
-# windows-sys backs the detached-worker feature: Job Objects for whole-tree
-# teardown, OpenProcess/QueryFullProcessImageName/TerminateProcess for PID
-# identity/signalling. Windows-only gate keeps Unix builds free of it.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
-    # BCryptGenRandom (the OS CSPRNG) for drop_server's token minting. Same
-    # crate, extra module gate — no new dependency, Cargo.lock unchanged.
     "Win32_Security_Cryptography",
     "Win32_System_Threading",
     "Win32_System_JobObjects",
 ] }
 
 [dev-dependencies]
-# Temp directories for StateDir/served-tree isolation in tests.
 tempfile = "3"
-# Property tests for safe_component / extract_url / validate_name.
 proptest = "1"
 # tokio test harness; "test-util" is not part of the "full" feature set.
 tokio = { version = "1.52.3", features = ["test-util", "macros", "rt-multi-thread"] }
-# Drive the Router directly in HTTP-layer tests (ServiceExt::oneshot).
 tower = { version = "0.5", features = ["util"] }
-# Read response bodies in tests.
 http-body-util = "0.1"
 http = "1"
 # Bench harness, pinned EXACTLY (=0.8.2): saved baselines must not silently

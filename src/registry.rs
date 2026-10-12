@@ -1,7 +1,3 @@
-//! Persistence and querying of the service registry. Every mutation goes
-//! through [`Registry::update`], whose exclusive flock serializes the whole
-//! load → modify → save against concurrent `ft` invocations.
-
 use crate::error::Result;
 use crate::fsutil;
 use crate::model::{Registry, Service, ServiceKind};
@@ -15,12 +11,8 @@ use std::io::Write;
 /// no explicit unlock — it trips a `clippy::incompatible_msrv` false positive.
 struct RegistryLock(#[allow(dead_code)] std::fs::File);
 
-/// Hard bound on a registry blob read: past this the file is corruption
-/// (e.g. a log redirected over registry.json) — bound the read, never slurp.
 const MAX_REGISTRY_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Read at most `MAX_REGISTRY_BYTES + 1` bytes (the +1 separates "at the
-/// bound" from "past it"); `None` when missing/unreadable, like `read().ok()`.
 fn read_registry_blob(path: &std::path::Path) -> Option<Vec<u8>> {
     use std::io::Read as _;
     let file = std::fs::File::open(path).ok()?;
@@ -41,14 +33,10 @@ fn acquire_lock(state: &StateDir) -> Result<RegistryLock> {
         .with_context(|| format!("opening registry lock {}", path.display()))?;
     file.lock_exclusive()
         .with_context(|| format!("locking registry {}", path.display()))?;
-    // Remove leftover tmp HERE (under the lock), not on unlocked loads: a
-    // read-only command must never delete a writer's in-flight temp.
     let _ = std::fs::remove_file(state.registry_path().with_extension("json.tmp"));
     Ok(RegistryLock(file))
 }
 
-/// Best-effort fsync of the directory holding `path`, so a rename there
-/// survives power loss; errors ignored (some filesystems cannot sync dirs).
 fn sync_parent_dir(path: &std::path::Path) {
     let Some(dir) = path.parent() else { return };
     if let Ok(f) = std::fs::File::open(dir) {
@@ -56,8 +44,6 @@ fn sync_parent_dir(path: &std::path::Path) {
     }
 }
 
-/// Best-effort re-seal of an existing file to 0600 (Unix; Windows privacy is
-/// the profile-dir ACL) — heals a loose-umask or legacy registry on read.
 fn seal_private_file(path: &std::path::Path) {
     #[cfg(unix)]
     {
@@ -79,8 +65,6 @@ impl Registry {
         if let Some(bytes) = read_registry_blob(&path)
             && !bytes.iter().all(u8::is_ascii_whitespace)
         {
-            // Oversized = corruption: same recovery as a parse failure
-            // (backup, else loud error) — never a silent fresh default.
             let parsed = if bytes.len() > MAX_REGISTRY_BYTES as usize {
                 Err(anyhow::anyhow!(
                     "blob is larger than the {MAX_REGISTRY_BYTES}-byte safety bound"
@@ -115,8 +99,6 @@ impl Registry {
             return None;
         }
         let parsed = Registry::parse(&bytes).ok()?;
-        // Heal perms on the backup too, so the same recovery point never stays
-        // world-readable after a one-time loose-umask write.
         seal_private_file(&bak);
         Some(parsed)
     }
@@ -126,8 +108,6 @@ impl Registry {
     pub fn save(&self, state: &StateDir) -> Result<()> {
         let path = state.registry_path();
         let tmp = path.with_extension("json.tmp");
-        // Compact encoding: registry.json is read via `ft detail`/`ft ls`, not
-        // by eye, so pretty-print's 2-3x overhead is waste.
         let data = serde_json::to_vec(self).context("encoding registry")?;
         {
             let mut opts = OpenOptions::new();
@@ -146,16 +126,12 @@ impl Registry {
             && !prev.iter().all(u8::is_ascii_whitespace)
             && Registry::parse(&prev).is_ok()
         {
-            // Owner-only like every other registry write: the .bak can carry
-            // static_flags token secrets (defense-in-depth atop the 0700 root).
             let mut opts = OpenOptions::new();
             opts.write(true).create(true).truncate(true);
             fsutil::apply_private_mode(&mut opts);
             if let Ok(mut file) = opts.open(path.with_extension("json.bak")) {
                 let _ = file.write_all(&prev);
             }
-            // mode(0o600) applies only at creation — re-seal a legacy .bak
-            // that a pre-fix build left at umask-default 0644.
             seal_private_file(&path.with_extension("json.bak"));
         }
         std::fs::rename(&tmp, &path)
@@ -182,8 +158,6 @@ impl Registry {
             if !names.insert(s.name.as_str()) {
                 anyhow::bail!("duplicate service name {:?}", s.name);
             }
-            // 0 is unusable for both kinds: Static binds it, Proxy fronts the
-            // operator's server on it.
             if s.port == 0 {
                 anyhow::bail!("service {:?} has reserved port 0", s.name);
             }
@@ -201,8 +175,6 @@ impl Registry {
                 _ => {}
             }
         }
-        // Keep the id counter strictly ahead of every existing id so a hand-
-        // edited entry can never collide with a future allocation.
         let max_id = self.services.iter().map(|s| s.id).max().unwrap_or(0);
         if self.next_id <= max_id {
             self.next_id = max_id.saturating_add(1);
@@ -395,7 +367,6 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::new_at(tmp.path().join("ft-state"));
         state.ensure().expect("ensure state dir");
-        // Seed an empty registry so load() has a file to flock.
         Registry::default().save(&state).expect("seed save");
 
         let n_threads = 8;
@@ -423,14 +394,12 @@ mod tests {
             all.extend(h.join().unwrap());
         }
 
-        // No duplicate ids were ever handed out.
         let mut sorted = all.clone();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), all.len(), "duplicate ids allocated: {all:?}");
         assert_eq!(all.len(), n_threads * per_thread);
 
-        // And every allocation survived to disk (no lost updates).
         let reg = Registry::load(&state).expect("final load");
         assert_eq!(reg.services.len(), n_threads * per_thread);
         assert_eq!(reg.next_id, (n_threads * per_thread + 1) as u64);
@@ -461,7 +430,7 @@ mod tests {
         assert!(reg.validate().is_err(), "duplicate id must be rejected");
 
         let mut reg = Registry {
-            next_id: 1, // behind the highest id below
+            next_id: 1,
             services: vec![dummy_service(7, "a")],
         };
         assert!(reg.validate().is_ok());
@@ -518,8 +487,6 @@ mod tests {
 
     #[test]
     fn parse_accepts_legacy_registry_without_kind() {
-        // A pre-proxy registry.json (no `kind` keys anywhere) must load: each
-        // entry defaults to Static with the directory it already carried.
         let json = r#"{
                 "next_id": 2,
                 "services": [
@@ -546,7 +513,6 @@ mod tests {
 
     #[test]
     fn parse_rejects_proxy_entry_with_dir() {
-        // validate runs inside parse, so nonsense is rejected at load time.
         let json = r#"{
                 "next_id": 2,
                 "services": [
@@ -569,8 +535,6 @@ mod tests {
         assert!(Registry::parse(json.as_bytes()).is_err());
     }
 
-    /// A fully-populated Service (every field non-default) so a round-trip
-    /// proves each survives serde + save()'s temp/.bak/rename path.
     fn fully_populated_service() -> Service {
         Service {
             id: 42,
@@ -584,7 +548,6 @@ mod tests {
             tunnel_pid: Some(5353),
             command_pid: None,
             static_flags: Default::default(),
-            // Pinned instant (SystemTime epoch) so created_at is deterministic.
             created_at: std::time::SystemTime::UNIX_EPOCH.into(),
             state_dir: PathBuf::from("/srv/ft-state/services/blog"),
             foreground: true,
@@ -648,8 +611,6 @@ mod tests {
 
     #[test]
     fn save_promotes_the_previous_blob_to_an_owner_only_bak() {
-        // Regression: the .bak used to be written with umask-default mode
-        // (typically 0644); it can carry static_flags token secrets.
         #[cfg(unix)]
         {
             use crate::state::StateDir;
@@ -698,8 +659,8 @@ mod tests {
         let state = StateDir::new_at(tmp.path().join("ft-state"));
         state.ensure().expect("ensure");
 
-        // Seed known-good, snapshot as backup. next_id must match the
-        // service id or validate() would heal it — this tests fallback.
+        // next_id must exceed the top service id or validate() would heal
+        // it and the round-trip assert would fail.
         let good = Registry {
             next_id: 43,
             services: vec![fully_populated_service()],

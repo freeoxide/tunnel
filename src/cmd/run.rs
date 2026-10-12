@@ -31,8 +31,6 @@ pub async fn run(
          `ft run --port 3000 -- npm start`"
     );
 
-    // The child has to BIND the port (unlike PROXY's existing upstream), so
-    // an occupied one is a friendly up-front failure.
     ensure!(
         port::is_port_free(port),
         "port {port} is already in use — the command ft spawns must be able to \
@@ -40,8 +38,6 @@ pub async fn run(
     );
 
     if foreground {
-        // No port-wait in the foreground: the operator watches the command
-        // live; the "never came up" surface is the command exiting.
         crate::cmd::start::run_foreground_with_command(name, Some(port), command).await
     } else {
         run_background(port, name, command).await
@@ -64,8 +60,6 @@ async fn run_background(port: u16, name: Option<String>, command: &[OsString]) -
 
     state.ensure()?;
 
-    // Shared reservation incl. START_GRACE; the command pid lands later
-    // (the worker spawns it and records `command_pid`).
     let (id, name) = start::reserve_entry(
         &state,
         ServiceKind::Run,
@@ -78,8 +72,6 @@ async fn run_background(port: u16, name: Option<String>, command: &[OsString]) -
         Default::default(),
     )?;
 
-    // `dir: None` = directory-less worker; the command rides the argv
-    // after `--`, read only by a Run worker.
     let worker_pid = match spawn::spawn_worker_with_command(id, &name, None, port, command) {
         Ok(pid) => pid,
         Err(e) => {
@@ -105,8 +97,6 @@ async fn run_background(port: u16, name: Option<String>, command: &[OsString]) -
         let new_mtime = std::fs::metadata(&registry_path)
             .and_then(|m| m.modified())
             .ok();
-        // `None` = did NOT re-read this poll (mtime unchanged); `Some(None)`
-        // = re-read and our entry is gone (vanished).
         let snapshot: Option<Option<Service>> = if new_mtime != last_mtime {
             last_mtime = new_mtime;
             Some(Registry::load(&state)?.find(&id.to_string()).cloned())
@@ -119,8 +109,6 @@ async fn run_background(port: u16, name: Option<String>, command: &[OsString]) -
 
         match snapshot {
             Some(Some(svc)) if svc.public_url.is_some() => {
-                // The URL alone is not success for a run: the origin (the
-                // command's port) must answer too.
                 origin_up = doctor::origin_alive_async(svc.port).await;
                 if origin_up {
                     output::print_started(&svc);
@@ -128,8 +116,6 @@ async fn run_background(port: u16, name: Option<String>, command: &[OsString]) -
                 }
             }
             Some(Some(svc)) if !proc::pid_alive(svc.worker_pid) => {
-                // Worker died before publishing — surface the reason inline
-                // (the entry is removed; `ft logs` won't exist afterwards).
                 return fail_start(&state, &id, &name, worker_pid, command, origin_up).await;
             }
             Some(None) => {
@@ -163,8 +149,6 @@ async fn fail_start(
     start::teardown(state, *id, worker_pid, "worker death").await;
     let reason = last_reason(state, name);
     if origin_up {
-        // The port WAS answering; its death is the command exiting — same
-        // message shape, the operator's next step is the same.
         bail!(
             "'{}' exited before the tunnel came up{reason}",
             command_display(command)

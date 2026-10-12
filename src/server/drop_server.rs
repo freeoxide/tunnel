@@ -37,12 +37,8 @@ pub(crate) const MAX_TOTAL_STORE: u64 = 1024 * 1024 * 1024;
 /// fill the byte cap, and the public `GET /` listing is O(entries).
 pub(crate) const MAX_FILE_COUNT: u64 = 10_000;
 
-/// Bytes the temp-name scheme (`.{name}.part-<tag8>`) adds around the name
-/// (see [`DropStore::temp_path`]).
 const TEMP_NAME_OVERHEAD: usize = 1 + ".part-".len() + 8;
 
-/// Longest accepted name — a BUDGET, not NAME_MAX: the temp name is LONGER
-/// (dot-prefixed), so this keeps the publish path within 255-byte NAME_MAX.
 const MAX_NAME_BYTES: usize = 255 - TEMP_NAME_OVERHEAD;
 
 const TOKEN_FILENAME: &str = "drop-token";
@@ -82,7 +78,6 @@ fn fill_random(buf: &mut [u8]) -> std::io::Result<()> {
                 BCRYPT_USE_SYSTEM_PREFERRED_RNG,
             )
         };
-        // NTSTATUS 0 is STATUS_SUCCESS.
         if status == 0 {
             Ok(())
         } else {
@@ -155,15 +150,12 @@ fn sanitize_filename(raw: &str) -> Result<String, String> {
     if raw.chars().any(char::is_control) {
         return Err("control characters are not allowed".to_string());
     }
-    // ':' is NTFS alternate-data-stream syntax.
     if raw.contains(':') {
         return Err("colons are not allowed (Windows filenames cannot contain them)".to_string());
     }
     if raw.ends_with('.') || raw.ends_with(' ') {
         return Err("trailing dots/spaces are not allowed (Windows strips them)".to_string());
     }
-    // Windows refuses files whose STEM is a device name, with or without an
-    // extension; refuse them everywhere so a bucket stays portable.
     let stem = raw.split('.').next().unwrap_or("").to_ascii_uppercase();
     const DEVICES: &[&str] = &[
         "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
@@ -175,20 +167,15 @@ fn sanitize_filename(raw: &str) -> Result<String, String> {
     Ok(raw.to_string())
 }
 
-/// Running usage under the store lock (the caps' check-then-write stays
-/// atomic); starts from a startup walk and only grows.
 #[derive(Default)]
 struct Usage {
     bytes: u64,
     files: u64,
 }
 
-/// Shared drop state; `used` is guarded by the lock that serializes uploads.
 pub(crate) struct DropStore {
-    /// Canonicalised upload root — the confinement base and only write target.
     root: PathBuf,
     token: String,
-    /// Per-upload body cap (also the router's pre-handler limit-layer bound).
     max_upload: usize,
     total_cap: u64,
     file_cap: u64,
@@ -238,16 +225,12 @@ impl DropStore {
         }))
     }
 
-    /// This service's temp for `name`: token-scoped (two services on one
-    /// directory never share a temp) and dot-prefixed (API-unreachable).
     fn temp_path(&self, name: &str) -> PathBuf {
         let tag = token_tag(&self.token);
         self.root.join(format!(".{name}.part-{tag}"))
     }
 }
 
-/// First ≤ 8 bytes of `token`, cut at a char boundary — plain slicing would
-/// panic on a multibyte operator `--token`, 500-ing every upload.
 fn token_tag(token: &str) -> &str {
     let end = token.len().min(8);
     if token.is_char_boundary(end) {
@@ -260,8 +243,6 @@ fn token_tag(token: &str) -> &str {
     &token[..end]
 }
 
-/// Best-effort size + count of regular files under `root`; symlinks are
-/// skipped (`file_type()` does not follow them) — no cycles.
 fn measure_dir(root: &Path) -> Usage {
     let mut used = Usage::default();
     let mut stack = vec![root.to_path_buf()];
@@ -293,8 +274,6 @@ enum StoreError {
     Io(std::io::Error),
 }
 
-/// The drop origin's [`Router`]; layering mirrors
-/// [`crate::server::static_server::router_with`].
 pub(crate) fn router(store: Arc<DropStore>) -> Router {
     Router::new()
         .fallback_service(ServeDir::new(store.root.clone()))
@@ -312,8 +291,6 @@ pub(crate) fn router(store: Arc<DropStore>) -> Router {
         ))
 }
 
-/// GET/HEAD pass (reads are public); every other method must present the
-/// token BEFORE its body is read (no bytes in from the unauthenticated).
 async fn require_token(
     State(store): State<Arc<DropStore>>,
     request: Request,
@@ -404,8 +381,6 @@ async fn upload(store: Arc<DropStore>, request: Request) -> Response {
                 .into_response();
         }
     };
-    // Second cap enforcement for chunked bodies (no Content-Length for the
-    // limit layer to pre-reject): the read itself is bounded at the cap.
     let bytes = match axum::body::to_bytes(request.into_body(), store.max_upload).await {
         Ok(b) => b,
         Err(e) => {
@@ -455,8 +430,6 @@ async fn upload(store: Arc<DropStore>, request: Request) -> Response {
     }
 }
 
-/// Blocking half of [`upload`], under the upload lock; only a published
-/// write grows the counter (a counted byte is always on disk).
 fn store_write(store: &DropStore, name: &str, bytes: &[u8]) -> Result<(), StoreError> {
     let mut used = store
         .used
@@ -530,8 +503,6 @@ fn store_write(store: &DropStore, name: &str, bytes: &[u8]) -> Result<(), StoreE
     res
 }
 
-/// `GET /` (and HEAD): the HTML listing. The curl hint uses a `<token>`
-/// PLACEHOLDER — the page is public; the real token must never be rendered.
 async fn listing(store: Arc<DropStore>, is_head: bool) -> Response {
     let rendered = tokio::task::spawn_blocking(move || render_listing(&store)).await;
     let html = match rendered {
@@ -562,7 +533,7 @@ pub(crate) fn render_listing(store: &DropStore) -> String {
 }
 
 fn visible_entries(root: &Path) -> Vec<(String, bool, u64)> {
-    let mut entries: Vec<(String, bool, u64)> = Vec::new(); // (name, is_dir, size)
+    let mut entries: Vec<(String, bool, u64)> = Vec::new();
     if let Ok(read) = std::fs::read_dir(root) {
         for entry in read.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -638,8 +609,6 @@ fn listing_html(entries: &[(String, bool, u64)]) -> String {
 
 #[cfg(test)]
 mod tests {
-    //! Pure rule units plus the full Router via tower::oneshot.
-
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
@@ -743,7 +712,6 @@ mod tests {
         assert_eq!(token_tag("tok-abc123"), "tok-abc1", "ASCII: first 8 bytes");
         assert_eq!(token_tag("ab"), "ab", "short tokens are used whole");
         assert_eq!(token_tag(""), "", "an empty token yields an empty tag");
-        // Byte 8 splits a 3-byte char — the cut walks back to the boundary.
         assert_eq!(token_tag("日本語テスト"), "日本");
         assert_eq!(token_tag("😀😀😀"), "😀😀");
         for token in ["aé🎉b", "🎉", "🎉🎉🎉🎉🎉", "日本", "x"] {
@@ -763,7 +731,7 @@ mod tests {
         let store = DropStore::open(tmp.path(), "tok-abc123".to_string(), 1024, MAX_TOTAL_STORE)
             .expect("open store");
         let max_ascii = "a".repeat(MAX_NAME_BYTES);
-        let max_multibyte = "é".repeat(MAX_NAME_BYTES / 2); // 2 bytes per char
+        let max_multibyte = "é".repeat(MAX_NAME_BYTES / 2);
         assert_eq!(max_multibyte.len(), MAX_NAME_BYTES, "byte budget met");
         for name in [max_ascii, max_multibyte] {
             assert!(
@@ -944,7 +912,6 @@ mod tests {
                 "{method} must advertise the auth scheme"
             );
         }
-        // Not even an over-cap unauthenticated body is read: 401, not 413.
         let big = vec![b'x'; 2000];
         let resp = app
             .oneshot(req("POST", "/flood", &[], &big))
@@ -1004,7 +971,7 @@ mod tests {
     #[tokio::test]
     async fn oversized_chunked_body_is_413_and_stores_nothing() {
         let (_tmp, store) = test_store(MAX_TOTAL_STORE);
-        let big = vec![b'z'; 1025]; // store cap is 1024 in test_store
+        let big = vec![b'z'; 1025];
         let resp = router(store.clone())
             .oneshot(req("POST", "/flood.bin?token=tok-abc123", &[], &big))
             .await
@@ -1061,7 +1028,6 @@ mod tests {
             .oneshot(req("POST", "/x.txt?token=tok-abc123", &[], b"first"))
             .await
             .expect("first upload");
-        // Forge the crash state: temp sharing the stored file's inode.
         std::fs::hard_link(store.root.join("x.txt"), store.temp_path("x.txt"))
             .expect("forge stale temp link");
 
@@ -1242,13 +1208,13 @@ mod tests {
         let (_tmp, store) = test_store(MAX_TOTAL_STORE);
         let app = router(store.clone());
         let cases = [
-            "/%2e%2e%2fescaped.txt",      // ../escaped.txt, percent-encoded
-            "/sub%2Fescaped.txt",         // a/b with an encoded separator
-            "/.env",                      // dotfile by path
-            "/..%2Fescaped.txt",          // .. with an encoded separator
-            "/x?filename=../escaped.txt", // traversal via the query
-            "/x?filename=.env",           // dotfile via the query
-            "/a/b",                       // raw multi-segment path
+            "/%2e%2e%2fescaped.txt",
+            "/sub%2Fescaped.txt",
+            "/.env",
+            "/..%2Fescaped.txt",
+            "/x?filename=../escaped.txt",
+            "/x?filename=.env",
+            "/a/b",
         ];
         for uri in cases {
             let uri = if uri.contains('?') {
@@ -1294,7 +1260,6 @@ mod tests {
         let store =
             DropStore::open(tmp.path(), "tok-abc123".to_string(), 1024, 1000).expect("open store");
         let app = router(store.clone());
-        // Fits exactly (700 + 300 == cap).
         let resp = app
             .clone()
             .oneshot(req(
@@ -1331,8 +1296,6 @@ mod tests {
             2,
         )
         .expect("open store");
-        // The startup walk counted both files: deletions need a restart to
-        // be credited.
         let resp = router(store.clone())
             .oneshot(req("POST", "/next.txt?token=tok-abc123", &[], b"x"))
             .await
@@ -1498,8 +1461,6 @@ mod tests {
 
     #[tokio::test]
     async fn origin_serves_over_a_real_socket_and_pre_rejects_declared_oversize() {
-        // Real-TCP smoke (oneshot bypasses the HTTP server): a declared
-        // oversize Content-Length is pre-rejected 413 by the limit layer.
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (_tmp, store) = test_store(1 << 20);
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))

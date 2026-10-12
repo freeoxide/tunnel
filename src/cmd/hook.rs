@@ -35,8 +35,6 @@ pub async fn run(
         }
         None => port::allocate_free_port()?,
     };
-    // Retention is bounded to 1..=1000 by clap's value parser, so it always
-    // fits the u16 the worker argv carries.
     let keep = keep.unwrap_or(hook_server::DEFAULT_KEEP);
 
     if foreground {
@@ -69,8 +67,6 @@ async fn open_hook_log(
 async fn run_background(port: u16, name: Option<String>, keep: u16) -> Result<()> {
     let state = StateDir::new()?;
 
-    // Looked up before reserving anything, so a missing binary fails without
-    // leaving a half-started entry to clean up.
     cloudflared::ensure_installed()?;
 
     state.ensure()?;
@@ -78,7 +74,7 @@ async fn run_background(port: u16, name: Option<String>, keep: u16) -> Result<()
     let (id, name) = start::reserve_entry(
         &state,
         ServiceKind::Hook,
-        None, // a hook serves no directory; its records live in requests.json
+        None,
         format!("hook-{port}"),
         port,
         name,
@@ -126,8 +122,6 @@ async fn run_foreground(port: u16, name: Option<String>, keep: u16) -> Result<()
 
     let _entry = start::EntryGuard::new(state.clone(), id);
 
-    // Tee cloudflared output to tunnel.log so `ft logs <name>` works for
-    // foreground tunnels (which otherwise only print to the terminal).
     let tunnel_log = state.tunnel_log(&name);
     let log_writer = Arc::new(Mutex::new(
         crate::fsutil::open_private_append_async(&tunnel_log)
@@ -135,14 +129,10 @@ async fn run_foreground(port: u16, name: Option<String>, keep: u16) -> Result<()
             .with_context(|| format!("opening tunnel log {}", tunnel_log.display()))?,
     ));
 
-    // Install the SIGTERM handler BEFORE spawning server + cloudflared: on
-    // failure the `?` leaves only the guard-protected entry, no orphans.
     #[cfg(unix)]
     let mut sig_term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("installing SIGTERM handler")?;
 
-    // ft's own hook server in THIS process; `serve` installs its own Ctrl-C
-    // drain, bounded below.
     let hook_log = open_hook_log(&state, &name, keep).await?;
     let router = hook_server::router(hook_log);
     let mut server_handle = tokio::spawn(async move {
@@ -220,8 +210,6 @@ async fn run_foreground(port: u16, name: Option<String>, keep: u16) -> Result<()
         }
     };
 
-    // If cloudflared may still be alive, shut it down and reap it (on
-    // ChildExited the select's wait() already reaped it).
     if matches!(exit_reason, ReaderExit::Signal) {
         cloudflared::shutdown(tunnel_pid, &mut child).await;
     }
@@ -230,8 +218,6 @@ async fn run_foreground(port: u16, name: Option<String>, keep: u16) -> Result<()
         task.abort();
     }
 
-    // `serve`'s Ctrl-C drain is under way; bound it so a stuck request can't
-    // hang the command, falling back to abort.
     match tokio::time::timeout(start::SERVER_SHUTDOWN_TIMEOUT, &mut server_handle).await {
         Ok(_) => {}
         Err(_) => {

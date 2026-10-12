@@ -1,6 +1,3 @@
-//! Command dispatch for `ft`: [`run`] routes the parsed [`Cli`] to its
-//! handler; no subcommand = the implicit START against the positional `dir`.
-
 pub mod detail;
 pub mod doctor;
 pub mod drop;
@@ -23,7 +20,6 @@ use anyhow::Result;
 use crate::cli::{Cli, Command};
 
 /// Poll cadence while a parent waits for a worker to publish the public URL.
-/// Shared by the START/PROXY/RUN/HOOK background flows.
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Upper bound on how long a parent waits for the tunnel URL — generous
 /// (30 s) because dev servers boot slowly.
@@ -33,8 +29,6 @@ pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 /// Dispatch the parsed CLI; `None` falls through to the implicit START (dir
 /// defaults to `.`).
 pub async fn run(cli: Cli) -> Result<()> {
-    // Short-lived printing commands only — serving paths must NEVER do this
-    // (see reset_sigpipe).
     if matches!(
         cli.command,
         Some(
@@ -95,8 +89,6 @@ pub async fn run(cli: Cli) -> Result<()> {
         }) => crate::worker::run(id, name, dir, port, command, keep, max_size).await,
         None => {
             let dir: PathBuf = cli.dir.unwrap_or_else(|| PathBuf::from("."));
-            // The static-origin flags exist only on the implicit START, so
-            // the never-on-proxy exclusion holds by construction.
             let static_flags = crate::model::StaticFlags {
                 spa: cli.spa,
                 cors: cli.cors,

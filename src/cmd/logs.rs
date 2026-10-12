@@ -1,5 +1,3 @@
-//! The `logs` command: print the tail of a service's log files.
-
 use std::path::Path;
 use std::time::Duration;
 
@@ -73,8 +71,6 @@ async fn print_tail(path: &Path, label: &str) -> Result<()> {
 async fn follow_logs(tunnel_path: &Path, worker_path: &Path) -> Result<()> {
     let mut tunnel = open_at_end(tunnel_path).await?;
     let mut worker = open_at_end(worker_path).await?;
-    // Per-file leftover buffers carried across reads so a line or multi-byte
-    // UTF-8 code point that straddles a read boundary is never split.
     let mut tunnel_leftover = Vec::new();
     let mut worker_leftover = Vec::new();
 
@@ -110,8 +106,6 @@ async fn drain_appended(file: &mut tokio::fs::File, leftover: &mut Vec<u8>) {
     loop {
         let read_start = leftover.len();
         if read_start >= buf.len() {
-            // Pathological: a single line longer than READ_CAP with no
-            // newline. Flush it as-is rather than growing unbounded.
             flush_text(leftover);
             leftover.clear();
             continue;

@@ -1,31 +1,16 @@
 name: latest
 
-# Rolling "latest" build. On every push to `main` this rebuilds all release
-# targets and OVERRIDES the assets of the fixed `latest` GitHub Release, so a
-# fetch from /releases/download/latest/... always returns the newest `main`.
-#
-# Branch note: the repo's default branch is `main` (freeoxide/tunnel is not a
-# fork; no `master` branch exists), so this triggers on `main`. Versioned `v*`
-# releases are produced by release.yml and are untouched here.
-#
-# The release is a snapshot — prerelease + make_latest:false — so stable `v*`
-# releases keep the green "Latest" badge. The `latest` git tag is force-moved
-# to the triggering commit on every run (see the publish job), so both the tag
-# and the assets track HEAD rather than drifting to the first commit that
-# created the tag.
+# release.yml triggers only on `v*` tags, so the two workflows never publish
+# the same release — a division of labor this YAML cannot reference.
 on:
   push:
     branches: [main]
   workflow_dispatch: {}
 
-# Only the newest push's build should win and become "latest". An older
-# in-flight run is cancelled when a newer push lands.
 concurrency:
   group: latest-release
   cancel-in-progress: true
 
-# Default (read-only) token for every job; the `publish` job escalates to
-# `contents: write` only where it moves the tag and uploads release assets.
 permissions:
   contents: read
 
@@ -36,28 +21,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Same MVP cross-compile matrix as release.yml. Asset names match the
-        # binstall metadata: freeoxide-tunnel-<target>.tgz on unix,
-        # freeoxide-tunnel-<target>.zip on windows, with ft / ft.exe at the
-        # archive root.
+        # Same cross-compile matrix as release.yml:29-47 — a parity the YAML
+        # cannot reference.
         include:
-          # --- Linux / musl: static binaries, glibc-independent. ---
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
             archive: tgz
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-latest
             archive: tgz
-          # --- macOS: universal binaries via separate targets. arm64 builds
-          # natively on the Apple Silicon runner; x86_64 cross-compiles. ---
           - target: x86_64-apple-darwin
             runner: macos-latest
             archive: tgz
           - target: aarch64-apple-darwin
             runner: macos-latest
             archive: tgz
-          # --- Windows / MSVC: native and cross-arch via the x64/arm64
-          # MSVC toolchains on windows runners. ---
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             archive: zip
@@ -65,29 +43,22 @@ jobs:
             runner: windows-latest
             archive: zip
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
 
       - name: Install Rust target
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
           # Separate cache namespace from release.yml's `release-` key so a
           # corrupted rolling-build cache can never affect a tagged release.
           key: latest-${{ matrix.target }}
 
-      # musl cross-linker. The dep tree (tokio/axum/tower-http with the enabled
-      # feature set) is pure Rust and links no C. x86_64 keeps musl-gcc from
-      # musl-tools (also C-capable if a future -sys dep lands). aarch64 has NO
-      # musl cross gcc in Ubuntu repos — `gcc-aarch64-linux-musl` does not
-      # exist, so that apt install always failed — and instead links with
-      # rust-lld shipped inside the Rust toolchain, which produces a fully
-      # static aarch64 musl binary for a pure-Rust dep tree (verified:
-      # ELF e_machine AArch64, no PT_INTERP/NEEDED entries). If a future
-      # dependency adds C, the aarch64 job needs a real C cross toolchain
-      # (cross or zig); rust-lld cannot compile C.
+      # aarch64 musl links with rust-lld: Ubuntu ships no
+      # gcc-aarch64-linux-musl package, and rust-lld cannot compile C — a
+      # future -sys dependency needs a real cross toolchain (cross/zig).
       - name: Install musl toolchain (x86_64 musl only)
         if: runner.os == 'Linux' && matrix.target == 'x86_64-unknown-linux-musl'
         run: |
@@ -133,29 +104,26 @@ jobs:
           Set-Content -NoNewline -Path "freeoxide-tunnel-${{ matrix.target }}.zip.sha256" -Value $hash
 
       - name: Upload archive + sidecar
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: asset-${{ matrix.target }}
           if-no-files-found: error
-          # Both the archive and its .sha256 sidecar ride this artifact.
           path: |
             freeoxide-tunnel-${{ matrix.target }}.tgz
             freeoxide-tunnel-${{ matrix.target }}.tgz.sha256
             freeoxide-tunnel-${{ matrix.target }}.zip
             freeoxide-tunnel-${{ matrix.target }}.zip.sha256
 
-  # Supply-chain gate before any asset is uploaded. Whatever is in Cargo.lock
-  # at push time must not ship as a downloadable "latest" binary if it is
-  # known-vulnerable or yanked. deny.toml encodes the policy (advisories deny,
-  # yanked deny, licenses allowlisted, crates.io-only); this enforces it on the
-  # publishable artifacts, not only on PR CI.
+  # Enforces the deny.toml policy (yanked = "deny", deny.toml:3) on the
+  # publishable "latest" artifacts — the same gate ci.yml runs, so the
+  # rolling snapshot is never weaker than PR CI.
   supply-chain:
     name: cargo-deny + cargo-audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - uses: taiki-e/install-action@9bcaee1dcae34154180f412e2fa69355a7cda9f6 # v2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+      - uses: taiki-e/install-action@9bcaee1dcae34154180f412e2fa69355a7cda9f6
         with:
           tool: cargo-deny,cargo-audit
       - name: cargo-deny (advisories, bans, licenses, sources)
@@ -163,26 +131,19 @@ jobs:
       - name: cargo-audit
         run: cargo audit
 
-  # Installer lint gate — the same gate release.yml runs before a tagged
-  # release. install.sh / install.ps1 are a user's first contact point (fetched
-  # via curl|sh / irm|iex) and get no syntax check in ci.yml, so a parse failure
-  # or shellcheck error must never ship attached to the `latest` Release either.
-  # Blocks publish via the publish job's needs:.
+  # ci.yml has no shellcheck/sh -n: this job is the only installer lint
+  # gate before install.sh/install.ps1 ship on `latest`.
   lint-scripts:
     name: lint install scripts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
 
-      # Blocking syntax gate: -n parses without executing, so a structurally
-      # broken installer can never be uploaded regardless of shellcheck.
       - name: sh -n install.sh
         run: sh -n install.sh
 
       - name: shellcheck install.sh
         run: |
-          # shellcheck is in apt; fall back to taiki-e/install-action if the
-          # distro package is unavailable.
           if ! command -v shellcheck >/dev/null 2>&1; then
             sudo apt-get update && sudo apt-get install -y shellcheck
           fi
@@ -192,10 +153,8 @@ jobs:
     name: lint install.ps1
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
 
-      # Parse-only: compiling the script as a ScriptBlock surfaces syntax errors
-      # without executing anything. -NoProfile keeps CI reproducible.
       - name: Parse-check install.ps1
         shell: pwsh
         run: |
@@ -208,32 +167,25 @@ jobs:
     name: override latest release
     runs-on: ubuntu-latest
     needs: [build, supply-chain, lint-scripts, lint-scripts-windows]
-    # Only this job moves the tag and uploads Release assets, so only it needs
-    # the write token.
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
 
       - name: Download all per-target assets
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           pattern: asset-*
           merge-multiple: true
           path: dist
 
-      # install.sh / install.ps1 live at the repo root (committed by the
-      # installer slice); copy them into dist/ so the checksum assembly and
-      # the Release upload glob a single directory.
       - name: Stage installers
         run: |
           cp install.sh dist/install.sh
           cp install.ps1 dist/install.ps1
 
-      # Combined checksum file in the format install.sh / install.ps1 parse:
-      # one line per asset: "<hash>  <filename>" (two spaces, basename only).
-      # Rebuilt from the per-asset .sha256 sidecars so the list and the
-      # sidecars can never disagree.
+      # Checksum line format install.sh:157 and install.ps1:142-149 parse:
+      # "<hash>  <filename>" — two spaces, basename only.
       - name: Assemble SHA256SUMS
         working-directory: dist
         run: |
@@ -243,7 +195,6 @@ jobs:
             hash="$(cat "$sidecar" | awk '{print $1}')"
             printf '%s  %s\n' "$hash" "$asset" >> SHA256SUMS
           done
-          # Stable ordering independent of glob iteration order.
           sort -k2 SHA256SUMS -o SHA256SUMS
           echo "=== SHA256SUMS ==="
           cat SHA256SUMS
@@ -252,14 +203,11 @@ jobs:
         working-directory: dist
         run: sha256sum -c SHA256SUMS
 
-      # Attach to the rolling `latest` pre-release. softprops/action-gh-release
-      # resolves the release by tag_name and, on every push, refreshes its
-      # assets (same-named files are replaced — the "overwrite") on the single
-      # `latest` release. This is the flutter-starter `latest` pattern: tag_name
-      # latest, prerelease true, make_latest false. Stable v* releases keep the
-      # "Latest" badge; this snapshot lives at /releases/download/latest/...
+      # softprops/action-gh-release resolves the release by tag_name and
+      # replaces same-named assets on every run — the overwrite that keeps
+      # /releases/download/latest/... tracking HEAD.
       - name: Overwrite latest release assets
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
           tag_name: latest
           name: Latest build
@@ -270,7 +218,6 @@ jobs:
             This is **not** a stable release — for versioned releases see
             https://github.com/freeoxide/tunnel/releases
           prerelease: true
-          # String, not bool: "false" so stable v* releases keep "Latest".
           make_latest: "false"
           generate_release_notes: false
           fail_on_unmatched_files: true
