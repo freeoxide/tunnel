@@ -255,8 +255,6 @@ mod tests {
     use super::{Cli, Command};
     use clap::Parser as _;
 
-    /// clap reads the one process env; this serializes the FT_TOKEN removal
-    /// in `parse` with every parse, so parallel test threads cannot race it.
     static FT_TOKEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn parse(args: &[&str]) -> std::result::Result<Cli, clap::Error> {

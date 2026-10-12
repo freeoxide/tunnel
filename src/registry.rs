@@ -7,8 +7,6 @@ use fs2::FileExt;
 use std::fs::OpenOptions;
 use std::io::Write;
 
-/// Exclusive advisory lock released on drop (both OSes release on close);
-/// no explicit unlock — it trips a `clippy::incompatible_msrv` false positive.
 struct RegistryLock(#[allow(dead_code)] std::fs::File);
 
 const MAX_REGISTRY_BYTES: u64 = 16 * 1024 * 1024;

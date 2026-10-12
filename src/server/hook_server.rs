@@ -122,19 +122,10 @@ struct Window {
     file_len: u64,
 }
 
-/// Worst-case JSON expansion of one body byte (`\u00XX` = 6). NUL bodies are
-/// legitimate UTF-8, so the read bound MUST budget this — an escape-unaware
-/// bound wipes such stores on reload: remotely triggerable record loss.
 const JSON_ESCAPE_FACTOR: usize = 6;
 
-/// hyper's whole-wire head budget (8 KiB + 4 KiB × 100 headers — hyper's
-/// DEFAULT_MAX_BUFFER_SIZE, proto/h1/io.rs); capture truncates no head
-/// material, so the read bound needs it; it must grow with hyper's default.
 const HYPER_HEAD_BUDGET: usize = 417_792;
 
-/// Per-record head allowance: [`HYPER_HEAD_BUDGET`] × 2 — http admits raw
-/// `"`/`\` in heads and serde expands each 1→2 — plus 2 KiB structure;
-/// smaller would wipe legitimate stores on reload.
 const STORE_RECORD_OVERHEAD: usize = HYPER_HEAD_BUDGET * 2 + 2 * 1024;
 
 const MIN_TAIL_PAD: usize = 64 * 1024;
@@ -573,8 +564,6 @@ fn evict_at(
     Ok(())
 }
 
-/// Recover from poisoning: in-memory state stays valid across a panic
-/// (insert + truncate are infallible), so recording continues.
 fn lock(log: &Mutex<HookLog>) -> MutexGuard<'_, HookLog> {
     log.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -598,8 +587,6 @@ pub fn router(log: Arc<Mutex<HookLog>>) -> Router {
         ))
 }
 
-/// Fallback handler: record, answer 200; a persist failure is a 500 so the
-/// sender can retry — never a silent "acknowledged but unwritten".
 async fn record(State(log): State<Arc<Mutex<HookLog>>>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
     // Second cap enforcement: the layer pre-rejects a DECLARED oversize

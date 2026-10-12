@@ -537,8 +537,6 @@ mod command_child_tests {
         );
     }
 
-    /// Signal 0 succeeds even for an unreaped zombie (a reparented
-    /// grandchild); on Linux /proc state `Z` reads dead instead.
     fn probe_alive(pid: u32) -> bool {
         if kill(Pid::from_raw(pid as i32), None).is_err() {
             return false;
@@ -918,8 +916,6 @@ mod windows_tests {
         assert!(!pid_matches(std::process::id(), "totally-bogus-needle"));
     }
 
-    /// The whole-tree kill cannot be proven in-process (it would kill this
-    /// test); what is pinned is setup + clean guard drop.
     #[test]
     fn create_kill_on_close_job_succeeds_and_drops() {
         let guard = create_kill_on_close_job();
